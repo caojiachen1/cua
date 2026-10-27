@@ -1,0 +1,15 @@
+<!doctype html><html><head><title>Cua Page Three</title></head>
+<body style="height:2000px">
+<h1>Page Three</h1>
+<input id="name" placeholder="name here"/>
+<button id="act" onclick="document.getElementById('out').textContent='clicked'">Act</button>
+<div id="out"></div>
+<script>
+setTimeout(() => {
+  const b = document.createElement('button');
+  b.id = 'dyn';
+  b.textContent = 'Dynamic Button';
+  document.body.appendChild(b);
+}, 800);
+</script>
+</body></html>
