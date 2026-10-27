@@ -47,12 +47,13 @@ Windows Settings (including `ms-settings:` URIs), and the Win key.
 ## Tests
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tests\run-all.ps1    # 234 assertions, 4 suites
+powershell -ExecutionPolicy Bypass -File tests\run-all.ps1    # 261 assertions, 5 suites
 ```
 
 Suites cover the CLI surface, deep behaviours (unicode input, drag, capture, error paths),
-control patterns and geometry, the UBB browser bridge, and stock Windows apps (Notepad, Character
-Map, System Information, Volume Mixer, Explorer).
+control patterns and geometry, the UBB browser bridge, stock Windows apps (Notepad, Character
+Map, System Information, Volume Mixer, Explorer) and third-party desktop apps (QQ Music,
+NetEase Cloud Music, Soda Music — skipped when not installed).
 
 ## Known limits
 

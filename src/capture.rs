@@ -80,21 +80,30 @@ unsafe fn print_window(hwnd: HWND, w: i32, h: i32, client_only: bool) -> Result<
     if client_only {
         flags = PRINT_WINDOW_FLAGS(flags.0 | PW_CLIENTONLY.0);
     }
-    let ok = PrintWindow(hwnd, mem, flags).as_bool();
+    let _ok = PrintWindow(hwnd, mem, flags).as_bool();
     // deselect before GetDIBits (documented requirement)
     let _ = SelectObject(mem, old);
     let mut shot = blit_to_rgba(mem, bmp, w, h);
     let _ = DeleteObject(obj);
     let _ = DeleteDC(mem);
     let _ = ReleaseDC(hwnd, hdc);
-    if !ok {
-        shot.rendered = false;
-    } else {
-        // detect all-black capture (minimized/DRM windows render nothing)
-        let nonzero = shot.rgba.chunks_exact(4).take(4096).any(|px| px[0] as u32 + px[1] as u32 + px[2] as u32 > 0);
-        shot.rendered = nonzero;
-    }
+    // QQ Music's TXGuiFoundation returns FALSE from PrintWindow yet still fills the bitmap,
+    // so the BOOL cannot decide on its own; the pixels do (minimized/DRM render nothing).
+    shot.rendered = has_content(&shot.rgba);
     Ok(shot)
+}
+
+/// Strided sample so a black letterbox bar at the top cannot mask a rendered frame.
+fn has_content(rgba: &[u8]) -> bool {
+    let px = rgba.len() / 4;
+    if px == 0 {
+        return false;
+    }
+    let stride = (px / 4096).max(1);
+    (0..px).step_by(stride).any(|i| {
+        let p = &rgba[i * 4..i * 4 + 4];
+        p[0] as u32 + p[1] as u32 + p[2] as u32 > 0
+    })
 }
 
 unsafe fn blit_to_rgba(

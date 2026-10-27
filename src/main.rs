@@ -1102,10 +1102,18 @@ fn cmd_hover(
         },
         |t| {
             if let Some(idx) = index {
-                let rid = rid_for_index(t.info.hwnd, idx)?;
-                let (_rect, (cx, cy), name) = uia::element_center(t.hwnd, &rid)?;
-                input::move_to(cx, cy)?;
-                Ok((format!("hovered at ({cx},{cy}) over '{}'", name), None))
+                match target_for_index(t.info.hwnd, idx)? {
+                    ElementTarget::Rid(rid) => {
+                        let (_rect, (cx, cy), name) = uia::element_center(t.hwnd, &rid)?;
+                        input::move_to(cx, cy)?;
+                        Ok((format!("hovered at ({cx},{cy}) over '{}'", name), None))
+                    }
+                    ElementTarget::Rect { rect, ctype, name } => {
+                        let (cx, cy, via) = locate_rect(t.hwnd, &rect, &ctype, &name)?;
+                        input::move_to(cx, cy)?;
+                        Ok((format!("no runtime id; {via}, hovered at ({cx},{cy})"), None))
+                    }
+                }
             } else {
                 let (px, py) = (x.unwrap(), y.unwrap());
                 input::move_to(px, py)?;
@@ -1160,15 +1168,25 @@ fn cmd_click(
         },
         |t| {
             if let Some(idx) = index {
-                let rid = rid_for_index(t.info.hwnd, idx)?;
-                match strategy.as_str() {
-                    "a11y" => {
-                        let d = uia::click_element_strict(t.hwnd, &rid, double, right)?;
+                match target_for_index(t.info.hwnd, idx)? {
+                    ElementTarget::Rid(rid) => {
+                        let d = if strategy == "a11y" {
+                            uia::click_element_strict(t.hwnd, &rid, double, right)?
+                        } else {
+                            uia::click_element(t.hwnd, &rid, double, right)?
+                        };
                         Ok((d, Some(util::new_state_id())))
                     }
-                    _ => {
-                        let d = uia::click_element(t.hwnd, &rid, double, right)?;
-                        Ok((d, Some(util::new_state_id())))
+                    ElementTarget::Rect { rect, ctype, name } => {
+                        let (cx, cy, via) = locate_rect(t.hwnd, &rect, &ctype, &name)?;
+                        if background {
+                            let root = win::root_window(t.hwnd);
+                            input::post_click(root, cx, cy, right, double)?;
+                            Ok((format!("no runtime id; {via}, clicked ({cx},{cy}) via message-level input"), Some(util::new_state_id())))
+                        } else {
+                            input::click(cx, cy, right, double)?;
+                            Ok((format!("no runtime id; {via}, clicked ({cx},{cy})"), Some(util::new_state_id())))
+                        }
                     }
                 }
             } else {
@@ -1189,21 +1207,93 @@ fn cmd_click(
     )
 }
 
-pub fn rid_for_index(hwnd: isize, idx: usize) -> Result<Vec<i32>> {
+/// What a cached element index can be re-resolved to. Some providers (QQ Music's
+/// TXGuiFoundation) hand out an empty runtime id, leaving the rectangle as the only handle.
+pub enum ElementTarget {
+    Rid(Vec<i32>),
+    Rect { rect: [i32; 4], ctype: String, name: String },
+}
+
+fn cached_node(hwnd: isize, idx: usize) -> Result<serde_json::Value> {
     let cache = util::load_elements(hwnd).ok_or_else(|| anyhow!("no state for this window — run 'cua state --window ...' first"))?;
     let arr = cache.as_array().ok_or_else(|| anyhow!("corrupt element cache"))?;
-    let node = arr
-        .iter()
+    arr.iter()
         .find(|n| n["i"].as_u64() == Some(idx as u64))
-        .ok_or_else(|| anyhow!("index {idx} not in last state (count {}) — re-observe", arr.len()))?;
+        .cloned()
+        .ok_or_else(|| anyhow!("index {idx} not in last state (count {}) — re-observe", arr.len()))
+}
+
+pub fn target_for_index(hwnd: isize, idx: usize) -> Result<ElementTarget> {
+    let node = cached_node(hwnd, idx)?;
     let rid: Vec<i32> = node["rid"]
         .as_array()
         .map(|a| a.iter().filter_map(|v| v.as_i64().map(|x| x as i32)).collect())
         .unwrap_or_default();
-    if rid.is_empty() {
-        bail!("element has no runtime id — re-observe");
+    if !rid.is_empty() {
+        return Ok(ElementTarget::Rid(rid));
     }
-    Ok(rid)
+    let rect: Vec<i64> = node["rect"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
+        .unwrap_or_default();
+    if rect.len() == 4 && rect[2] > 0 && rect[3] > 0 {
+        return Ok(ElementTarget::Rect {
+            rect: [rect[0] as i32, rect[1] as i32, rect[2] as i32, rect[3] as i32],
+            ctype: node["type"].as_str().unwrap_or_default().to_string(),
+            name: node["name"].as_str().unwrap_or_default().to_string(),
+        });
+    }
+    bail!("index {idx} has neither a runtime id nor a usable rectangle — re-observe");
+}
+
+/// Without a runtime id an index cannot be re-resolved by identity, and a churning tree
+/// (QQ Music renumbers its nodes constantly) would silently send the click elsewhere.
+/// Re-walk and relocate the element by name+type; use the cached rectangle only when the
+/// element carries no name to search for.
+pub fn locate_rect(hwnd: windows::Win32::Foundation::HWND, rect: &[i32; 4], ctype: &str, name: &str) -> Result<(i32, i32, String)> {
+    let cached = (rect[0] + rect[2] / 2, rect[1] + rect[3] / 2);
+    if name.trim().is_empty() {
+        return Ok((cached.0, cached.1, "cached rect (unnamed element)".into()));
+    }
+    let hits = uia::ground(hwnd, name).unwrap_or_default();
+    let mut best: Option<&uia::Node> = None;
+    for n in hits.iter() {
+        let exact_name = n.name == name;
+        let same_type = n.ctype.eq_ignore_ascii_case(ctype);
+        if !exact_name && !same_type {
+            continue;
+        }
+        match best {
+            Some(b) => {
+                let better = (exact_name && b.name != name) || (same_type && b.ctype != ctype);
+                if better {
+                    best = Some(n);
+                }
+            }
+            None => best = Some(n),
+        }
+    }
+    match best {
+        Some(n) => Ok((
+            n.rect[0] + n.rect[2] / 2,
+            n.rect[1] + n.rect[3] / 2,
+            format!("re-located '{}' by name+type", n.name),
+        )),
+        None => bail!(
+            "index has no runtime id and '{}' is no longer in the tree — re-observe before acting",
+            name
+        ),
+    }
+}
+
+pub fn rid_for_index(hwnd: isize, idx: usize) -> Result<Vec<i32>> {
+    match target_for_index(hwnd, idx)? {
+        ElementTarget::Rid(rid) => Ok(rid),
+        ElementTarget::Rect { .. } => bail!(
+            "index {idx} has no runtime id: this app's UIA provider does not expose one, so pattern \
+             actions cannot target it — use 'click --index' (falls back to its rectangle) or --x/--y"
+        ),
+    }
 }
 
 fn cmd_type(

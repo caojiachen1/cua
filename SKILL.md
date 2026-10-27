@@ -101,7 +101,19 @@ exit 0 without ever creating a window. The receipt lists what was removed; pass
 `--no-clean-env` to inherit verbatim. Electron/Chromium UIs expose no DOM nodes until
 accessibility is switched on — launch with
 `--args "--force-renderer-accessibility"` to get a full UIA tree (hundreds of nodes)
-instead of a 9-node shell, then drive it with `grounding` + `click --index`.
+instead of a 9-node shell, then drive it with `grounding` + `click --index`. NetEase Cloud
+Music needs that flag; Soda Music instead enables accessibility while a client walks the
+tree and disables it when idle, so poll `state` rather than trusting the first capture.
+
+Some providers (QQ Music's TXGuiFoundation) hand out **no runtime id at all**, so an index
+cannot be re-resolved by identity. `click`/`hover --index` then re-locate the element by
+name+type in a fresh walk and act on its current rectangle — the receipt says
+`no runtime id; re-located '<name>'`, or `cached rect (unnamed element)` — and refuse the
+action rather than clicking a stale position when the element is gone. Pattern actions
+(`set-value`, `toggle`, `get-value`) cannot target such nodes; the error says so.
+Message-level `click --background` does reach these apps, so prefer it when the window
+cannot be raised (`SetForegroundWindow` is blocked by focus-steal protection) and real
+keyboard input would otherwise land in whatever the user has focused.
 
 ## Hidden-desktop sandbox (true background, our own extension)
 

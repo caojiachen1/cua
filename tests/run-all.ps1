@@ -1,7 +1,7 @@
 # tests\run-all.ps1 - run all cua end-to-end phases sequentially and propagate failures.
 $ErrorActionPreference = "Continue"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-$suites = @("e2e.ps1", "e2e2.ps1", "e2e3.ps1", "e2e4.ps1")
+$suites = @("e2e.ps1", "e2e2.ps1", "e2e3.ps1", "e2e4.ps1", "e2e5.ps1")
 $failed = @()
 foreach ($s in $suites) {
     Write-Host ""

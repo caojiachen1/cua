@@ -16,7 +16,7 @@ use windows::Win32::System::Threading::AttachThreadInput;
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetForegroundWindow, GetSystemMetrics,
     GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, GetWindowRect, IsIconic,
-    IsWindow, IsWindowVisible, IsZoomed, SetForegroundWindow, ShowWindow,
+    IsWindow, IsWindowVisible, IsZoomed, SetForegroundWindow, ShowWindow, BringWindowToTop,
     SW_RESTORE, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
     SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
@@ -356,12 +356,25 @@ pub fn activate_window(hwnd: HWND) -> Result<bool> {
                 let _ = AttachThreadInput(cur, fg_thread, true);
             }
         }
-        let ok = SetForegroundWindow(hwnd).as_bool();
+        let mut ok = SetForegroundWindow(hwnd).as_bool();
         if !ok {
             // documented workaround: brief alt keystroke unlocks SetForegroundWindow
             keybd_event(VK_MENU.0 as u8, 0, KEYBD_EVENT_FLAGS(0), 0);
-            let _ = SetForegroundWindow(hwnd);
+            ok = SetForegroundWindow(hwnd).as_bool();
             keybd_event(VK_MENU.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+        }
+        if !ok {
+            // last resort: ask the shell to release the lock and push the window to the top;
+            // some apps (QQ Music's main window) only accept the raise on the second attempt
+            use windows::Win32::UI::WindowsAndMessaging::{LockSetForegroundWindow, LSFW_UNLOCK};
+            let _ = LockSetForegroundWindow(LSFW_UNLOCK);
+            let _ = BringWindowToTop(hwnd);
+            for _ in 0..3 {
+                if SetForegroundWindow(hwnd).as_bool() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(40));
+            }
         }
         if attached {
             let _ = AttachThreadInput(cur, target_thread, false);
