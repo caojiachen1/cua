@@ -112,6 +112,30 @@ Check "A7 explorer items parsed as ListItems" (@(Nodes $stEx "ListItem" | Where-
 $exAddr = First (Nodes $stEx "Edit" @("address", ""))
 Check "A7b explorer address bar + view radios parsed" (@(Nodes $stEx "RadioButton").Count -ge 1 -and @(Nodes $stEx "Edit").Count -ge 1 -and (@(Nodes $stEx "ScrollBar" | Where-Object { $null -ne $_.range }).Count -ge 1)) "edits=$((@(Nodes $stEx "Edit").Count)) radios=$((@(Nodes $stEx "RadioButton").Count))"
 
+# Grid / Transform / VirtualizedItem (the patterns that unlock table cells and mouse-free moves)
+$exGrid = $stEx.nodes | Where-Object { $_.patterns -contains "Grid" } | Select-Object -First 1
+Check "A8 explorer advertises a UIA Grid provider" ($null -ne $exGrid) "nodes=$($stEx.node_count)"
+if ($exGrid) {
+    $g = J (RunCua grid --window $expl.hwnd --index $exGrid.i --max-cells 12)
+    Check "A8b grid dumps a 2D matrix" ($g.grid.rows -gt 0 -and $g.grid.cols -ge 3 -and @($g.grid.cells[0]).Count -eq [int]$g.grid.cols) "rows=$($g.grid.rows) cols=$($g.grid.cols)"
+    $c = J (RunCua grid --window $expl.hwnd --index $exGrid.i --row 1 --col 0)
+    Check "A8c one cell resolves by (row,col)" ($null -ne $c.grid.rect -and $c.grid.rect[2] -gt 0) "rect=$($c.grid.rect -join ',')"
+}
+$cmWin = $stCm.nodes | Where-Object { $_.patterns -contains "Transform" } | Select-Object -First 1
+Check "A9 charmap window exposes TransformPattern" ($null -ne $cmWin) "patterns on window node"
+if ($cmWin) {
+    $rep = J (RunCua transform --window $CM --index $cmWin.i)
+    Check "A9b transform reports capabilities" ($rep.detail -like "*can_move*:true*") "$($rep.detail.Substring(0, [Math]::Min(80, $rep.detail.Length)))"
+    $cap0 = J (RunCua cursor)
+    $mv = J (RunCua transform --window $CM --index $cmWin.i --move-to "520,300")
+    Start-Sleep -Milliseconds 700
+    $rectNow = (J (RunCua apps)).windows | Where-Object { $_.hwnd -eq $stCm.window.hwnd } | ForEach-Object { $_.rect }
+    $cap1 = J (RunCua cursor)
+    Check "A9c transform moves a window with no cursor and no SetWindowPos" ($mv.status -eq "ok" -and $rectNow[0] -ge 500 -and $cap0.x -eq $cap1.x -and $cap0.y -eq $cap1.y) "x=$($rectNow[0]) cursor $($cap0.x),$($cap0.y)->$($cap1.x),$($cap1.y)"
+}
+$rz = RunErr realize --window $CM --index $cmChk.i
+Check "A10 realize fails cleanly when the pattern is absent" ($rz -like "*VirtualizedItemPattern*") ($rz.Substring(0, [Math]::Min(70, $rz.Length)))
+
 # ---------- B. control-level actions with verified effects ----------
 $stCm = J (RunCua state --window $CM --no-shot)
 $cmEdit = First (Nodes $stCm "Edit")

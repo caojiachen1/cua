@@ -75,6 +75,11 @@ cua get-value --window W --index N
 cua toggle|select|expand|collapse --window W --index N  # Toggle / SelectionItem / ExpandCollapse
 cua set-range --window W --index N --value 75           # RangeValue (sliders/spinners)
 cua get-range --window W --index N
+cua grid --window W --index N [--max-cells 200]         # GridPattern: dump rows x cols of cells
+cua grid --window W --index N --row R --col C [--invoke] # resolve (or drive) one table cell
+cua transform --window W --index N                       # report can_move / can_resize / can_zoom
+cua transform --window W --index N --move-to "x,y" [--size "w,h"] [--zoom N]
+cua realize --window W --index N                         # VirtualizedItem: materialize a list item
 cua clipboard set --text "..." | cua clipboard get
 cua launch --exe notepad.exe [--args "--flag x"] [--cwd DIR] [--no-clean-env]
 cua open --name calc    # .exe targets launch directly (sanitized env), others use ShellExecute
@@ -177,6 +182,13 @@ Gotchas: `file://` needs "Allow access to file URLs" on the extension (use a loc
 server instead); `screenshot` on a background tab can hang — `tab.select` first, or use
 `cua shot --window <Edge hwnd>`; MAIN-world `evaluate`, destructive labels and
 restricted URLs are refused unless the user confirms.
+
+Grid, Transform and VirtualizedItem are probed and reported in `state --patterns` (Grid only on
+list/table/tree types, Transform only on window/pane). `grid --invoke` and `transform` need no
+mouse and no focus: `transform --move-to` asks the app itself to relocate, which also works when
+the app would fight `SetWindowPos`, and reports `can_move=false` instead of silently failing.
+`realize` is rare in the wild (mostly WPF virtualized lists) — when a provider does not advertise
+`VirtualizedItem` the command says so rather than guessing.
 
 ## Screen recording (`cua rec`)
 

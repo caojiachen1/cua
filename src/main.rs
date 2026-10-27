@@ -268,6 +268,43 @@ enum Cmd {
         #[arg(long)]
         sandbox: bool,
     },
+    /// Read a UIA Grid/Table as a 2D matrix, or resolve/act on one (row, col) cell
+    Grid {
+        #[arg(long)]
+        window: String,
+        #[arg(long)]
+        index: usize,
+        #[arg(long, allow_hyphen_values = true)]
+        row: Option<i32>,
+        #[arg(long, allow_hyphen_values = true)]
+        col: Option<i32>,
+        #[arg(long, help = "with --row/--col: drive the cell through the a11y chain")]
+        invoke: bool,
+        #[arg(long, default_value_t = 200, help = "cell budget for the full dump")]
+        max_cells: usize,
+    },
+    /// Report or apply UIA TransformPattern (move/resize without SetWindowPos or the mouse)
+    Transform {
+        #[arg(long)]
+        window: String,
+        #[arg(long)]
+        index: usize,
+        #[arg(long, allow_hyphen_values = true)]
+        move_to: Option<String>,
+        #[arg(long, allow_hyphen_values = true)]
+        size: Option<String>,
+        #[arg(long, allow_hyphen_values = true)]
+        zoom: Option<f64>,
+        #[arg(long)]
+        record: Option<String>,
+    },
+    /// Force a virtualized UIA item to materialize so its children appear in the tree
+    Realize {
+        #[arg(long)]
+        window: String,
+        #[arg(long)]
+        index: usize,
+    },
     /// Clipboard read/write (Trae clipboard)
     Clipboard {
         #[command(subcommand)]
@@ -644,6 +681,13 @@ fn dispatch(cmd: Cmd) -> i32 {
                 cmd_set_range(&window, index, value, record, sandbox)
             }
             Cmd::GetRange { window, index, sandbox } => cmd_get_range(&window, index, sandbox),
+            Cmd::Grid { window, index, row, col, invoke, max_cells } => {
+                cmd_grid(&window, index, row, col, invoke, max_cells)
+            }
+            Cmd::Transform { window, index, move_to, size, zoom, record } => {
+                cmd_transform(&window, index, move_to, size, zoom, record)
+            }
+            Cmd::Realize { window, index } => cmd_realize(&window, index),
             Cmd::Clipboard { op } => cmd_clipboard(op),
             Cmd::Launch { exe, args, cwd, no_clean_env, record, sandbox } => {
                 cmd_launch(&exe, args, cwd, !no_clean_env, record, sandbox)
@@ -1698,6 +1742,82 @@ fn cmd_set_range(sel: &str, index: usize, value: f64, record: Option<String>, sa
             Ok((d, Some(util::new_state_id())))
         },
     )
+}
+
+fn parse_pair(spec: &str) -> Result<(f64, f64)> {
+    let mut it = spec.split([',', 'x', ' ']).filter(|p| !p.is_empty());
+    let a: f64 = it.next().ok_or_else(|| anyhow!("expected \"a,b\""))?.parse()?;
+    let b: f64 = it.next().ok_or_else(|| anyhow!("expected \"a,b\""))?.parse()?;
+    Ok((a, b))
+}
+
+fn cmd_grid(sel: &str, index: usize, row: Option<i32>, col: Option<i32>, invoke: bool, max_cells: usize) -> Result<i32> {
+    let t = resolve_target(sel)?;
+    let rid = rid_for_index(t.info.hwnd, index)?;
+    let name = t
+        .info
+        .title
+        .clone();
+    let out = match (row, col) {
+        (Some(r), Some(c)) => uia::grid_cell(t.hwnd, &rid, r, c, invoke)?,
+        _ => uia::grid_dump(t.hwnd, &rid, max_cells)?,
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "schema": "cua-grid-v1",
+            "window": target_json(&t),
+            "index": index,
+            "element": name,
+            "grid": out,
+        }))?
+    );
+    Ok(0)
+}
+
+fn cmd_transform(
+    sel: &str,
+    index: usize,
+    move_to: Option<String>,
+    size: Option<String>,
+    zoom: Option<f64>,
+    record: Option<String>,
+) -> Result<i32> {
+    let argv = record_argv(&record);
+    let mov = move_to.as_deref().map(parse_pair).transpose()?;
+    let sz = size.as_deref().map(parse_pair).transpose()?;
+    guarded_action(
+        "transform",
+        argv,
+        &record,
+        || resolve_target(sel),
+        |_cfg, _t| Ok(()),
+        |t| {
+            let rid = rid_for_index(t.info.hwnd, index)?;
+            if mov.is_none() && sz.is_none() && zoom.is_none() {
+                let caps = uia::transform_report(t.hwnd, &rid)?;
+                return Ok((format!("capabilities: {}", caps), None));
+            }
+            let d = uia::transform_do(t.hwnd, &rid, mov, sz, zoom)?;
+            Ok((d, None))
+        },
+    )
+}
+
+fn cmd_realize(sel: &str, index: usize) -> Result<i32> {
+    let t = resolve_target(sel)?;
+    let rid = rid_for_index(t.info.hwnd, index)?;
+    let d = uia::realize(t.hwnd, &rid)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "schema": "cua-realize-v1",
+            "window": target_json(&t),
+            "index": index,
+            "detail": d,
+        }))?
+    );
+    Ok(0)
 }
 
 fn cmd_get_range(sel: &str, index: usize, sandbox: bool) -> Result<i32> {

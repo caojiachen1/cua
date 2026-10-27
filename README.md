@@ -26,6 +26,8 @@ cua state --window Notepad --patterns                  # UIA tree + screenshot +
 cua set-value --window Notepad --index 6 --value hi    # Value > RangeValue > Legacy
 cua click --window Notepad --index 4 --right           # right/double always use real events
 cua toggle --window App --index 3                      # also: select / expand / collapse / set-range
+cua grid --window App --index 3 --row 2 --col 1         # GridPattern: address a table cell
+cua transform --window App --index 0 --move-to 400,300  # move a window with no mouse
 cua type --window App --text hi --background           # message-level, focus stays put
 cua wait --window "title:Report" --gone                # also: hover / cursor / resize / restore
 cua sandbox start --exe D:\app.exe                     # run and control on an invisible desktop
@@ -50,7 +52,8 @@ Windows Settings (including `ms-settings:` URIs), and the Win key.
 ## Tests
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tests\run-all.ps1    # 285 assertions, 6 suites
+powershell -ExecutionPolicy Bypass -File tests\run-all.ps1    # 308 assertions, 7 suites
+powershell -ExecutionPolicy Bypass -File tools\uia-probe.ps1 -Apps qqmusic,cloudmusic  # capability report
 ```
 
 Suites cover the CLI surface, deep behaviours (unicode input, drag, capture, error paths),
@@ -59,9 +62,18 @@ Map, System Information, Volume Mixer, Explorer) and third-party desktop apps (Q
 NetEase Cloud Music, Soda Music — skipped when not installed), and a long-horizon
 Bilibili scenario that is screen-recorded end to end (`cua rec`).
 
+`tools/uia-probe.ps1` is a separate diagnostic: it launches an app, measures the UIA tree
+(provider size, name / rectangle / runtime-id coverage, pattern histogram), attempts one
+safety-filtered pattern action with read-back, probes message-level input and capture, then
+classifies the app as `NO_PROVIDER` / `READ_ONLY` / `A11Y_RECT_ONLY` / `MSG_LEVEL_ONLY` /
+`A11Y_PARTIAL` / `A11Y_FULL` / `NEEDS_REAL_INPUT` / `CAPTURE_BLACK`. `-SelfTest` checks the
+ladder without touching any app.
+
 ## Known limits
 
-The sandbox has no real `SendInput` (OS binds input to the input desktop), so it drives apps
+The real-app suites need a quiet desktop: they click at screen coordinates, so an unrelated
+full-screen window (a music client left open, say) can swallow the click. Run them with no
+third-party app occupying the screen.
 through UIA patterns and window messages; UWP apps cannot start there, and DRM-protected
 windows refuse `PrintWindow`. Message-level input reaches classic controls
 (EDIT/RICHEDIT/BUTTON) but not XAML/DirectUI surfaces — use the a11y actions for those.

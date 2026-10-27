@@ -4,8 +4,9 @@ use anyhow::{anyhow, bail, Result};
 use serde::Serialize;
 use uiautomation::controls::ControlType;
 use uiautomation::patterns::{
-    UIExpandCollapsePattern, UIInvokePattern, UILegacyIAccessiblePattern, UIRangeValuePattern,
-    UISelectionItemPattern, UITogglePattern, UIValuePattern,
+    UIExpandCollapsePattern, UIGridPattern, UIInvokePattern, UILegacyIAccessiblePattern,
+    UIRangeValuePattern, UISelectionItemPattern, UITogglePattern, UITransformPattern,
+    UIValuePattern, UIVirtualizedItemPattern,
 };
 use uiautomation::types::{ExpandCollapseState, Handle, Rect, ToggleState};
 use uiautomation::{UIAutomation, UIElement};
@@ -142,11 +143,10 @@ pub fn walk_window(
             None
         };
         let patterns = if with_patterns && probes_patterns(&ctype) {
-            pattern_names(&el)
+            pattern_names_for(&el, &ctype)
         } else {
             Vec::new()
         };
-
         sig_parts.push(format!(
             "{}|{}|{}|{:?}|{}|{}|{}|{}|{:?}",
             ctype,
@@ -279,7 +279,7 @@ fn probes_patterns(ctype: &str) -> bool {
     )
 }
 
-fn pattern_names(el: &UIElement) -> Vec<String> {
+fn pattern_names_for(el: &UIElement, ctype: &str) -> Vec<String> {
     let mut v = Vec::new();
     macro_rules! probe {
         ($t:ty, $name:literal) => {
@@ -302,6 +302,16 @@ fn pattern_names(el: &UIElement) -> Vec<String> {
     probe!(uiautomation::patterns::UIScrollPattern, "Scroll");
     probe!(uiautomation::patterns::UITextPattern, "Text");
     probe!(uiautomation::patterns::UIWindowPattern, "Window");
+    // Grid/Transform/VirtualizedItem are only worth a probe on the types that can carry them.
+    if ctype.is_empty() || matches!(ctype, "List" | "Table" | "DataGrid" | "Tree" | "Grid" | "Custom" | "Group") {
+        probe!(UIGridPattern, "Grid");
+    }
+    if ctype.is_empty() || matches!(ctype, "Window" | "Pane") {
+        probe!(UITransformPattern, "Transform");
+    }
+    if matches!(ctype, "DataItem" | "ListItem" | "TreeItem" | "Custom") {
+        probe!(UIVirtualizedItemPattern, "VirtualizedItem");
+    }
     v
 }
 
@@ -378,8 +388,11 @@ pub fn click_element(hwnd: HWND, rid: &[i32], double: bool, right: bool) -> Resu
         return Ok("selected element via UIA SelectionItemPattern".into());
     }
     if let Ok(p) = el.get_pattern::<UILegacyIAccessiblePattern>() {
-        p.do_default_action().map_err(|e| anyhow!("default action failed: {e}"))?;
-        return Ok("invoked element via LegacyIAccessible DoDefaultAction".into());
+        if p.do_default_action().is_ok() {
+            return Ok("invoked element via LegacyIAccessible DoDefaultAction".into());
+        }
+        // legacy providers are frequently stubs (Explorer's grid cells advertise the
+        // interface and then refuse it), so a failure here must not block the rect fallback
     }
     click_element_rect(&el, double, right)
 }
@@ -459,6 +472,136 @@ pub fn get_value_element(hwnd: HWND, rid: &[i32]) -> Result<String> {
         .get_pattern::<UIValuePattern>()
         .map_err(|_| anyhow!("element does not support UIA ValuePattern"))?;
     Ok(p.get_value()?)
+}
+
+/// Dump a Grid/Table provider as a 2D matrix of cell names (bounded by `max_cells`).
+pub fn grid_dump(hwnd: HWND, rid: &[i32], max_cells: usize) -> Result<serde_json::Value> {
+    let el = find_by_rid(hwnd, rid)?;
+    let g = el
+        .get_pattern::<UIGridPattern>()
+        .map_err(|_| anyhow!("element does not support UIA GridPattern"))?;
+    let rows = g.get_row_count().map_err(|e| anyhow!("row count: {e}"))?;
+    let cols = g.get_column_count().map_err(|e| anyhow!("column count: {e}"))?;
+    let shown = (max_cells / cols.max(1) as usize).max(1).min(rows.max(0) as usize);
+    let mut cells: Vec<Vec<serde_json::Value>> = Vec::new();
+    for r in 0..shown as i32 {
+        let mut row = Vec::new();
+        for c in 0..cols {
+            row.push(cell_brief(g.get_item(r, c).ok()));
+        }
+        cells.push(row);
+    }
+    Ok(serde_json::json!({
+        "rows": rows, "cols": cols, "rows_shown": shown, "cells": cells,
+        "truncated": shown < rows.max(0) as usize,
+    }))
+}
+
+fn cell_brief(el: Option<UIElement>) -> serde_json::Value {
+    match el {
+        Some(e) => serde_json::json!({
+            "name": e.get_name().unwrap_or_default(),
+            "type": e.get_control_type().map(type_name).unwrap_or_default(),
+            "rect": e.get_bounding_rectangle().map(|r| rect_of(&r)).unwrap_or([0, 0, 0, 0]),
+            "value": e.get_pattern::<UIValuePattern>().ok().and_then(|v| v.get_value().ok()),
+        }),
+        None => serde_json::Value::Null,
+    }
+}
+
+/// Resolve one (row, col) cell; with `act`, drive it through the normal a11y chain by way of
+/// the cell's own runtime id, falling back to its rectangle when the provider gives none.
+pub fn grid_cell(hwnd: HWND, rid: &[i32], row: i32, col: i32, act: bool) -> Result<serde_json::Value> {
+    let el = find_by_rid(hwnd, rid)?;
+    let g = el
+        .get_pattern::<UIGridPattern>()
+        .map_err(|_| anyhow!("element does not support UIA GridPattern"))?;
+    let rows = g.get_row_count().unwrap_or(0);
+    let cols = g.get_column_count().unwrap_or(0);
+    if row < 0 || col < 0 || row >= rows || col >= cols {
+        bail!("cell ({row},{col}) outside grid {rows}x{cols}");
+    }
+    let cell = g.get_item(row, col).map_err(|e| anyhow!("get_item({row},{col}): {e}"))?;
+    let mut out = cell_brief(Some(cell.clone()));
+    if act {
+        let cell_rid = cell.get_runtime_id().unwrap_or_default();
+        let detail = if !cell_rid.is_empty() {
+            click_element(hwnd, &cell_rid, false, false)?
+        } else {
+            let r = rect_of(&cell.get_bounding_rectangle().map_err(|e| anyhow!("rect: {e}"))?);
+            if r[2] <= 0 || r[3] <= 0 {
+                bail!("cell ({row},{col}) has neither a runtime id nor a usable rectangle");
+            }
+            let (cx, cy) = (r[0] + r[2] / 2, r[1] + r[3] / 2);
+            crate::input::click(cx, cy, false, false)?;
+            format!("cell has no runtime id; clicked ({cx},{cy}) at its rectangle")
+        };
+        out["acted"] = serde_json::json!(detail);
+    }
+    Ok(out)
+}
+
+/// TransformPattern capabilities — tells us whether the app itself allows moving/resizing.
+pub fn transform_report(hwnd: HWND, rid: &[i32]) -> Result<serde_json::Value> {
+    let el = find_by_rid(hwnd, rid)?;
+    let p = el
+        .get_pattern::<UITransformPattern>()
+        .map_err(|_| anyhow!("element does not support UIA TransformPattern"))?;
+    Ok(serde_json::json!({
+        "can_move": p.can_move().unwrap_or(false),
+        "can_resize": p.can_resize().unwrap_or(false),
+        "can_zoom": p.can_zoom().unwrap_or(false),
+        "rect": el.get_bounding_rectangle().map(|r| rect_of(&r)).unwrap_or([0, 0, 0, 0]),
+    }))
+}
+
+/// Move / resize / zoom through the app's own TransformPattern instead of SetWindowPos.
+pub fn transform_do(
+    hwnd: HWND,
+    rid: &[i32],
+    mov: Option<(f64, f64)>,
+    size: Option<(f64, f64)>,
+    zoom: Option<f64>,
+) -> Result<String> {
+    let el = find_by_rid(hwnd, rid)?;
+    let p = el
+        .get_pattern::<UITransformPattern>()
+        .map_err(|_| anyhow!("element does not support UIA TransformPattern"))?;
+    let mut done: Vec<String> = Vec::new();
+    if let Some((x, y)) = mov {
+        if !p.can_move().unwrap_or(false) {
+            bail!("TransformPattern refuses to move this element (CanMove=false)");
+        }
+        p.move_to(x, y).map_err(|e| anyhow!("transform move: {e}"))?;
+        done.push(format!("moved to ({x},{y})"));
+    }
+    if let Some((w, h)) = size {
+        if !p.can_resize().unwrap_or(false) {
+            bail!("TransformPattern refuses to resize this element (CanResize=false)");
+        }
+        p.resize(w, h).map_err(|e| anyhow!("transform resize: {e}"))?;
+        done.push(format!("resized to {w}x{h}"));
+    }
+    if let Some(z) = zoom {
+        p.zoom(z).map_err(|e| anyhow!("transform zoom: {e}"))?;
+        done.push(format!("zoomed to {z}"));
+    }
+    if done.is_empty() {
+        bail!("nothing to do — pass --move-to / --size / --zoom");
+    }
+    Ok(format!("{} via UIA TransformPattern", done.join(", ")))
+}
+
+/// VirtualizedItemPattern: force a provider to materialise an item that was never realized
+/// (virtualised lists otherwise hide their children until this is called).
+pub fn realize(hwnd: HWND, rid: &[i32]) -> Result<String> {
+    let el = find_by_rid(hwnd, rid)?;
+    let p = el
+        .get_pattern::<UIVirtualizedItemPattern>()
+        .map_err(|_| anyhow!("element does not support UIA VirtualizedItemPattern"))?;
+    p.realize().map_err(|e| anyhow!("realize: {e}"))?;
+    let name = el.get_name().unwrap_or_default();
+    Ok(format!("realized '{}' via UIA VirtualizedItemPattern — re-run state to see its children", name))
 }
 
 pub fn toggle_element(hwnd: HWND, rid: &[i32]) -> Result<(String, String)> {
