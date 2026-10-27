@@ -83,6 +83,7 @@ fn spawn_on_sandbox(exe: &str, args: Option<&str>) -> Result<u32> {
         ..Default::default()
     };
     let mut pi = PROCESS_INFORMATION::default();
+    let env_block = crate::util::sanitized_env_block();
     unsafe {
         CreateProcessW(
             PCWSTR::null(),
@@ -91,7 +92,7 @@ fn spawn_on_sandbox(exe: &str, args: Option<&str>) -> Result<u32> {
             None,
             false,
             CREATE_NEW_CONSOLE | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
-            None,
+            Some(env_block.as_ptr() as *const _),
             None,
             &si,
             &mut pi,

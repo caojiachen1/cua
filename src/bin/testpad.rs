@@ -205,6 +205,27 @@ unsafe fn append_mark() {
     append_line(&format!("MARK:{secs}"));
 }
 
+fn opt_from_args(name: &str) -> Option<String> {
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        if a == name {
+            return args.next();
+        }
+    }
+    None
+}
+
+/// `--dump-env <file>` writes the child's environment so the e2e suite can assert
+/// that `cua launch` strips the automation-shell variables that break other apps.
+fn dump_env() {
+    let Some(path) = opt_from_args("--dump-env") else { return };
+    let mut lines = vec![format!("CWD:{}", std::env::current_dir().unwrap_or_default().display())];
+    for (k, v) in std::env::vars() {
+        lines.push(format!("{k}={v}"));
+    }
+    let _ = std::fs::write(&path, lines.join("\n"));
+}
+
 fn title_from_args() -> String {
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -218,6 +239,7 @@ fn title_from_args() -> String {
 }
 
 fn main() -> anyhow::Result<()> {
+    dump_env();
     unsafe {
         let hinstance = GetModuleHandleW(PCWSTR::null()).unwrap_or_default();
         let wc = WNDCLASSW {

@@ -198,6 +198,46 @@ pub fn process_image_name(pid: u32) -> Option<String> {
     crate::win::process_name(pid).map(|n| n.to_ascii_lowercase())
 }
 
+/// Env vars that silently break third-party apps when inherited from an automation
+/// shell: an Electron app that sees ELECTRON_RUN_AS_NODE runs as bare Node and exits 0
+/// without ever creating a window; a stray crashpad pipe name hijacks Chromium helpers.
+const TOXIC_EXACT: &[&str] = &[
+    "ELECTRON_RUN_AS_NODE",
+    "CHROME_CRASHPAD_PIPE_NAME",
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "NODE_REPL_EXTERNAL_MODULE",
+    "NODE_REPL_HISTORY",
+];
+const TOXIC_PREFIX: &[&str] = &["ELECTRON_"];
+
+fn toxic(key_upper: &str) -> bool {
+    TOXIC_EXACT.iter().any(|k| *k == key_upper) || TOXIC_PREFIX.iter().any(|p| key_upper.starts_with(p))
+}
+
+/// Wide environment block (CreateProcessW format) with the toxic vars stripped.
+pub fn sanitized_env_block() -> Vec<u16> {
+    let mut block: Vec<u16> = Vec::new();
+    for (k, v) in std::env::vars() {
+        if toxic(&k.to_ascii_uppercase()) {
+            continue;
+        }
+        for unit in format!("{k}={v}").encode_utf16() {
+            block.push(unit);
+        }
+        block.push(0);
+    }
+    block.push(0);
+    block
+}
+
+pub fn stripped_env_keys() -> Vec<String> {
+    std::env::vars()
+        .map(|(k, _)| k)
+        .filter(|k| toxic(&k.to_ascii_uppercase()))
+        .collect()
+}
+
 /// Which deny-list entry, if any, matches this launch/open target?
 /// Covers bare names, file names, `.exe` stems and URI schemes (`ms-settings:display`),
 /// which is how Settings and other protected surfaces are actually opened.

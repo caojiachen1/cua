@@ -75,7 +75,8 @@ cua toggle|select|expand|collapse --window W --index N  # Toggle / SelectionItem
 cua set-range --window W --index N --value 75           # RangeValue (sliders/spinners)
 cua get-range --window W --index N
 cua clipboard set --text "..." | cua clipboard get
-cua launch --exe notepad.exe [--args "--flag x"] | cua open --name calc
+cua launch --exe notepad.exe [--args "--flag x"] [--cwd DIR] [--no-clean-env]
+cua open --name calc    # .exe targets launch directly (sanitized env), others use ShellExecute
 cua activate|minimize|maximize|restore|close --window W  # close needs --confirm
 cua resize --window W [--width --height --x --y]        # SetWindowPos, no focus change
 cua batch --file steps.json                             # [[cmd,args...],...] (Trae batch)
@@ -91,6 +92,15 @@ controls (EDIT/RICHEDIT/BUTTON, verified on Character Map); XAML/DirectUI surfac
 ignore it — use the a11y actions (`click --index`, `set-value`, `toggle`) for those.
 Real apps may raise themselves as a side effect of their own Invoke/Toggle handler;
 cua never calls SetForegroundWindow outside `activate`/`--window` foreground input.
+
+`launch`/`open` build the child a **sanitized environment**: `ELECTRON_RUN_AS_NODE`,
+`ELECTRON_*`, `NODE_OPTIONS`, `NODE_PATH`, `CHROME_CRASHPAD_PIPE_NAME` are stripped,
+because an automation shell exports them and Electron apps then start as bare Node and
+exit 0 without ever creating a window. The receipt lists what was removed; pass
+`--no-clean-env` to inherit verbatim. Electron/Chromium UIs expose no DOM nodes until
+accessibility is switched on — launch with
+`--args "--force-renderer-accessibility"` to get a full UIA tree (hundreds of nodes)
+instead of a 9-node shell, then drive it with `grounding` + `click --index`.
 
 ## Hidden-desktop sandbox (true background, our own extension)
 

@@ -278,6 +278,10 @@ enum Cmd {
         exe: String,
         #[arg(long, allow_hyphen_values = true)]
         args: Option<String>,
+        #[arg(long, help = "working directory for the new process")]
+        cwd: Option<String>,
+        #[arg(long, help = "inherit this shell's environment verbatim (default: strip ELECTRON_/NODE_ vars that break app startup)")]
+        no_clean_env: bool,
         #[arg(long)]
         record: Option<String>,
         #[arg(long)]
@@ -674,7 +678,9 @@ fn dispatch(cmd: Cmd) -> i32 {
             }
             Cmd::GetRange { window, index, sandbox } => cmd_get_range(&window, index, sandbox),
             Cmd::Clipboard { op } => cmd_clipboard(op),
-            Cmd::Launch { exe, args, record, sandbox } => cmd_launch(&exe, args, record, sandbox),
+            Cmd::Launch { exe, args, cwd, no_clean_env, record, sandbox } => {
+                cmd_launch(&exe, args, cwd, !no_clean_env, record, sandbox)
+            }
             Cmd::Open { name, record } => cmd_open(&name, record),
             Cmd::Activate { window, record } => cmd_window_op(&window, "activate", record, false),
             Cmd::Minimize { window, record } => cmd_window_op(&window, "minimize", record, false),
@@ -1741,13 +1747,21 @@ pub fn clipboard_set(text: &str) -> Result<()> {
     }
 }
 
-fn cmd_launch(exe: &str, args: Option<String>, record: Option<String>, sandbox: bool) -> Result<i32> {
+fn cmd_launch(
+    exe: &str,
+    args: Option<String>,
+    cwd: Option<String>,
+    clean_env: bool,
+    record: Option<String>,
+    sandbox: bool,
+) -> Result<i32> {
     if sandbox {
         return sandbox::cmd_launch(exe, args);
     }
     let argv = record_argv(&record);
     let exe = exe.to_string();
     let args = args.clone();
+    let cwd2 = cwd.clone();
     guarded_action(
         "launch",
         argv,
@@ -1771,17 +1785,38 @@ fn cmd_launch(exe: &str, args: Option<String>, record: Option<String>, sandbox: 
             Ok(())
         },
         |_t| {
-            let pid = spawn_process(&exe, args.as_deref(), None)?;
-            Ok((format!("launched pid {pid}"), None))
+            let stripped = if clean_env { util::stripped_env_keys() } else { Vec::new() };
+            let pid = spawn_process_opts(&exe, args.as_deref(), None, cwd2.as_deref(), clean_env)?;
+            let mut detail = format!("launched pid {pid}");
+            if let Some(c) = &cwd {
+                detail.push_str(&format!(" (cwd {c})"));
+            }
+            if !stripped.is_empty() {
+                detail.push_str(&format!("; env sanitized, stripped {}", stripped.join(",")));
+            }
+            Ok((detail, None))
         },
     )
 }
 
 pub fn spawn_process(exe: &str, args: Option<&str>, desktop: Option<&str>) -> Result<u32> {
-    use windows::Win32::System::Threading::{CreateProcessW, CREATE_NEW_CONSOLE, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW};
+    spawn_process_opts(exe, args, desktop, None, true)
+}
+
+/// Launch a process. `clean_env` strips automation-shell variables that break other
+/// apps' startup (see util::sanitized_env_block); `cwd` sets their working directory.
+pub fn spawn_process_opts(
+    exe: &str,
+    args: Option<&str>,
+    desktop: Option<&str>,
+    cwd: Option<&str>,
+    clean_env: bool,
+) -> Result<u32> {
     use windows::core::PCWSTR;
-    #[allow(unused_imports)]
-    use windows::Win32::Foundation::GENERIC_ALL as _GA;
+    use windows::Win32::System::Threading::{
+        CreateProcessW, CREATE_NEW_CONSOLE, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION,
+        STARTUPINFOW,
+    };
     let mut cmd: Vec<u16> = if exe.contains('\\') || exe.contains('/') {
         format!("\"{exe}\" {}", args.unwrap_or("")).trim_end().encode_utf16().collect()
     } else {
@@ -1799,6 +1834,12 @@ pub fn spawn_process(exe: &str, args: Option<&str>, desktop: Option<&str>) -> Re
         si.lpDesktop = windows::core::PWSTR(w.as_mut_ptr());
         desktop_w = Some(w);
     }
+    let env_block = if clean_env { Some(util::sanitized_env_block()) } else { None };
+    let cwd_w: Option<Vec<u16>> = cwd.map(|c| c.encode_utf16().chain(std::iter::once(0)).collect());
+    let cwd_arg = match &cwd_w {
+        Some(v) => PCWSTR(v.as_ptr()),
+        None => PCWSTR::null(),
+    };
     let mut pi = PROCESS_INFORMATION::default();
     unsafe {
         CreateProcessW(
@@ -1808,14 +1849,14 @@ pub fn spawn_process(exe: &str, args: Option<&str>, desktop: Option<&str>) -> Re
             None,
             false,
             CREATE_NEW_CONSOLE | CREATE_UNICODE_ENVIRONMENT,
-            None,
-            None,
+            env_block.as_ref().map(|b| b.as_ptr() as *const _),
+            cwd_arg,
             &si,
             &mut pi,
         )
         .map_err(|e| anyhow!("CreateProcessW('{exe}'): {e}"))?;
     }
-    let _ = desktop_w;
+    let _ = (desktop_w, cwd_w, env_block);
     unsafe {
         let _ = windows::Win32::Foundation::CloseHandle(pi.hThread);
         let _ = windows::Win32::Foundation::CloseHandle(pi.hProcess);
@@ -1849,7 +1890,25 @@ fn cmd_open(name: &str, record: Option<String>) -> Result<i32> {
             }
             Ok(())
         },
-        |_t| {
+        |t| {
+            // An .exe target goes through CreateProcess so we can hand it a clean
+            // environment and its own directory as cwd, like a shell launch does.
+            if name.to_ascii_lowercase().ends_with(".exe") && std::path::Path::new(&name).exists() {
+                let stripped = util::stripped_env_keys();
+                let cwd = std::path::Path::new(&name)
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string());
+                let pid = spawn_process_opts(&name, None, None, cwd.as_deref(), true)?;
+                let mut detail = format!("opened '{name}' (pid {pid}) with a sanitized environment");
+                if !stripped.is_empty() {
+                    detail.push_str(&format!("; stripped {}", stripped.join(",")));
+                }
+                if let Some(c) = &cwd {
+                    detail.push_str(&format!("; cwd {c}"));
+                }
+                return Ok((detail, None));
+            }
+            let _ = t;
             use windows::Win32::Foundation::HINSTANCE;
             use windows::core::PCWSTR;
             use windows::Win32::UI::Shell::ShellExecuteW;

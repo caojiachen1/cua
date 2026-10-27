@@ -375,6 +375,35 @@ Check "F2 check exposes cursor/config_path" ($check.cursor.Count -eq 2 -and $che
 $r = J (RunCua wait --window $W1 --gone --timeout-ms 4000)
 Check "F3 final close + wait gone" ($r.satisfied -eq $true) "$($r | ConvertTo-Json -Compress)"
 
+# ---------- G. launch environment hygiene ----------
+# An automation shell exports ELECTRON_RUN_AS_NODE / NODE_OPTIONS / CHROME_CRASHPAD_PIPE_NAME;
+# inherited, they make every Electron app exit 0 without ever creating a window.
+$env:ELECTRON_RUN_AS_NODE = "1"
+$env:NODE_OPTIONS = "--max-old-space-size=4096"
+$envClean = Join-Path $cache "env-clean.txt"
+$envDirty = Join-Path $cache "env-dirty.txt"
+Remove-Item $envClean, $envDirty -Force -ErrorAction SilentlyContinue
+$rl = J (RunCua launch --exe $testpad --args "--title CuaEnvPad --dump-env $envClean" --cwd $root)
+Check "G1 launch receipt reports sanitizing" ($rl.status -eq "ok" -and $rl.detail -like "*env sanitized*ELECTRON_RUN_AS_NODE*") "$($rl.detail)"
+$r = J (RunCua wait --window "title:CuaEnvPad" --timeout-ms 8000)
+for ($k = 0; $k -lt 25 -and -not (Test-Path $envClean); $k++) { Start-Sleep -Milliseconds 300 }
+$dump = if (Test-Path $envClean) { Get-Content $envClean -Raw } else { "" }
+Check "G2 child env has no ELECTRON_/NODE_/CHROME_ vars" ($dump -ne "" -and $dump -notmatch "(?m)^(ELECTRON|NODE|CHROME)") "len=$($dump.Length)"
+Check "G3 launch honours --cwd" (($dump -split "\r?\n") -contains "CWD:$root") "$(($dump -split "\r?\n" | Select-Object -First 1))"
+& $cua close --window "title:CuaEnvPad" --confirm | Out-Null
+Start-Sleep -Milliseconds 600
+$rl2 = J (RunCua launch --exe $testpad --args "--title CuaEnvPad2 --dump-env $envDirty" --no-clean-env)
+Check "G4 --no-clean-env receipt omits sanitizing" ($rl2.status -eq "ok" -and $rl2.detail -notlike "*env sanitized*") "$($rl2.detail)"
+$r = J (RunCua wait --window "title:CuaEnvPad2" --timeout-ms 8000)
+for ($k = 0; $k -lt 25 -and -not (Test-Path $envDirty); $k++) { Start-Sleep -Milliseconds 300 }
+$dump2 = if (Test-Path $envDirty) { Get-Content $envDirty -Raw } else { "" }
+Check "G5 --no-clean-env keeps ELECTRON_RUN_AS_NODE" ($dump2 -match "(?m)^ELECTRON_RUN_AS_NODE=1$") "len=$($dump2.Length)"
+& $cua close --window "title:CuaEnvPad2" --confirm | Out-Null
+Start-Sleep -Milliseconds 600
+$ro = J (RunCua open --name $testpad)
+Check "G6 open of an .exe also sanitizes" ($ro.status -eq "ok" -and $ro.detail -like "*sanitized*") "$($ro.detail)"
+& $cua close --window "title:CuaTestPad Fixture" --confirm | Out-Null
+
 # ---------- result ----------
 Write-Host ""
 Write-Host ("==== PHASE-3 RESULT: {0} passed, {1} failed" -f $script:pass, $script:fail) -ForegroundColor $(if ($script:fail -eq 0) { "Green" } else { "Red" })

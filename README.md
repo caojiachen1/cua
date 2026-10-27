@@ -27,6 +27,7 @@ cua toggle --window App --index 3                      # also: select / expand /
 cua type --window App --text hi --background           # message-level, focus stays put
 cua wait --window "title:Report" --gone                # also: hover / cursor / resize / restore
 cua sandbox start --exe D:\app.exe                     # run and control on an invisible desktop
+cua launch --exe "C:\Windows\System32\msinfo32.exe" --cwd D:\    # env sanitized by default
 cua browser open https://example.com
 cua browser click --text "Sign in"
 ```
@@ -34,6 +35,9 @@ cua browser click --text "Sign in"
 Selectors: title substring, `title:Exact`, `process:name.exe`, `class:X`, `pid:N`, hwnd.
 Coordinate actions need a fresh `--shot-id` from the observed window (screen captures cover
 any point). Every action prints `cua-action-receipt-v1`; exit 0 ok, 1 failed, 2 refused.
+`launch` strips `ELECTRON_*`/`NODE_*`/crashpad variables so Electron apps do not start as bare
+Node and exit silently; `--no-clean-env` inherits them. Electron/Chromium UIs need
+`--args "--force-renderer-accessibility"` before their DOM shows up in the UIA tree.
 
 Never automated: terminals, task manager, registry, `mmc`, Control Panel, password managers,
 Windows Settings (including `ms-settings:` URIs), and the Win key.
@@ -41,7 +45,7 @@ Windows Settings (including `ms-settings:` URIs), and the Win key.
 ## Tests
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tests\run-all.ps1    # 236 assertions, 4 suites
+powershell -ExecutionPolicy Bypass -File tests\run-all.ps1    # 242 assertions, 4 suites
 ```
 
 Suites cover the CLI surface, deep behaviours (unicode input, drag, capture, error paths),
