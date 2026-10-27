@@ -1379,7 +1379,7 @@ fn cmd_type(
                 ));
             }
             if window.is_some() {
-                win::activate_window(t.hwnd)?;
+                require_foreground(t.hwnd)?;
             }
             input::type_text(&text)?;
             Ok((format!("typed {} chars", text.chars().count()), None))
@@ -1439,7 +1439,7 @@ fn cmd_key(
                 ));
             }
             if window.is_some() {
-                win::activate_window(t.hwnd)?;
+                require_foreground(t.hwnd)?;
             }
             if let Some(text) = &combo.text {
                 input::type_text(text)?;
@@ -1514,6 +1514,19 @@ fn cmd_scroll(
             input::scroll(px, py, dx, dy)?;
             Ok((format!("scrolled dx={dx} dy={dy} at ({px},{py})"), None))
         },
+    )
+}
+
+/// Keyboard input goes to whatever the OS has focused, so a window we could not raise means
+/// the keystrokes would land in the user's application. Refuse instead of misfiring.
+fn require_foreground(hwnd: windows::Win32::Foundation::HWND) -> Result<()> {
+    if win::activate_window(hwnd)? {
+        return Ok(());
+    }
+    bail!(
+        "cannot bring this window to the foreground (Windows focus-steal protection), so nothing \
+         was typed — use --background, an a11y action (set-value/toggle/click --index), or ask \
+         the user to click it first"
     )
 }
 

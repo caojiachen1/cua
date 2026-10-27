@@ -112,8 +112,12 @@ name+type in a fresh walk and act on its current rectangle — the receipt says
 action rather than clicking a stale position when the element is gone. Pattern actions
 (`set-value`, `toggle`, `get-value`) cannot target such nodes; the error says so.
 Message-level `click --background` does reach these apps, so prefer it when the window
-cannot be raised (`SetForegroundWindow` is blocked by focus-steal protection) and real
-keyboard input would otherwise land in whatever the user has focused.
+cannot be raised. `type`/`key` without `--background` need the target to be foreground and
+**refuse outright** when `SetForegroundWindow` is blocked by focus-steal protection —
+otherwise the keystrokes would silently land in whatever the user has focused. Coordinate
+clicks (`--x/--y`, `drag`, `scroll`, and the rectangle fallback above) move the real cursor,
+so they compete with the user's mouse; `--index` a11y actions, `--background` input and the
+hidden-desktop sandbox do not.
 
 ## Hidden-desktop sandbox (true background, our own extension)
 
