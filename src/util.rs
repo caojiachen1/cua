@@ -194,6 +194,18 @@ pub fn load_config() -> SafetyConfig {
     SafetyConfig::default()
 }
 
+/// Raw config JSON, for keys SafetyConfig does not model (e.g. `ubb_path`).
+pub fn load_config_json() -> serde_json::Value {
+    let p = ensure_data_dir().join("config.json");
+    std::fs::read(p)
+        .ok()
+        .and_then(|b| {
+            let b = b.strip_prefix(b"\xEF\xBB\xBF".as_slice()).unwrap_or(&b).to_vec();
+            serde_json::from_slice(&b).ok()
+        })
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
 pub fn process_image_name(pid: u32) -> Option<String> {
     crate::win::process_name(pid).map(|n| n.to_ascii_lowercase())
 }

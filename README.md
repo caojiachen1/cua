@@ -2,11 +2,12 @@
 
 Rust CLI for driving Windows desktop apps: UIA accessibility tree + screenshots, a11y-first
 actions, real `SendInput`, message-level background input, a hidden-desktop sandbox for true
-background control, an isolated CDP browser, and JSON action receipts with safety guards.
+background control, browser control bridged to UBB, and JSON action receipts with safety guards.
 
 ## Install
 
-Needs Windows 10/11 x64, Rust (MSVC), PowerShell 5.1+. Browser control needs Edge or Chrome.
+Needs Windows 10/11 x64, Rust (MSVC), PowerShell 5.1+. Browser tasks need the `ubb` CLI and
+its Edge extension connected (`cua browser status` → `extension: true`).
 
 ```powershell
 git clone https://github.com/caojiachen1/cua.git
@@ -28,8 +29,9 @@ cua type --window App --text hi --background           # message-level, focus st
 cua wait --window "title:Report" --gone                # also: hover / cursor / resize / restore
 cua sandbox start --exe D:\app.exe                     # run and control on an invisible desktop
 cua launch --exe "C:\Windows\System32\msinfo32.exe" --cwd D:\    # env sanitized by default
-cua browser open https://example.com
-cua browser click --text "Sign in"
+cua browser tab.create '{"url":"https://example.com"}'  # bridged to UBB (the user's Edge)
+cua browser find '{"query":"Sign in"}'                   # -> @ref
+cua browser click '{"ref":"@d1"}'
 ```
 
 Selectors: title substring, `title:Exact`, `process:name.exe`, `class:X`, `pid:N`, hwnd.
@@ -45,11 +47,11 @@ Windows Settings (including `ms-settings:` URIs), and the Win key.
 ## Tests
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tests\run-all.ps1    # 242 assertions, 4 suites
+powershell -ExecutionPolicy Bypass -File tests\run-all.ps1    # 234 assertions, 4 suites
 ```
 
 Suites cover the CLI surface, deep behaviours (unicode input, drag, capture, error paths),
-control patterns and geometry, browser tabs, and stock Windows apps (Notepad, Character
+control patterns and geometry, the UBB browser bridge, and stock Windows apps (Notepad, Character
 Map, System Information, Volume Mixer, Explorer).
 
 ## Known limits
@@ -58,4 +60,6 @@ The sandbox has no real `SendInput` (OS binds input to the input desktop), so it
 through UIA patterns and window messages; UWP apps cannot start there, and DRM-protected
 windows refuse `PrintWindow`. Message-level input reaches classic controls
 (EDIT/RICHEDIT/BUTTON) but not XAML/DirectUI surfaces — use the a11y actions for those.
-The browser uses its own profile and port 9334 and never touches your browser session.
+Browser control is a bridge: it needs the `ubb` daemon + extension, works on the user's real
+profile, and never opens a window of its own. `file://` pages need explicit file access on
+the extension; screenshotting a background tab needs `tab.select` first.

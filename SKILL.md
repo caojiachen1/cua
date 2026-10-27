@@ -5,7 +5,8 @@ description: |
   (UIA trees + screenshots incl. background/occluded windows), a11y-first
   actions (element index > ValuePattern > coordinates), real SendInput,
   message-level and hidden-desktop sandbox control that never disturbs the
-  user, recording/replay with per-step verification, an isolated CDP browser,
+  user, recording/replay with per-step verification, browser control bridged to
+  UBB (the user's own Edge/Chrome),
   clipboard, local grounding, and Qoder/ZCode-style safety (receipts,
   no-negotiable deny list, stale-shot guard, confirm levels). Use for any task
   needing a native desktop app's UI or the OS. Main agent only.
@@ -125,23 +126,34 @@ Sandbox input is a11y + message-level (PostMessage); real SendInput cannot targe
 non-input desktop (OS rule). Shortcuts that read raw key state need foreground mode.
 The hidden desktop supports multiple apps; `sandbox.json` tracks all pids for cleanup.
 
-## Browser (isolated CDP; own profile & port 9334)
+## Browser (bridged to UBB — the user's own Edge/Chrome)
+
+cua has no browser of its own. `cua browser <ubb-tool> [json]` forwards to the `ubb`
+CLI (extension + local daemon), which drives the browser the user is actually logged into.
 
 ```bash
-cua browser open [url] [--exe chrome]     # launches isolated Edge/Chrome
-cua browser tabs | navigate <url> | back | reload | close
-cua browser snapshot                      # title/text/clickables with rects (domSnapshot analog)
-cua browser click --x X --y Y | --selector "#go" | --text "Submit"
-cua browser type --text "..." [--selector "#box"] [--clear]
-cua browser keys --keys "enter" | eval "document.title" | scroll --dy 300
-cua browser wait --selector "#done" | --text "Loaded" [--timeout-ms 10000]
-cua browser tab-new [url] | tab-switch <id|index> | tab-close <id|index>
-cua browser shot --out x.png
+cua browser status                        # daemon + extension health
+cua browser session.start                 # creates the "⏳ UBB" tab group
+cua browser tab.create '{"url":"example.com"}'
+cua browser snapshot                      # @eN refs (re-take after navigation)
+cua browser find '{"query":"Sign in"}'    # keyword search -> refs
+cua browser click '{"ref":"@d1"}' | fill '{"ref":"@e2","value":"hi"}'
+cua browser wait_for '{"condition":"url_contains","text":"page2"}'
+cua browser evaluate '{"expression":"6*7","world":"isolated"}'
+cua browser tab.select '{"tab_id":N}'     # raise, then capture
+cua browser screenshot --out shot.png
+cua browser session.stop                  # always end the task with this
+cua browser list                          # full ubb tool catalog (73 tools)
 ```
 
-The active tab is persisted (`browser.json`); `open`/`tab-new` make their tab active.
-Prefer selector/text clicks (a11y-first) over coordinates. `browser eval` is local to
-the isolated profile and is the deterministic way to verify DOM state.
+Resolution order for the CLI: `$CUA_UBB`, then `ubb_path` in the cua config, then `PATH`.
+Receipts carry `backend: "ubb"`, `cli`, `call` and ubb's own JSON under `result`.
+The bridge never touches the user's tabs: `tab.list` marks every agent tab
+`session_owned: true`, and `session.stop` closes exactly those.
+Gotchas: `file://` needs "Allow access to file URLs" on the extension (use a local HTTP
+server instead); `screenshot` on a background tab can hang — `tab.select` first, or use
+`cua shot --window <Edge hwnd>`; MAIN-world `evaluate`, destructive labels and
+restricted URLs are refused unless the user confirms.
 
 ## Safety model (Qoder no-negotiables + ZCode grants spirit)
 

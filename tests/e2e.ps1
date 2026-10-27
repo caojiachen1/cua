@@ -182,32 +182,14 @@ for ($k = 0; $k -lt 12; $k++) {
 Check "sandbox isolation: fixture invisible on user desktop" $gone ("leaked: " + (($r.windows | Where-Object { $_.process -eq "testpad.exe" } | ForEach-Object { "pid=$($_.pid)" }) -join ","))
 & $cua sandbox stop | Out-Null
 
-# ---------- 17. browser (isolated CDP) ----------
-$page1 = "$fixturesUri/page1.html"
-$page2 = "$fixturesUri/page2.html"
-& $cua browser close 2>$null | Out-Null
-Start-Sleep -Seconds 1
-$r = J (RunCua browser open $page1)
-Check "browser open: CDP up" ($r.port -eq 9334) "$($r | ConvertTo-Json -Compress)"
-Start-Sleep -Seconds 1
-$r = J (RunCua browser navigate $page1)
-Check "browser navigate: ok" ($r.status -eq "ok") "$($r.detail)"
-$sn = J (RunCua browser snapshot)
-Check "browser snapshot: title" ($sn.snapshot.title -eq "Cua Page One") "$($sn.snapshot.title)"
-$go = $sn.snapshot.clickables | Where-Object { $_.text -eq "GoToPage2" }
-Check "browser snapshot: clickables" ($null -ne $go)
-$r = J (RunCua browser click --x ($go.rect[0] + [int]($go.rect[2]/2)) --y ($go.rect[1] + [int]($go.rect[3]/2)))
-Check "browser click: ok" ($r.status -eq "ok") "$($r.detail)"
-Start-Sleep -Seconds 1
-$sn = J (RunCua browser snapshot)
-Check "browser click: navigated to page2" ($sn.snapshot.title -eq "Cua Page Two") "$($sn.snapshot.title)"
-& $cua browser navigate $page1 | Out-Null; Start-Sleep -Milliseconds 800
-$r = J (RunCua browser click --x 400 --y 350)
-$r = J (RunCua browser type --text "browser-typed")
-Check "browser type: ok" ($r.status -eq "ok") "$($r.detail)"
-$r = J (RunCua browser shot --out "$cache\br-e2e.png")
-Check "browser shot: bytes>1000" ($r.bytes -gt 1000) "$($r.bytes)"
-& $cua browser close | Out-Null
+# ---------- 17. browser bridge (UBB) contract ----------
+$help = (& $cua browser help 2>&1) -join "`n"
+Check "browser help: documents the ubb bridge" ($help -like "*ubb*" -and $help -like "*session.start*") ($help.Substring(0, [Math]::Min(60, $help.Length)))
+$ck = J (RunCua check)
+Check "check: browser backend is ubb" ($ck.browser.backend -eq "ubb") ($ck.browser | ConvertTo-Json -Compress)
+$err = RunErr browser shot --out "$cache
+ope.png"
+Check "old CDP subcommand is gone" ($err -like "*failed*" -or $err -like "*not found*") ($err.Substring(0, [Math]::Min(70, $err.Length)))
 
 # ---------- result ----------
 Write-Host ""

@@ -11,7 +11,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 uiautomation = "0.16"
-tungstenite = "0.26"
 
 [dependencies.windows]
 version = "0.58"

@@ -1,5 +1,5 @@
 ﻿# tests\e2e2.ps1 — phase-2 deep e2e: selectors, unicode/drag/keys, capture, error paths,
-# config override, sandbox deep, browser deep, window ops, exit codes.
+# config override, sandbox deep, ubb bridge contract, window ops, exit codes.
 $ErrorActionPreference = "Continue"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
@@ -26,14 +26,8 @@ function Check($name, $cond, $detail = "") {
 }
 function RunCua { & $cua @args 2>$null }
 function RunErr { (& $cua @args 2>&1) -join "`n" }
-function CloseBrowser {
-    & $cua browser close 2>$null | Out-Null
-    for ($k = 0; $k -lt 20; $k++) {
-        & $cua browser tabs 2>$null | Out-Null
-        if ($LASTEXITCODE -ne 0) { return }
-        Start-Sleep -Milliseconds 500
-    }
-}
+function JsonArg($h) { ($h | ConvertTo-Json -Compress) -replace '"', '\"' }
+function CloseBrowser { & $cua browser session.stop 2>$null | Out-Null }
 
 Write-Host "== cua e2e phase-2 (cli: $cua)" -ForegroundColor Cyan
 
@@ -216,32 +210,31 @@ Check "F8 user foreground unchanged by sandbox" ($fgBefore -eq $fgAfter) "$fgBef
 $r = J (RunCua sandbox stop)
 Check "F10 sandbox stop kills app+keeper" ($r.killed_processes -ge 2) "$($r.killed_processes)"
 
-# ---------- G. browser deep ----------
-$page1 = "$fixturesUri/page1.html"
-$page2 = "$fixturesUri/page2.html"
-CloseBrowser
-& $cua browser open $page1 | Out-Null
-Start-Sleep -Seconds 1
-$openR = J (RunCua browser open $page1)
-Check "G1 open: verified location.href" ($openR.url -like "*page1.html") ($openR | ConvertTo-Json -Compress)
-& $cua browser navigate $page2 | Out-Null
-Start-Sleep -Milliseconds 800
-& $cua browser back | Out-Null
-Start-Sleep -Milliseconds 800
-$sn = J (RunCua browser snapshot)
-Check "G2 back returns to page1" ($sn.snapshot.title -eq "Cua Page One") "$($sn.snapshot.title)"
-& $cua browser navigate $page2 | Out-Null
-Start-Sleep -Milliseconds 800
-$sn = J (RunCua browser snapshot)
-Check "G2b page2 has no clickables" ($sn.snapshot.clickables.Count -eq 0) "count=$($sn.snapshot.clickables.Count)"
-CloseBrowser
-$err = RunErr browser tabs
-Check "G3 browser closed: tabs errors" ($err -like "*connect*") ($err.Substring(0, [Math]::Min(60, $err.Length)))
-& $cua browser open $page1 | Out-Null
-Start-Sleep -Seconds 1
-$sn = J (RunCua browser snapshot)
-Check "G4 browser reopen works" ($sn.snapshot.title -eq "Cua Page One") "$($sn.snapshot.title)"
-& $cua browser close | Out-Null
+# ---------- G. ubb bridge: cli resolution + argument passthrough ----------
+# A stub CLI (node .mjs) proves the contract without touching the user's browser.
+$stub = Join-Path $cache "ubb-stub.mjs"
+Set-Content -Path $stub -Value 'console.log(JSON.stringify({ got: process.argv.slice(2) }))' -Encoding Ascii
+$prevUbb = $env:CUA_UBB
+$env:CUA_UBB = $stub
+$r = J (RunCua browser status)
+Check "G1 ubb cli resolved from `$env:CUA_UBB" ($r.status -eq "ok" -and $r.backend -eq "ubb" -and $r.cli -like "*ubb-stub.mjs") "$($r.cli)"
+Check "G2 tool name forwarded" ($r.result.got[0] -eq "status") ($r.result.got -join "|")
+$params = (@{ url = "http://x/y" } | ConvertTo-Json -Compress)
+$wire = JsonArg @{ url = "http://x/y" }
+$r = J (RunCua browser tab.create $wire)
+Check "G3 json arg forwarded verbatim" ($r.result.got[0] -eq "tab.create" -and $r.result.got[1] -eq $params) ($r.result.got -join "|")
+$stubFail = Join-Path $cache "ubb-stub-fail.mjs"
+Set-Content -Path $stubFail -Value 'console.log(JSON.stringify({ code: "TOOL_FAILED", message: "no such tool" })); process.exit(1)' -Encoding Ascii
+$env:CUA_UBB = $stubFail
+$err = RunErr browser no.such.tool "{}"
+Check "G4 cli failure maps to receipt failed" ($LASTEXITCODE -eq 1 -and $err -like "*failed*" -and $err -like "*no such tool*") "exit=$LASTEXITCODE"
+$env:CUA_UBB = Join-Path $cache "missing-ubb.mjs"
+$prevPath = $env:PATH
+$env:PATH = "$env:SystemRoot\System32"
+$err = RunErr browser status
+$env:PATH = $prevPath
+Check "G5 missing ubb cli reports not found" ($LASTEXITCODE -eq 1 -and $err -like "*not found*") ($err.Substring(0, [Math]::Min(70, $err.Length)))
+if ($prevUbb) { $env:CUA_UBB = $prevUbb } else { Remove-Item Env:CUA_UBB -ErrorAction SilentlyContinue }
 
 # ---------- H. window ops deep ----------
 & $cua launch --exe $testpad | Out-Null

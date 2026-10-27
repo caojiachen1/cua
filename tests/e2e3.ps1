@@ -1,7 +1,7 @@
 ﻿# tests\e2e3.ps1 - phase-3: a11y patterns (toggle/select/range), right/double by index,
 # background (message-level) input on the user desktop, hover/cursor/wait/resize, exact-title
 # selectors, window-scoped shot guard, diff value changes, sandbox multi-app + a11y parity,
-# browser selector/eval/wait/tabs.
+# browser bridge (UBB: session/tab/find/click/evaluate/screenshot) and env hygiene.
 $ErrorActionPreference = "Continue"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
@@ -28,6 +28,7 @@ function Check($name, $cond, $detail = "") {
 }
 function RunCua { & $cua @args 2>$null }
 function RunErr { (& $cua @args 2>&1) -join "`n" }
+function JsonArg($h) { ($h | ConvertTo-Json -Compress) -replace '"', '\"' }
 function Node($st, $type, $name = $null) {
     if ($null -eq $name) { return ($st.nodes | Where-Object { $_.type -eq $type } | Select-Object -First 1) }
     return ($st.nodes | Where-Object { $_.type -eq $type -and $_.name -eq $name } | Select-Object -First 1)
@@ -35,14 +36,7 @@ function Node($st, $type, $name = $null) {
 function Val($sel, $idx) { (J (RunCua get-value --window $sel --index $idx)).value }
 function ShotId($sel) { (J (RunCua shot --window $sel --out "$cache\p3.png")).state_id }
 function FgHwnd { (J (RunCua apps)).foreground_hwnd }
-function CloseBrowser {
-    & $cua browser close 2>$null | Out-Null
-    for ($k = 0; $k -lt 20; $k++) {
-        & $cua browser tabs 2>$null | Out-Null
-        if ($LASTEXITCODE -ne 0) { return }
-        Start-Sleep -Milliseconds 400
-    }
-}
+function CloseBrowser { & $cua browser session.stop 2>$null | Out-Null }
 
 Write-Host "== cua e2e phase-3 (cli: $cua)" -ForegroundColor Cyan
 
@@ -295,74 +289,72 @@ Check "D12 sandbox apps invisible on user desktop" ((@($userApps.windows | Where
 $r = J (RunCua sandbox stop)
 Check "D13 sandbox stop cleans up" ($r.killed_processes -ge 2) "$($r.killed_processes)"
 
-# ---------- E. browser: selector / eval / wait / tabs ----------
-$page1 = "$fixturesUri/page1.html"
-$page2 = "$fixturesUri/page2.html"
-$page3 = "$fixturesUri/page3.html"
-CloseBrowser
-$r = J (RunCua browser open $page1)
-Start-Sleep -Milliseconds 800
-$tabs = J (RunCua browser tabs)
-Check "E1 browser open: one active tab" ($r.url -like "*page1.html" -and $tabs.count -eq 1 -and $tabs.tabs[0].active -eq $true) "$($tabs | ConvertTo-Json -Compress)"
-$sn = J (RunCua browser snapshot)
-Check "E2 snapshot title + clickables" ($sn.snapshot.title -eq "Cua Page One" -and @($sn.snapshot.clickables | Where-Object { $_.text -eq "GoToPage2" }).Count -eq 1) "$($sn.snapshot.title)"
-$r = J (RunCua browser click --selector "#go")
-Start-Sleep -Milliseconds 800
-$title = (J (RunCua browser eval "document.title")).result
-Check "E3 browser click --selector" ($r.status -eq "ok" -and $title -eq "Cua Page Two") "$($r.detail) / $title"
-& $cua browser navigate $page1 | Out-Null
-$cjk = ([string][char]0x4E2D) + ([char]0x6587)
-$typed = "hello-$cjk"
-$r = J (RunCua browser type --text $typed --selector "#box")
-$v = (J (RunCua browser eval "document.querySelector('#box').value")).result
-Check "E4 browser type --selector (unicode)" ($r.status -eq "ok" -and $v -eq $typed) "$($r.detail) / $v"
-$r = J (RunCua browser eval "1+2*3")
-Check "E5 browser eval" ($r.result -eq 7) "$($r.result)"
-$r = J (RunCua browser click --text "Go")
-Start-Sleep -Milliseconds 800
-$title = (J (RunCua browser eval "document.title")).result
-Check "E6 browser click --text" ($r.status -eq "ok" -and $title -eq "Cua Page Two") "$($r.detail) / $title"
-& $cua browser navigate $page1 | Out-Null
-$newTab = J (RunCua browser tab-new $page3)
-Start-Sleep -Seconds 1
-$tabs = J (RunCua browser tabs)
-Check "E7 tab-new makes new tab active" ($tabs.count -eq 2 -and @($tabs.tabs | Where-Object { $_.id -eq $newTab.id -and $_.active }).Count -eq 1) "$($tabs | ConvertTo-Json -Compress)"
-$r = J (RunCua browser wait --selector "#dyn" --timeout-ms 4000)
-Check "E8 browser wait --selector (dynamic)" ($r.satisfied -eq $true -and $r.title -eq "Cua Page Three") "$($r | ConvertTo-Json -Compress)"
-$r = J (RunCua browser wait --text "Dynamic Button" --timeout-ms 2000)
-Check "E9 browser wait --text" ($r.satisfied -eq $true) "$($r | ConvertTo-Json -Compress)"
-$sw = [Diagnostics.Stopwatch]::StartNew()
-& $cua browser wait --selector "#no-such-element" --timeout-ms 500 2>$null | Out-Null
-$code = $LASTEXITCODE
-$sw.Stop()
-Check "E10 browser wait timeout exits 1" ($code -eq 1 -and $sw.ElapsedMilliseconds -lt 3000) "code=$code ms=$($sw.ElapsedMilliseconds)"
-$r = J (RunCua browser click --text "Act")
-$out = (J (RunCua browser eval "document.getElementById('out').textContent")).result
-Check "E11 click --text triggers handler" ($r.status -eq "ok" -and $out -eq "clicked") "$($r.detail) / $out"
-$r = J (RunCua browser scroll --dy 300)
-$sy = (J (RunCua browser eval "window.scrollY")).result
-Check "E12 browser scroll" ($r.status -eq "ok" -and $sy -ge 300) "scrollY=$sy"
-$r = J (RunCua browser reload)
-$title = (J (RunCua browser eval "document.title")).result
-Check "E13 browser reload" ($r.status -eq "ok" -and $title -eq "Cua Page Three") "$($r.detail) / $title"
-$tabs = J (RunCua browser tabs)
-$page1Tab = $tabs.tabs | Where-Object { $_.url -like "*page1.html" } | Select-Object -First 1
-$page3Tab = $tabs.tabs | Where-Object { $_.url -like "*page3.html" } | Select-Object -First 1
-$r = J (RunCua browser tab-switch $page1Tab.id)
-$title = (J (RunCua browser eval "document.title")).result
-Check "E14 tab-switch by id" ($r.action -eq "switch" -and $title -eq "Cua Page One") "$($r | ConvertTo-Json -Compress)"
-$r = J (RunCua browser tab-close $page3Tab.id)
-Start-Sleep -Milliseconds 500
-$tabs = J (RunCua browser tabs)
-Check "E15 tab-close by id" ($r.success -eq $true -and $tabs.count -eq 1) "$($tabs | ConvertTo-Json -Compress)"
-$r = J (RunCua browser click --selector "#no-such")
-Check "E16 browser selector miss fails" ($r.status -eq "failed" -and $r.detail -like "*selector not found*") "$($r.detail)"
-$err = RunErr browser wait --timeout-ms 300
-Check "E17 browser wait without condition errors" ($err -like "*requires --selector or --text*") ($err.Substring(0, [Math]::Min(80, $err.Length)))
-$checkBr = J (RunCua check)
-Check "E18 check reports browser CDP up" ($checkBr.browser.cdp_up -eq $true) "$($checkBr.browser | ConvertTo-Json -Compress)"
-& $cua browser close | Out-Null
-Start-Sleep -Milliseconds 800
+# ---------- E. browser bridge (UBB) ----------
+# cua has no browser of its own: `cua browser ...` forwards to the ubb CLI, which drives
+# the user's real Edge through the UBB extension. Needs a fixture server, so it is gated.
+$ubbReady = $false
+$st = J (RunCua browser status)
+if ($st.status -eq "ok" -and $st.result.extension -eq $true) { $ubbReady = $true }
+$py = $null
+if (Get-Command python -ErrorAction SilentlyContinue) { $py = "python" }
+$port = 8799
+$srv = $null
+if ($ubbReady -and $py) {
+    $srv = Start-Process -FilePath $py `
+        -ArgumentList @("-m", "http.server", "$port", "--directory", (Join-Path $root "tests\fixtures")) `
+        -PassThru -WindowStyle Hidden
+    for ($k = 0; $k -lt 30; $k++) {
+        try { Invoke-WebRequest "http://127.0.0.1:$port/page1.html" -UseBasicParsing -TimeoutSec 2 | Out-Null; break }
+        catch { Start-Sleep -Milliseconds 200 }
+    }
+}
+Check "E0 ubb extension + fixture server ready" ($ubbReady -and $null -ne $py) "ubb=$ubbReady python=$($null -ne $py)"
+if ($ubbReady -and $py) {
+    $base = "http://127.0.0.1:$port"
+    & $cua browser session.stop 2>$null | Out-Null
+    $r = J (RunCua browser session.start)
+    Check "E1 session.start" ($r.status -eq "ok" -and $r.result.session_id) "$($r.detail)"
+    $r = J (RunCua browser tab.create (JsonArg @{ url = "$base/page1.html" }))
+    Check "E2 tab.create" ($r.status -eq "ok" -and $r.result.url -like "*page1.html*") "$($r.detail)"
+    Start-Sleep -Milliseconds 1500
+    $pg = J (RunCua browser read_page)
+    Check "E3 read_page title" ($pg.result.title -eq "Cua Page One") "$($pg.result.title)"
+    $f = J (RunCua browser find (JsonArg @{ query = "GoToPage2" }))
+    $ref = $f.result.matches[0].ref
+    Check "E4 find returns a ref" ($f.status -eq "ok" -and $ref) "$($f | ConvertTo-Json -Compress)"
+    $r = J (RunCua browser click (JsonArg @{ ref = $ref }))
+    Check "E5 click by ref" ($r.status -eq "ok") "$($r.detail)"
+    $w = J (RunCua browser wait_for (JsonArg @{ condition = "url_contains"; text = "page2" }))
+    Check "E6 wait_for url_contains" ($w.result.ok -eq $true) "$($w | ConvertTo-Json -Compress)"
+    $pg = J (RunCua browser read_page)
+    Check "E7 page navigated by ref click" ($pg.result.title -eq "Cua Page Two") "$($pg.result.title)"
+    $e = J (RunCua browser evaluate (JsonArg @{ expression = "6*7"; world = "isolated" }))
+    Check "E8 evaluate isolated needs no confirm" ($e.result.value -eq 42) "$($e.detail)"
+    $err = RunErr browser evaluate (JsonArg @{ expression = "6*7"; world = "main" })
+    Check "E9 evaluate MAIN world refused without confirm" ($err -like "*NEEDS_CONFIRM*" -and $err -like "*failed*") ($err.Substring(0, [Math]::Min(90, $err.Length)))
+    $e = J (RunCua browser evaluate (JsonArg @{ expression = "6*7"; world = "main"; confirm = $true }))
+    Check "E10 evaluate MAIN world with confirm" ($e.result.value -eq 42) "$($e.detail)"
+    $tid = $e.result.tab_id
+    $tl = J (RunCua browser tab.list)
+    $mine = @($tl.result.tabs | Where-Object { $_.session_owned -and $_.url -like "*page2.html*" })
+    Check "E11 tab.list marks the session tab" ($mine.Count -ge 1) "$($tl.result.tabs.Count) tabs"
+    & $cua browser tab.select (JsonArg @{ tab_id = $mine[0].tab_id }) | Out-Null
+    Start-Sleep -Milliseconds 800
+    $shotPath = Join-Path $cache "ubb-shot.png"
+    Remove-Item $shotPath -Force -ErrorAction SilentlyContinue
+    $sh = J (RunCua browser screenshot --out $shotPath)
+    $bytes = if (Test-Path $shotPath) { (Get-Item $shotPath).Length } else { 0 }
+    Check "E12 screenshot of the selected tab" ($sh.status -eq "ok" -and $bytes -gt 1000) "bytes=$bytes $($sh.detail)"
+    $bad = RunErr browser no.such.tool
+    Check "E13 unknown ubb tool exits 1" ($LASTEXITCODE -eq 1 -and $bad -like "*failed*") "exit=$LASTEXITCODE"
+    $sp = J (RunCua browser session.stop)
+    Check "E14 session.stop" ($sp.result.stopped -eq $true) "$($sp.detail)"
+    Start-Sleep -Milliseconds 800
+    $tl = J (RunCua browser tab.list)
+    $left = @($tl.result.tabs | Where-Object { $_.session_owned })
+    Check "E15 agent tabs closed after stop" ($left.Count -eq 0) "$($left.Count) left"
+}
+if ($srv -and -not $srv.HasExited) { Stop-Process -Id $srv.ProcessId -Force -ErrorAction SilentlyContinue }
 
 # ---------- F. performance + final cleanup ----------
 $sw = [Diagnostics.Stopwatch]::StartNew()

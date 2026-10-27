@@ -3,10 +3,10 @@
 // confirmation levels), Trae (tool surface incl. batch/clipboard/grounding/verify steps),
 // ZCode (a11y-first, strategy auto|a11y|event, action receipts, background observation),
 // + sandbox hidden-desktop executor for true background control.
-mod browser;
 mod capture;
 mod input;
 mod sandbox;
+mod ubb;
 mod uia;
 mod util;
 mod win;
@@ -375,10 +375,11 @@ enum Cmd {
         #[command(subcommand)]
         op: SandboxOp,
     },
-    /// Isolated CDP browser (own profile & port; ZCode browser-use analog)
+    /// Browser control bridged to UBB (the user's own Edge/Chrome); `browser help` lists tools
     Browser {
-        #[command(subcommand)]
-        op: BrowserOp,
+        /// ubb tool name + JSON params, e.g. `tab.create {"url":"example.com"}`
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        rest: Vec<String>,
     },
 }
 
@@ -545,81 +546,6 @@ enum SandboxOp {
     Keepalive,
 }
 
-#[derive(Subcommand)]
-enum BrowserOp {
-    /// Launch isolated browser (own profile + debug port) and optionally navigate
-    Open {
-        url: Option<String>,
-        #[arg(long)]
-        exe: Option<String>,
-    },
-    /// List CDP targets/tabs
-    Tabs,
-    Navigate { url: String },
-    Shot {
-        #[arg(long)]
-        out: String,
-    },
-    /// AI/ARIA-lite snapshot: title, text, clickable elements (ZCode domSnapshot analog)
-    Snapshot,
-    Click {
-        #[arg(long, allow_hyphen_values = true)]
-        x: Option<i32>,
-        #[arg(long, allow_hyphen_values = true)]
-        y: Option<i32>,
-        #[arg(long, help = "CSS selector (a11y-first browser click)")]
-        selector: Option<String>,
-        #[arg(long, help = "clickable text (exact, then contains)")]
-        text: Option<String>,
-    },
-    Type {
-        #[arg(long)]
-        text: String,
-        #[arg(long, help = "CSS selector to focus before typing")]
-        selector: Option<String>,
-        #[arg(long, help = "clear the field before typing")]
-        clear: bool,
-    },
-    Keys {
-        #[arg(long)]
-        keys: String,
-    },
-    /// Evaluate JavaScript in the active tab and print the result
-    Eval {
-        expr: String,
-    },
-    /// Wait until a selector/text appears in the active tab
-    Wait {
-        #[arg(long)]
-        selector: Option<String>,
-        #[arg(long)]
-        text: Option<String>,
-        #[arg(long, default_value_t = 10000)]
-        timeout_ms: u64,
-    },
-    Reload,
-    /// Scroll the active tab (CSS pixels)
-    Scroll {
-        #[arg(long, default_value_t = 0, allow_hyphen_values = true)]
-        dx: i32,
-        #[arg(long, default_value_t = 0, allow_hyphen_values = true)]
-        dy: i32,
-    },
-    /// Open a new tab (and make it active)
-    TabNew {
-        url: Option<String>,
-    },
-    /// Switch the active tab by 0-based index or target id
-    TabSwitch {
-        target: String,
-    },
-    /// Close a tab by 0-based index or target id
-    TabClose {
-        target: String,
-    },
-    Back,
-    Close,
-}
 
 fn main() {
     win::dpi_aware();
@@ -696,7 +622,7 @@ fn dispatch(cmd: Cmd) -> i32 {
             Cmd::Batch { file, continue_on_error } => cmd_batch(&file, continue_on_error),
             Cmd::Replay { name, verify } => cmd_replay(&name, verify),
             Cmd::Sandbox { op } => sandbox::dispatch(op),
-            Cmd::Browser { op } => browser::dispatch(op),
+            Cmd::Browser { rest } => ubb::cmd_browser(&rest),
         }
     })();
     match r {
@@ -866,11 +792,7 @@ fn cmd_check() -> Result<i32> {
         .unwrap_or(0);
     let cfg = util::load_config();
     let (cx, cy) = input::cursor_pos();
-    let browser_up = std::net::TcpStream::connect_timeout(
-        &std::net::SocketAddr::from(([127, 0, 0, 1], browser::PORT)),
-        std::time::Duration::from_millis(200),
-    )
-    .is_ok();
+    let ubb_cli = ubb::resolve().map(|c| c.label());
     let out = json!({
         "tool": "cua",
         "version": env!("CARGO_PKG_VERSION"),
@@ -880,7 +802,7 @@ fn cmd_check() -> Result<i32> {
         "screen": {"virtual": [vx, vy, vw, vh], "primary": [pw, ph]},
         "cursor": [cx, cy],
         "sandbox": sandbox::status(),
-        "browser": {"port": browser::PORT, "cdp_up": browser_up},
+        "browser": {"backend": "ubb", "cli": ubb_cli},
         "safety": {
             "deny_processes": cfg.deny_processes,
             "require_shot_id_for_coords": cfg.require_shot_id_for_coords,
