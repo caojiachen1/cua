@@ -167,8 +167,27 @@ server instead); `screenshot` on a background tab can hang — `tab.select` firs
 `cua shot --window <Edge hwnd>`; MAIN-world `evaluate`, destructive labels and
 restricted URLs are refused unless the user confirms.
 
-## Safety model (Qoder no-negotiables + ZCode grants spirit)
+## Screen recording (`cua rec`)
 
+Records what an agent did, for review:
+
+```bash
+cua rec start [--window W] [--fps 2] [--out NAME] [--max-seconds 900]
+cua rec status                      # frames captured so far
+cua rec stop [--out file.mp4] [--keep-frames]
+```
+
+`start` spawns a detached capture loop (its own process, no handle inheritance, so it never
+blocks the caller's pipeline); frames are JPEG under
+`%LOCALAPPDATA%\cua\recordings\NAME\frames`. `stop` signals it through a STOP file, waits
+for it to finish, then encodes with ffmpeg when one is reachable (`$CUA_FFMPEG`, config
+`ffmpeg_path`, or PATH) into `NAME.mp4`; without ffmpeg it writes a self-contained
+`player.html` that replays the same frames. Capture is passive (GDI), so it never disturbs
+the user, and frames whose window refused to render are skipped rather than recorded black.
+Pair it with `--record TRACE` on each action: the video shows what happened, the trace
+(`cua replay TRACE [--verify]`) shows what the agent asked for.
+
+## Safety model (Qoder no-negotiables + ZCode grants spirit)
 - Deny list (never automate): terminals (cmd/powershell/pwsh/wt), taskmgr, regedit,
   mmc, control, password managers (1password/keepass/bitwarden/…), system settings.
 - Windows-logo key refused. `close` and `alt+f4` require `--confirm` (Always-Confirm).

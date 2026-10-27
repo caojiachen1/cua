@@ -2,7 +2,8 @@
 
 Rust CLI for driving Windows desktop apps: UIA accessibility tree + screenshots, a11y-first
 actions, real `SendInput`, message-level background input, a hidden-desktop sandbox for true
-background control, browser control bridged to UBB, and JSON action receipts with safety guards.
+background control, browser control bridged to UBB, screen recording, and JSON action
+receipts with safety guards.
 
 ## Install
 
@@ -29,6 +30,8 @@ cua type --window App --text hi --background           # message-level, focus st
 cua wait --window "title:Report" --gone                # also: hover / cursor / resize / restore
 cua sandbox start --exe D:\app.exe                     # run and control on an invisible desktop
 cua launch --exe "C:\Windows\System32\msinfo32.exe" --cwd D:\    # env sanitized by default
+cua rec start --fps 2 --out session                    # record the screen while you work
+cua rec stop                                           # -> mp4 with ffmpeg, else an HTML player
 cua browser tab.create '{"url":"https://example.com"}'  # bridged to UBB (the user's Edge)
 cua browser find '{"query":"Sign in"}'                   # -> @ref
 cua browser click '{"ref":"@d1"}'
@@ -47,13 +50,14 @@ Windows Settings (including `ms-settings:` URIs), and the Win key.
 ## Tests
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tests\run-all.ps1    # 261 assertions, 5 suites
+powershell -ExecutionPolicy Bypass -File tests\run-all.ps1    # 285 assertions, 6 suites
 ```
 
 Suites cover the CLI surface, deep behaviours (unicode input, drag, capture, error paths),
 control patterns and geometry, the UBB browser bridge, stock Windows apps (Notepad, Character
 Map, System Information, Volume Mixer, Explorer) and third-party desktop apps (QQ Music,
-NetEase Cloud Music, Soda Music — skipped when not installed).
+NetEase Cloud Music, Soda Music — skipped when not installed), and a long-horizon
+Bilibili scenario that is screen-recorded end to end (`cua rec`).
 
 ## Known limits
 

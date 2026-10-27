@@ -157,3 +157,14 @@ pub fn save_png(shot: &Shot, path: &std::path::Path) -> Result<()> {
     img.save_with_format(path, image::ImageFormat::Png)?;
     Ok(())
 }
+
+/// JPEG is what the screen recorder writes: an 8-bit RGB encode is ~10x smaller than PNG
+/// and fast enough to keep up with a few frames per second.
+pub fn save_jpeg(shot: &Shot, path: &std::path::Path, quality: u8) -> Result<()> {
+    let img = RgbaImage::from_raw(shot.width, shot.height, shot.rgba.clone())
+        .ok_or_else(|| anyhow::anyhow!("bad image buffer"))?;
+    let rgb = image::DynamicImage::ImageRgba8(img).to_rgb8();
+    let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut f, quality).encode_image(&rgb)?;
+    Ok(())
+}

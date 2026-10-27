@@ -5,6 +5,7 @@
 // + sandbox hidden-desktop executor for true background control.
 mod capture;
 mod input;
+mod rec;
 mod sandbox;
 mod ubb;
 mod uia;
@@ -381,6 +382,46 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         rest: Vec<String>,
     },
+    /// Screen recording (JPEG frames -> mp4, or an HTML player when ffmpeg is missing)
+    Rec {
+        #[command(subcommand)]
+        op: RecOp,
+    },
+}
+
+#[derive(Subcommand)]
+enum RecOp {
+    /// Start capturing in a detached background process
+    Start {
+        #[arg(long)]
+        window: Option<String>,
+        #[arg(long, default_value_t = 2)]
+        fps: u32,
+        #[arg(long)]
+        out: Option<String>,
+        #[arg(long, default_value_t = 900, help = "hard stop so a forgotten recording cannot fill the disk")]
+        max_seconds: u64,
+    },
+    /// Stop, encode, and report the artifact
+    Stop {
+        #[arg(long)]
+        out: Option<String>,
+        #[arg(long)]
+        keep_frames: bool,
+    },
+    Status,
+    /// Internal: the detached capture loop
+    #[command(hide = true)]
+    Capture {
+        #[arg(long)]
+        dir: String,
+        #[arg(long)]
+        fps: u32,
+        #[arg(long)]
+        window: Option<String>,
+        #[arg(long, default_value_t = 900)]
+        max_seconds: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -623,6 +664,12 @@ fn dispatch(cmd: Cmd) -> i32 {
             Cmd::Replay { name, verify } => cmd_replay(&name, verify),
             Cmd::Sandbox { op } => sandbox::dispatch(op),
             Cmd::Browser { rest } => ubb::cmd_browser(&rest),
+            Cmd::Rec { op } => match op {
+                RecOp::Start { window, fps, out, max_seconds } => rec::cmd_start(window, fps, out, max_seconds),
+                RecOp::Stop { out, keep_frames } => rec::cmd_stop(out, keep_frames),
+                RecOp::Status => rec::cmd_status(),
+                RecOp::Capture { dir, fps, window, max_seconds } => rec::cmd_capture(&dir, fps, window, max_seconds),
+            },
         }
     })();
     match r {
@@ -636,12 +683,12 @@ fn dispatch(cmd: Cmd) -> i32 {
 
 // ---------------- helpers ----------------
 
-struct Target {
-    info: WinInfo,
-    hwnd: windows::Win32::Foundation::HWND,
+pub(crate) struct Target {
+    pub(crate) info: WinInfo,
+    pub(crate) hwnd: windows::Win32::Foundation::HWND,
 }
 
-fn resolve_target(sel: &str) -> Result<Target> {
+pub(crate) fn resolve_target(sel: &str) -> Result<Target> {
     let hwnd = resolve_window(sel)?;
     let info = win::snapshot_window(hwnd).ok_or_else(|| anyhow!("cannot snapshot window"))?;
     Ok(Target { info, hwnd })
