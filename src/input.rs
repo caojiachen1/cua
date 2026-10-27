@@ -80,7 +80,7 @@ pub fn move_to(x: i32, y: i32) -> Result<()> {
     };
     let n = unsafe { SendInput(&[inp], std::mem::size_of::<INPUT>() as i32) };
     if n != 1 {
-        bail!("SendInput move failed");
+        bail!("SendInput move failed: {}", windows::core::Error::from_win32());
     }
     Ok(())
 }

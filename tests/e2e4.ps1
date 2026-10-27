@@ -1,4 +1,4 @@
-# tests\e2e4.ps1 - phase-4: real Windows applications (no fixtures).
+﻿# tests\e2e4.ps1 - phase-4: real Windows applications (no fixtures).
 # Covers UIA control parsing per control type/pattern, control-level actions with verified
 # side effects, background (message-level) control while another window keeps focus,
 # hidden-desktop sandbox with real apps + process cleanup, deny list on real windows,
@@ -425,6 +425,19 @@ Check "D5 sandbox message-level scroll ok" ($r.status -eq "ok") "$($r.detail)"
 $userWins = (J (RunCua apps)).windows | Where-Object { $_.process -eq "msinfo32.exe" }
 $userOnlySandbox = @($userWins | Where-Object { $preMsSb -notcontains $_.pid }).Count
 Check "D6 sandboxed app invisible on the user desktop" ($userOnlySandbox -eq 0) "leaked=$userOnlySandbox"
+# non-interference: these gestures would move the real pointer if they were SendInput-based,
+# so the user's cursor and focus must be bit-identical afterwards
+$rct = $sbSt.window.rect
+$cx = $rct[0] + [int]($rct[2] / 2); $cy = $rct[1] + [int]($rct[3] / 2)
+$cur0 = J (RunCua cursor)
+$sbShot2 = J (RunCua sandbox shot --window $MS --out "$cache\e4-sb2.png")
+$cli = J (RunCua sandbox click --window $MS --x $cx --y $cy --shot-id $sbShot2.state_id)
+$dr = J (RunCua sandbox drag --x1 ($cx - 30) --y1 ($cy - 20) --x2 ($cx + 30) --y2 ($cy + 20))
+$cur1 = J (RunCua cursor)
+$fgNow = (J (RunCua apps)).foreground_hwnd
+Check "D6b sandbox coordinate click + drag need no real pointer" ($cli.status -eq "ok" -and $dr.status -eq "ok") "click=$($cli.status) drag=$($dr.status)"
+Check "D6c the user's cursor never moved" ($cur0.x -eq $cur1.x -and $cur0.y -eq $cur1.y) "$($cur0.x),$($cur0.y) -> $($cur1.x),$($cur1.y)"
+Check "D6d the user's foreground window never changed" ($fgNow -eq $fgSb) "$fgSb -> $fgNow"
 $fgMid = (J (RunCua apps)).foreground_hwnd
 & $cua sandbox state --window $MS --no-shot | Out-Null
 $fg6 = (J (RunCua apps)).foreground_hwnd

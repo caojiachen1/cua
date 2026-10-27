@@ -140,6 +140,13 @@ cua sandbox stop                                        # app(s) + keeper
 
 Sandbox input is a11y + message-level (PostMessage); real SendInput cannot target a
 non-input desktop (OS rule). Shortcuts that read raw key state need foreground mode.
+This is not an implementation gap: a keeper thread attached to the hidden desktop and calling
+`SendInput` gets `ERROR_ACCESS_DENIED` back, because the system only accepts injected input
+for the desktop that is currently the input desktop. Real keyboard/mouse plus zero user
+disturbance is therefore only possible from **another logon session or a VM** (that session
+has its own input desktop); inside one session the choice is UIA patterns and window
+messages, which is what the sandbox uses. The suite asserts the flip side: driving the
+sandbox never moves the user's cursor and never changes their foreground window.
 The hidden desktop supports multiple apps; `sandbox.json` tracks all pids for cleanup.
 
 ## Browser (bridged to UBB — the user's own Edge/Chrome)
