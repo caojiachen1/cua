@@ -29,11 +29,21 @@ cua toggle --window App --index 3                      # also: select / expand /
 cua grid --window App --index 3 --row 2 --col 1         # GridPattern: address a table cell
 cua transform --window App --index 0 --move-to 400,300  # move a window with no mouse
 cua type --window App --text hi --background           # message-level, focus stays put
+cua type --window App --text hi --background --index N # aim at one field in a multi-edit window
 cua wait --window "title:Report" --gone                # also: hover / cursor / resize / restore
+cua wait --window App --index 6 --value "Ready"        # element-level wait (toggle/selected/expanded/enabled)
+cua text --window Notepad --index 6 --max-chars 80     # TextPattern range (bounded)
+cua scroll-item --window App --index 9 --align-top     # ScrollItemPattern into view
+cua table --window Explorer --index 28                  # Table column headers
+cua find-item --window Explorer --index 28 --property name --value file.txt
+cua select-add --window App --index 4                   # multi-select: also select-remove
+cua ocr --window Notepad                                # local Windows OCR; also --screen/--file
+cua ocr --file "$env:TEMP\shot.png" --max-lines 50
 cua sandbox start --exe D:\app.exe                     # run and control on an invisible desktop
 cua launch --exe "C:\Windows\System32\msinfo32.exe" --cwd D:\    # env sanitized by default
 cua rec start --fps 2 --out session                    # record the screen while you work
 cua rec stop                                           # -> mp4 with ffmpeg, else an HTML player
+cua rec cancel                                         # force-stop a stuck recorder, keep frames
 cua browser tab.create '{"url":"https://example.com"}'  # bridged to UBB (the user's Edge)
 cua browser find '{"query":"Sign in"}'                   # -> @ref
 cua browser click '{"ref":"@d1"}'
@@ -41,7 +51,9 @@ cua browser click '{"ref":"@d1"}'
 
 Selectors: title substring, `title:Exact`, `process:name.exe`, `class:X`, `pid:N`, hwnd.
 Coordinate actions need a fresh `--shot-id` from the observed window (screen captures cover
-any point). Every action prints `cua-action-receipt-v1`; exit 0 ok, 1 failed, 2 refused.
+any point); this includes sandbox scroll/drag at explicit coordinates. Every action prints
+`cua-action-receipt-v1`; exit 0 ok, 1 failed, 2 refused. Set `CUA_DATA_DIR` to keep a
+session's config, cache, sandbox state and recordings out of `%LOCALAPPDATA%\cua`.
 `launch` strips `ELECTRON_*`/`NODE_*`/crashpad variables so Electron apps do not start as bare
 Node and exit silently; `--no-clean-env` inherits them. Electron/Chromium UIs need
 `--args "--force-renderer-accessibility"` before their DOM shows up in the UIA tree.
@@ -52,7 +64,7 @@ Windows Settings (including `ms-settings:` URIs), and the Win key.
 ## Tests
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tests\run-all.ps1    # 308 assertions, 7 suites
+powershell -ExecutionPolicy Bypass -File tests\run-all.ps1    # 8 suites, 372 passed + 1 env skip
 powershell -ExecutionPolicy Bypass -File tools\uia-probe.ps1 -Apps qqmusic,cloudmusic  # capability report
 ```
 

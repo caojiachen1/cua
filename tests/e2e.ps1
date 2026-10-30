@@ -2,11 +2,15 @@
 $ErrorActionPreference = "Continue"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
-$cua = "$root\bin\cua.exe"
+$cua = $env:CUA_TEST_BIN
+if (-not $cua -or -not (Test-Path $cua)) { $cua = "$root\bin\cua.exe" }
 if (-not (Test-Path $cua)) { $cua = "$root\target\debug\cua.exe" }
-$testpad = "$root\bin\testpad.exe"
+$testpad = $env:CUA_TEST_TESTPAD
+if (-not $testpad -or -not (Test-Path $testpad)) { $testpad = "$root\bin\testpad.exe" }
 if (-not (Test-Path $testpad)) { $testpad = "$root\target\debug\testpad.exe" }
-$cache = Join-Path $env:LOCALAPPDATA "cua\cache"
+$dataRoot = if ($env:CUA_DATA_DIR) { $env:CUA_DATA_DIR } else { Join-Path $env:LOCALAPPDATA "cua" }
+$cache = Join-Path $dataRoot "cache"
+Write-Host ("== binary: {0} ({1})" -f $cua, (Get-FileHash $cua -Algorithm SHA256).Hash.Substring(0, 12)) -ForegroundColor DarkGray
 $fixturesUri = ([System.Uri](Join-Path $root "tests\fixtures")).AbsoluteUri.TrimEnd("/")
 New-Item -ItemType Directory -Force -Path $cache | Out-Null
 $script:pass = 0; $script:fail = 0; $script:failures = @()
@@ -21,6 +25,7 @@ function Check($name, $cond, $detail = "") {
     if ($cond) { $script:pass++; Write-Host ("  PASS  {0}" -f $name) -ForegroundColor Green }
     else { $script:fail++; $script:failures += $name; Write-Host ("  FAIL  {0}  {1}" -f $name, $detail) -ForegroundColor Red }
 }
+function RunErr { (& $cua @args 2>&1) -join "`n" }
 function RunCua { & $cua @args 2>$null }
 
 Write-Host "== cua e2e (cli: $cua)" -ForegroundColor Cyan
@@ -34,7 +39,7 @@ Write-Host "== cua e2e (cli: $cua)" -ForegroundColor Cyan
 taskkill /IM testpad.exe /F 2>$null | Out-Null
 
 
-$rec = Join-Path $env:LOCALAPPDATA "cua\recordings"; if (Test-Path $rec) { Remove-Item (Join-Path $rec "*.jsonl") -Force -ErrorAction SilentlyContinue }
+$rec = Join-Path $dataRoot "recordings"; if (Test-Path $rec) { Remove-Item (Join-Path $rec "*.jsonl") -Force -ErrorAction SilentlyContinue }
 Start-Sleep -Milliseconds 800
 
 # ---------- 1. check ----------
@@ -187,8 +192,7 @@ $help = (& $cua browser help 2>&1) -join "`n"
 Check "browser help: documents the ubb bridge" ($help -like "*ubb*" -and $help -like "*session.start*") ($help.Substring(0, [Math]::Min(60, $help.Length)))
 $ck = J (RunCua check)
 Check "check: browser backend is ubb" ($ck.browser.backend -eq "ubb") ($ck.browser | ConvertTo-Json -Compress)
-$err = RunErr browser shot --out "$cache
-ope.png"
+$err = RunErr browser shot --out "$cache\e2e-browser-scope.png"
 Check "old CDP subcommand is gone" ($err -like "*failed*" -or $err -like "*not found*") ($err.Substring(0, [Math]::Min(70, $err.Length)))
 
 # ---------- result ----------

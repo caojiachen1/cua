@@ -6,13 +6,17 @@
 $ErrorActionPreference = "Continue"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
-$cua = "$root\bin\cua.exe"
+$cua = $env:CUA_TEST_BIN
+if (-not $cua -or -not (Test-Path $cua)) { $cua = "$root\bin\cua.exe" }
 if (-not (Test-Path $cua)) { $cua = "$root\target\debug\cua.exe" }
-$testpad = "$root\bin\testpad.exe"
+$testpad = $env:CUA_TEST_TESTPAD
+if (-not $testpad -or -not (Test-Path $testpad)) { $testpad = "$root\bin\testpad.exe" }
 if (-not (Test-Path $testpad)) { $testpad = "$root\target\debug\testpad.exe" }
-$cache = Join-Path $env:LOCALAPPDATA "cua\cache"
+$dataRoot = if ($env:CUA_DATA_DIR) { $env:CUA_DATA_DIR } else { Join-Path $env:LOCALAPPDATA "cua" }
+$cache = Join-Path $dataRoot "cache"
+Write-Host ("== binary: {0} ({1})" -f $cua, (Get-FileHash $cua -Algorithm SHA256).Hash.Substring(0, 12)) -ForegroundColor DarkGray
 New-Item -ItemType Directory -Force -Path $cache | Out-Null
-$script:pass = 0; $script:fail = 0; $script:failures = @()
+$script:pass = 0; $script:fail = 0; $script:skip = 0; $script:failures = @()
 
 function J($out) {
     $s = ($out -join "`n")
@@ -24,6 +28,9 @@ function J($out) {
 function Check($name, $cond, $detail = "") {
     if ($cond) { $script:pass++; Write-Host ("  PASS  {0}" -f $name) -ForegroundColor Green }
     else { $script:fail++; $script:failures += $name; Write-Host ("  FAIL  {0}  {1}" -f $name, $detail) -ForegroundColor Red }
+}
+function Skip($name, $why) {
+    $script:skip++; Write-Host ("  SKIP  {0}  ({1})" -f $name, $why) -ForegroundColor DarkGray
 }
 function RunCua { & $cua @args 2>$null }
 function RunErr { (& $cua @args 2>&1) -join "`n" }
@@ -121,6 +128,22 @@ if ($exGrid) {
     $c = J (RunCua grid --window $expl.hwnd --index $exGrid.i --row 1 --col 0)
     Check "A8c one cell resolves by (row,col)" ($null -ne $c.grid.rect -and $c.grid.rect[2] -gt 0) "rect=$($c.grid.rect -join ',')"
 }
+$exTable = $stEx.nodes | Where-Object { $_.patterns -contains "Table" } | Select-Object -First 1
+if ($exTable) {
+    $tb = J (RunCua table --window $EX --index $exTable.i --max-headers 5)
+    $cols = @($tb.table.column_headers)
+    Check "A8d table reads column headers" ($cols.Count -ge 3 -and $tb.table.row_or_column_major) "cols=$($cols.Count) major=$($tb.table.row_or_column_major)"
+} else {
+    Skip "A8d table reads column headers" "no Table provider"
+}
+$exIC = $stEx.nodes | Where-Object { $_.patterns -contains "ItemContainer" } | Select-Object -First 1
+if ($exIC) {
+    $firstItem = @(Nodes $stEx "ListItem")[0]
+    $fi = J (RunCua find-item --window $EX --index $exIC.i --property name --value $firstItem.name)
+    Check "A8e ItemContainer finds an item by name" ($fi.found -eq $true -and $fi.element.name -eq $firstItem.name) "found=$($fi.found)"
+} else {
+    Skip "A8e ItemContainer finds an item by name" "no ItemContainer provider"
+}
 $cmWin = $stCm.nodes | Where-Object { $_.patterns -contains "Transform" } | Select-Object -First 1
 Check "A9 charmap window exposes TransformPattern" ($null -ne $cmWin) "patterns on window node"
 if ($cmWin) {
@@ -128,9 +151,11 @@ if ($cmWin) {
     Check "A9b transform reports capabilities" ($rep.detail -like "*can_move*:true*") "$($rep.detail.Substring(0, [Math]::Min(80, $rep.detail.Length)))"
     $cap0 = J (RunCua cursor)
     $mv = J (RunCua transform --window $CM --index $cmWin.i --move-to "520,300")
+    # Read the pointer immediately: the sleep below is only for the window rect,
+    # and a user moving the mouse during it must not fail this assertion.
+    $cap1 = J (RunCua cursor)
     Start-Sleep -Milliseconds 700
     $rectNow = (J (RunCua apps)).windows | Where-Object { $_.hwnd -eq $stCm.window.hwnd } | ForEach-Object { $_.rect }
-    $cap1 = J (RunCua cursor)
     Check "A9c transform moves a window with no cursor and no SetWindowPos" ($mv.status -eq "ok" -and $rectNow[0] -ge 500 -and $cap0.x -eq $cap1.x -and $cap0.y -eq $cap1.y) "x=$($rectNow[0]) cursor $($cap0.x),$($cap0.y)->$($cap1.x),$($cap1.y)"
 }
 $rz = RunErr realize --window $CM --index $cmChk.i
@@ -200,7 +225,7 @@ if ($collapsedTree.Count -gt 0) {
         $selNow = @(Nodes $stMs3 "TreeItem" | Where-Object { $_.selected -eq $true })
         Check "B4b msinfo32 SelectionItem select moves selection" ($r.status -eq "ok" -and $selNow.Count -ge 1 -and @($selNow | Where-Object { $_.i -eq $kids[1].i }).Count -eq 1) "selected=$($selNow.Count)"
     } else {
-        $script:pass++; Write-Host "  PASS  B4b msinfo32 SelectionItem select (skipped: no children)" -ForegroundColor Green
+        Skip "B4b msinfo32 SelectionItem select" "no children"
     }
 } else {
     Check "B4 msinfo32 tree expand reveals child nodes" $false "no collapsed TreeItem found"
@@ -221,6 +246,8 @@ $r = J (RunCua set-value --window $NP --index $npDoc2.i --value $lines)
 Start-Sleep -Milliseconds 700
 $v = (J (RunCua get-value --window $NP --index $npDoc2.i)).value
 Check "B6 notepad Document set-value 200 lines via ValuePattern" ($r.status -eq "ok" -and $v.Length -gt 1500) "len=$($v.Length)"
+$tx = J (RunCua text --window $NP --index $npDoc2.i --max-chars 80)
+Check "B6b TextPattern reads and bounds the document" ($tx.text -like "*cua line 1*" -and $tx.chars -le 80 -and $tx.truncated -eq $true) "chars=$($tx.chars) truncated=$($tx.truncated)"
 $npShot = ShotOf $NP "$cache\e4-np.png"
 & $cua activate --window $NP | Out-Null
 $stS = J (RunCua state --window $NP --no-shot)
@@ -309,10 +336,10 @@ if ($treeItems.Count -gt 3) {
         Check "B13 explorer navigation tree expand adds TreeItems" ($r.status -eq "ok" -and $after -gt $before) "tree $before -> $after"
         & $cua collapse --window $EX --index $expandable.i | Out-Null
     } else {
-        $script:pass++; Write-Host "  PASS  B13 explorer nav tree expand (skipped: nothing collapsed)" -ForegroundColor Green
+        Skip "B13 explorer nav tree expand" "nothing collapsed"
     }
 } else {
-    $script:pass++; Write-Host "  PASS  B13 explorer nav tree expand (skipped: nav pane collapsed)" -ForegroundColor Green
+    Skip "B13 explorer nav tree expand" "nav pane collapsed"
 }
 
 # ---------- C. background control while another window holds focus ----------
@@ -392,7 +419,7 @@ Check "C4 UIA Invoke works on a background XAML app" ($npWasBg -and $r.status -e
 & $cua activate --window $F_ANCHOR | Out-Null
 Start-Sleep -Milliseconds 600
 $cmWasBg = Is-Background "charmap.exe"
-& $cua set-value --window $CM --index $edit.i --value "" | Out-Null
+& $cua set-value --window $CM --index $edit.i --clear | Out-Null
 $stCm3 = J (RunCua state --window $CM --no-shot)
 $cmSelBtn = First (Nodes $stCm3 "Button" $F_SELECT)
 $r = J (RunCua click --window $CM --index $cmSelBtn.i)
@@ -451,17 +478,28 @@ $userOnlySandbox = @($userWins | Where-Object { $preMsSb -notcontains $_.pid }).
 Check "D6 sandboxed app invisible on the user desktop" ($userOnlySandbox -eq 0) "leaked=$userOnlySandbox"
 # non-interference: these gestures would move the real pointer if they were SendInput-based,
 # so the user's cursor and focus must be bit-identical afterwards
-$rct = $sbSt.window.rect
-$cx = $rct[0] + [int]($rct[2] / 2); $cy = $rct[1] + [int]($rct[3] / 2)
-$cur0 = J (RunCua cursor)
-$sbShot2 = J (RunCua sandbox shot --window $MS --out "$cache\e4-sb2.png")
-$cli = J (RunCua sandbox click --window $MS --x $cx --y $cy --shot-id $sbShot2.state_id)
-$dr = J (RunCua sandbox drag --x1 ($cx - 30) --y1 ($cy - 20) --x2 ($cx + 30) --y2 ($cy + 20))
-$cur1 = J (RunCua cursor)
-$fgNow = (J (RunCua apps)).foreground_hwnd
-Check "D6b sandbox coordinate click + drag need no real pointer" ($cli.status -eq "ok" -and $dr.status -eq "ok") "click=$($cli.status) drag=$($dr.status)"
-Check "D6c the user's cursor never moved" ($cur0.x -eq $cur1.x -and $cur0.y -eq $cur1.y) "$($cur0.x),$($cur0.y) -> $($cur1.x),$($cur1.y)"
-Check "D6d the user's foreground window never changed" ($fgNow -eq $fgSb) "$fgSb -> $fgNow"
+# sandbox state carries identity but not geometry; take the rect from apps.
+$sbWin = (J (RunCua sandbox apps)).windows |
+    Where-Object { $_.process -eq "msinfo32.exe" -and $_.visible -and $_.rect[2] -gt 200 -and $_.rect[3] -gt 200 } |
+    Sort-Object { -($_.rect[2] * $_.rect[3]) } |
+    Select-Object -First 1
+$rct = if ($sbWin) { $sbWin.rect } else { $null }
+if (-not $rct) {
+    Check "D6b sandbox coordinate click + drag need no real pointer" $false "no msinfo32 rect on the hidden desktop"
+}
+$cx = if ($rct) { $rct[0] + [int]($rct[2] / 2) } else { $null }
+$cy = if ($rct) { $rct[1] + [int]($rct[3] / 2) } else { $null }
+if ($rct) {
+    $cur0 = J (RunCua cursor)
+    $sbShot2 = J (RunCua sandbox shot --window $MS --out "$cache\e4-sb2.png")
+    $cli = J (RunCua sandbox click --window $MS --x $cx --y $cy --shot-id $sbShot2.state_id)
+    $dr = J (RunCua sandbox drag --x1 ($cx - 30) --y1 ($cy - 20) --x2 ($cx + 30) --y2 ($cy + 20) --shot-id $sbShot2.state_id)
+    $cur1 = J (RunCua cursor)
+    $fgNow = (J (RunCua apps)).foreground_hwnd
+    Check "D6b sandbox coordinate click + drag need no real pointer" ($cli.status -eq "ok" -and $dr.status -eq "ok") "click=$($cli.status) drag=$($dr.status)"
+    Check "D6c the user's cursor never moved" ($cur0.x -eq $cur1.x -and $cur0.y -eq $cur1.y) "$($cur0.x),$($cur0.y) -> $($cur1.x),$($cur1.y)"
+    Check "D6d the user's foreground window never changed" ($fgNow -eq $fgSb) "$fgSb -> $fgNow"
+}
 $fgMid = (J (RunCua apps)).foreground_hwnd
 & $cua sandbox state --window $MS --no-shot | Out-Null
 $fg6 = (J (RunCua apps)).foreground_hwnd
@@ -501,7 +539,7 @@ if ($null -ne $ss) {
     $r = J (RunCua click --window "$($ss.hwnd)" --index $idx)
     Check "E2 automation of a real Settings window refused (no-negotiables)" ($r.status -eq "refused" -and $r.detail -like "*deny list*") "$($r.status)/$($r.detail)"
 } else {
-    $script:pass++; Write-Host "  PASS  E2 Settings window refusal (skipped: no Settings window open)" -ForegroundColor Green
+    Skip "E2 Settings window refusal" "no Settings window open"
 }
 $out = RunErr key --keys "win+r"
 Check "E3 Windows-logo key refused" ($out -like "*Windows-logo key*") ($out.Substring(0, [Math]::Min(70, $out.Length)))
@@ -529,6 +567,6 @@ Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
 
 # ---------- result ----------
 Write-Host ""
-Write-Host ("==== PHASE-4 RESULT: {0} passed, {1} failed" -f $script:pass, $script:fail) -ForegroundColor $(if ($script:fail -eq 0) { "Green" } else { "Red" })
+Write-Host ("==== PHASE-4 RESULT: {0} passed, {1} failed, {2} skipped" -f $script:pass, $script:fail, $script:skip) -ForegroundColor $(if ($script:fail -eq 0) { "Green" } else { "Red" })
 if ($script:fail -gt 0) { $script:failures | ForEach-Object { Write-Host ("  failed: " + $_) -ForegroundColor Red }; exit 1 }
 exit 0

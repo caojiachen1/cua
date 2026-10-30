@@ -5,14 +5,18 @@
 $ErrorActionPreference = "Continue"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
-$cua = "$root\bin\cua.exe"
+$cua = $env:CUA_TEST_BIN
+if (-not $cua -or -not (Test-Path $cua)) { $cua = "$root\bin\cua.exe" }
 if (-not (Test-Path $cua)) { $cua = "$root\target\debug\cua.exe" }
-$testpad = "$root\bin\testpad.exe"
+$testpad = $env:CUA_TEST_TESTPAD
+if (-not $testpad -or -not (Test-Path $testpad)) { $testpad = "$root\bin\testpad.exe" }
 if (-not (Test-Path $testpad)) { $testpad = "$root\target\debug\testpad.exe" }
-$cache = Join-Path $env:LOCALAPPDATA "cua\cache"
+$dataRoot = if ($env:CUA_DATA_DIR) { $env:CUA_DATA_DIR } else { Join-Path $env:LOCALAPPDATA "cua" }
+$cache = Join-Path $dataRoot "cache"
+Write-Host ("== binary: {0} ({1})" -f $cua, (Get-FileHash $cua -Algorithm SHA256).Hash.Substring(0, 12)) -ForegroundColor DarkGray
 $fixturesUri = ([System.Uri](Join-Path $root "tests\fixtures")).AbsoluteUri.TrimEnd("/")
 New-Item -ItemType Directory -Force -Path $cache | Out-Null
-$script:pass = 0; $script:fail = 0; $script:failures = @()
+$script:pass = 0; $script:fail = 0; $script:skip = 0; $script:failures = @()
 
 function J($out) {
     $s = ($out -join "`n")
@@ -25,6 +29,9 @@ function J($out) {
 function Check($name, $cond, $detail = "") {
     if ($cond) { $script:pass++; Write-Host ("  PASS  {0}" -f $name) -ForegroundColor Green }
     else { $script:fail++; $script:failures += $name; Write-Host ("  FAIL  {0}  {1}" -f $name, $detail) -ForegroundColor Red }
+}
+function Skip($name, $why) {
+    $script:skip++; Write-Host ("  SKIP  {0}  ({1})" -f $name, $why) -ForegroundColor DarkGray
 }
 function RunCua { & $cua @args 2>$null }
 function RunErr { (& $cua @args 2>&1) -join "`n" }
@@ -293,23 +300,47 @@ Check "D13 sandbox stop cleans up" ($r.killed_processes -ge 2) "$($r.killed_proc
 # cua has no browser of its own: `cua browser ...` forwards to the ubb CLI, which drives
 # the user's real Edge through the UBB extension. Needs a fixture server, so it is gated.
 $ubbReady = $false
+$chk = J (RunCua check)
+$ubbCli = $chk.browser.cli
 $st = J (RunCua browser status)
 if ($st.status -eq "ok" -and $st.result.extension -eq $true) { $ubbReady = $true }
 $py = $null
 if (Get-Command python -ErrorAction SilentlyContinue) { $py = "python" }
-$port = 8799
+# A fixed port collided with servers leaked by earlier failed runs. Pick a free
+# one and verify the fixture really answers before running the browser checks.
+$port = 0
+try {
+    $l = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+    $l.Start(); $port = $l.LocalEndpoint.Port; $l.Stop()
+} catch { $port = 8799 }
 $srv = $null
+$fixtureOk = $false
 if ($ubbReady -and $py) {
     $srv = Start-Process -FilePath $py `
-        -ArgumentList @("-m", "http.server", "$port", "--directory", (Join-Path $root "tests\fixtures")) `
+        -ArgumentList @("-m", "http.server", "$port", "--bind", "127.0.0.1", "--directory", (Join-Path $root "tests\fixtures")) `
         -PassThru -WindowStyle Hidden
     for ($k = 0; $k -lt 30; $k++) {
-        try { Invoke-WebRequest "http://127.0.0.1:$port/page1.html" -UseBasicParsing -TimeoutSec 2 | Out-Null; break }
+        try { Invoke-WebRequest "http://127.0.0.1:$port/page1.html" -UseBasicParsing -TimeoutSec 2 | Out-Null; $fixtureOk = $true; break }
         catch { Start-Sleep -Milliseconds 200 }
     }
 }
-Check "E0 ubb extension + fixture server ready" ($ubbReady -and $null -ne $py) "ubb=$ubbReady python=$($null -ne $py)"
-if ($ubbReady -and $py) {
+$browserRun = $ubbReady -and $py -and $fixtureOk
+if ($browserRun) {
+    Check "E0 ubb extension + fixture server ready" $true "ubb=$ubbReady python=$($null -ne $py) port=$port"
+} elseif ($ubbReady -and $py -and -not $fixtureOk) {
+    Check "E0 ubb extension + fixture server ready" $false "fixture server did not serve page1 on port $port"
+} elseif (-not $ubbCli -or -not $py) {
+    # A missing ubb CLI or python is environmental. A CLI that exists but whose
+    # status/bridge call fails is a regression and must stay a failure.
+    Skip "E0 ubb extension + fixture server ready" "ubb CLI=$ubbCli python=$($null -ne $py)"
+} elseif ($st.status -eq "ok") {
+    # The daemon answers but the Edge extension is not connected (browser closed).
+    # Rerun the browser section after opening Edge with the UBB extension.
+    Skip "E0 ubb extension + fixture server ready" "ubb daemon ok, extension not connected"
+} else {
+    Check "E0 ubb extension + fixture server ready" $false "ubb CLI present but status failed: $($st.detail)"
+}
+if ($browserRun) {
     $base = "http://127.0.0.1:$port"
     & $cua browser session.stop 2>$null | Out-Null
     $r = J (RunCua browser session.start)
@@ -354,7 +385,24 @@ if ($ubbReady -and $py) {
     $left = @($tl.result.tabs | Where-Object { $_.session_owned })
     Check "E15 agent tabs closed after stop" ($left.Count -eq 0) "$($left.Count) left"
 }
-if ($srv -and -not $srv.HasExited) { Stop-Process -Id $srv.ProcessId -Force -ErrorAction SilentlyContinue }
+if ($srv) {
+    try {
+        if (-not $srv.HasExited) { Stop-Process -Id $srv.Id -Force -ErrorAction SilentlyContinue }
+    } catch {
+        Write-Host ("  (fixture server cleanup failed: {0})" -f $_.Exception.Message) -ForegroundColor DarkGray
+    }
+}
+# Start-Process can hand back a launcher that exits while the real python child
+# keeps the port. Sweep only the server we started (chosen free port + repo dir).
+if ($port -gt 0) {
+    Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.CommandLine -and
+            $_.CommandLine -like "*-m http.server $port *" -and
+            $_.CommandLine -like "*D:\Codebase\cua\tests\fixtures*"
+        } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+}
 
 # ---------- F. performance + final cleanup ----------
 $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -398,6 +446,6 @@ Check "G6 open of an .exe also sanitizes" ($ro.status -eq "ok" -and $ro.detail -
 
 # ---------- result ----------
 Write-Host ""
-Write-Host ("==== PHASE-3 RESULT: {0} passed, {1} failed" -f $script:pass, $script:fail) -ForegroundColor $(if ($script:fail -eq 0) { "Green" } else { "Red" })
+Write-Host ("==== PHASE-3 RESULT: {0} passed, {1} failed, {2} skipped" -f $script:pass, $script:fail, $script:skip) -ForegroundColor $(if ($script:fail -eq 0) { "Green" } else { "Red" })
 if ($script:fail -gt 0) { $script:failures | ForEach-Object { Write-Host ("  failed: " + $_) -ForegroundColor Red }; exit 1 }
 exit 0

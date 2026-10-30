@@ -391,6 +391,45 @@ pub fn is_window_alive(hwnd: HWND) -> bool {
     unsafe { IsWindow(hwnd).as_bool() }
 }
 
+/// Which top-level window would receive a click at this screen point?
+pub fn window_from_point(x: i32, y: i32) -> Option<HWND> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::WindowFromPoint;
+    let h = unsafe { WindowFromPoint(POINT { x, y }) };
+    if h.is_invalid() { None } else { Some(root_window(h)) }
+}
+
+/// True when the point belongs to the same top-level window as `hwnd`.
+/// A covering popup/other app makes the physical click land elsewhere, so the
+/// caller must refuse instead of reporting that it clicked its target.
+pub fn point_hits_window(hwnd: HWND, x: i32, y: i32) -> bool {
+    match window_from_point(x, y) {
+        Some(hit) => hit.0 == root_window(hwnd).0,
+        None => false,
+    }
+}
+
+pub fn ensure_point_hits(hwnd: HWND, x: i32, y: i32) -> Result<()> {
+    if point_hits_window(hwnd, x, y) {
+        return Ok(());
+    }
+    let cover = window_from_point(x, y).and_then(snapshot_window);
+    match cover {
+        Some(w) => bail!(
+            "refusing physical input at ({x},{y}): that point belongs to '{}' (hwnd {:#x}, pid {}), not the target — bring the target to the front or use --background / an a11y action",
+            w.title,
+            w.hwnd,
+            w.pid
+        ),
+        None => bail!("refusing physical input at ({x},{y}): no window owns that point"),
+    }
+}
+
+pub fn is_foreground(hwnd: HWND) -> bool {
+    let fg = foreground_hwnd();
+    !fg.is_invalid() && root_window(fg).0 == root_window(hwnd).0
+}
+
 /// Top-level root of a (possibly child) window — used to scope screenshot IDs
 /// to the window a coordinate belongs to.
 pub fn root_window(hwnd: HWND) -> HWND {
@@ -398,6 +437,29 @@ pub fn root_window(hwnd: HWND) -> HWND {
     unsafe {
         let r = GetAncestor(hwnd, GA_ROOT);
         if r.is_invalid() { hwnd } else { r }
+    }
+}
+
+/// 100ns FILETIME ticks of process creation, used to prove that a stored PID
+/// still refers to the process a sandbox launched (PIDs are reused).
+pub fn process_creation_time(pid: u32) -> Option<u64> {
+    use windows::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut created = FILETIME::default();
+        let mut exited = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        let ok = GetProcessTimes(h, &mut created, &mut exited, &mut kernel, &mut user).is_ok();
+        let _ = CloseHandle(h);
+        if ok {
+            Some(((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64)
+        } else {
+            None
+        }
     }
 }
 

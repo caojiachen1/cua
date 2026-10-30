@@ -5,10 +5,12 @@ use serde::Serialize;
 use uiautomation::controls::ControlType;
 use uiautomation::patterns::{
     UIExpandCollapsePattern, UIGridPattern, UIInvokePattern, UILegacyIAccessiblePattern,
-    UIRangeValuePattern, UISelectionItemPattern, UITogglePattern, UITransformPattern,
+    UIItemContainerPattern, UIRangeValuePattern, UIScrollItemPattern, UISelectionItemPattern,
+    UITableItemPattern, UITablePattern, UITextPattern, UITogglePattern, UITransformPattern,
     UIValuePattern, UIVirtualizedItemPattern,
 };
-use uiautomation::types::{ExpandCollapseState, Handle, Rect, ToggleState};
+use uiautomation::types::{ExpandCollapseState, Handle, Rect, ToggleState, UIProperty};
+use uiautomation::variants::Variant;
 use uiautomation::{UIAutomation, UIElement};
 
 use windows::Win32::Foundation::HWND;
@@ -45,6 +47,8 @@ pub struct Node {
 pub struct Tree {
     pub nodes: Vec<Node>,
     pub sig: String,
+    /// the walk hit its depth or node budget before the tree was exhausted
+    pub truncated: bool,
 }
 
 fn rect_of(r: &Rect) -> [i32; 4] {
@@ -84,12 +88,16 @@ pub fn walk_window(
 
     let mut nodes: Vec<Node> = Vec::new();
     let mut sig_parts: Vec<String> = Vec::new();
+    let mut truncated = false;
 
     // BFS with stack of (element, depth)
     let mut queue: std::collections::VecDeque<(UIElement, usize)> = std::collections::VecDeque::new();
     queue.push_back((root, 0));
     while let Some((el, depth)) = queue.pop_front() {
         if nodes.len() >= max_nodes || depth > max_depth {
+            // This element was already popped and will never be processed, so the
+            // walk is incomplete even when no siblings remain queued behind it.
+            truncated = true;
             break;
         }
         let ctype = el.get_control_type().map(type_name).unwrap_or_default();
@@ -194,10 +202,40 @@ pub fn walk_window(
 
     let joined = sig_parts.join("\u{1}");
     let sig = format!("{:x}", crate::util::fnv1a(joined.as_bytes()));
-    Ok(Tree { nodes, sig })
+    Ok(Tree { nodes, sig, truncated })
 }
 
-fn redact_text(s: &str) -> String {
+/// Output-only redaction. The action cache must keep the real names so a
+/// no-runtime-id element can still be re-located by name after `--redact`.
+pub fn redacted_nodes(nodes: &[Node]) -> Vec<Node> {
+    nodes
+        .iter()
+        .cloned()
+        .map(|mut n| {
+            n.name = redact_text(&n.name);
+            if let Some(v) = &n.value {
+                n.value = Some(redact_text(v));
+            }
+            n
+        })
+        .collect()
+}
+
+pub fn nodes_json(nodes: &[Node]) -> Vec<serde_json::Value> {
+    nodes
+        .iter()
+        .map(|n| {
+            serde_json::json!({
+                "i": n.i, "type": n.ctype, "name": n.name, "class": n.class,
+                "rect": n.rect, "rid": n.rid, "disabled": n.disabled, "offscreen": n.offscreen,
+                "value": n.value, "toggle": n.toggle, "selected": n.selected,
+                "expanded": n.expanded, "range": n.range, "patterns": n.patterns,
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn redact_text(s: &str) -> String {
     if s.chars().count() <= 1 {
         "*".repeat(s.len())
     } else {
@@ -305,6 +343,11 @@ fn pattern_names_for(el: &UIElement, ctype: &str) -> Vec<String> {
     // Grid/Transform/VirtualizedItem are only worth a probe on the types that can carry them.
     if ctype.is_empty() || matches!(ctype, "List" | "Table" | "DataGrid" | "Tree" | "Grid" | "Custom" | "Group") {
         probe!(UIGridPattern, "Grid");
+        probe!(UITablePattern, "Table");
+        probe!(UIItemContainerPattern, "ItemContainer");
+    }
+    if matches!(ctype, "DataItem" | "ListItem" | "TreeItem" | "Custom") {
+        probe!(UITableItemPattern, "TableItem");
     }
     if ctype.is_empty() || matches!(ctype, "Window" | "Pane") {
         probe!(UITransformPattern, "Transform");
@@ -372,7 +415,7 @@ fn element_matches(el: &UIElement, rid: &[i32]) -> bool {
 pub fn click_element(hwnd: HWND, rid: &[i32], double: bool, right: bool) -> Result<String> {
     let el = find_by_rid(hwnd, rid)?;
     if double || right {
-        return click_element_rect(&el, double, right);
+        return click_element_rect(&el, hwnd, double, right);
     }
     if let Ok(p) = el.get_pattern::<UIInvokePattern>() {
         p.invoke().map_err(|e| anyhow!("invoke failed: {e}"))?;
@@ -394,10 +437,10 @@ pub fn click_element(hwnd: HWND, rid: &[i32], double: bool, right: bool) -> Resu
         // legacy providers are frequently stubs (Explorer's grid cells advertise the
         // interface and then refuse it), so a failure here must not block the rect fallback
     }
-    click_element_rect(&el, double, right)
+    click_element_rect(&el, hwnd, double, right)
 }
 
-fn click_element_rect(el: &UIElement, double: bool, right: bool) -> Result<String> {
+fn click_element_rect(el: &UIElement, top: HWND, double: bool, right: bool) -> Result<String> {
     let r = el.get_bounding_rectangle().map_err(|e| anyhow!("rect: {e}"))?;
     let rect = rect_of(&r);
     if rect[2] <= 0 || rect[3] <= 0 {
@@ -405,6 +448,7 @@ fn click_element_rect(el: &UIElement, double: bool, right: bool) -> Result<Strin
     }
     let cx = rect[0] + rect[2] / 2;
     let cy = rect[1] + rect[3] / 2;
+    crate::win::ensure_point_hits(top, cx, cy)?;
     crate::input::click(cx, cy, right, double)?;
     Ok(format!(
         "clicked element at ({cx},{cy}) via event strategy{}{} (no pattern for this gesture)",
@@ -413,9 +457,54 @@ fn click_element_rect(el: &UIElement, double: bool, right: bool) -> Result<Strin
     ))
 }
 
+/// Background click (`--background --index`): a11y patterns never move focus, and when
+/// the element has none the gesture degrades to *message-level* input at the element's
+/// rectangle instead of the real pointer a foreground click would steal.
+pub fn click_element_background(hwnd: HWND, rid: &[i32], double: bool, right: bool) -> Result<String> {
+    let el = find_by_rid(hwnd, rid)?;
+    if !double && !right {
+        if let Ok(p) = el.get_pattern::<UIInvokePattern>() {
+            p.invoke().map_err(|e| anyhow!("invoke failed: {e}"))?;
+            return Ok("invoked element via UIA InvokePattern (background; no focus change)".into());
+        }
+        if let Ok(p) = el.get_pattern::<UITogglePattern>() {
+            p.toggle().map_err(|e| anyhow!("toggle failed: {e}"))?;
+            let state = toggle_state(&el).unwrap_or_else(|| "?".into());
+            return Ok(format!("toggled element via UIA TogglePattern (now {state}; background, no focus change)"));
+        }
+        if let Ok(p) = el.get_pattern::<UISelectionItemPattern>() {
+            p.select().map_err(|e| anyhow!("select failed: {e}"))?;
+            return Ok("selected element via UIA SelectionItemPattern (background; no focus change)".into());
+        }
+        if let Ok(p) = el.get_pattern::<UILegacyIAccessiblePattern>() {
+            if p.do_default_action().is_ok() {
+                return Ok("invoked element via LegacyIAccessible DoDefaultAction (background; no focus change)".into());
+            }
+        }
+    }
+    let r = el.get_bounding_rectangle().map_err(|e| anyhow!("rect: {e}"))?;
+    let rect = rect_of(&r);
+    if rect[2] <= 0 || rect[3] <= 0 {
+        bail!("element has no actionable pattern and no usable rect");
+    }
+    let cx = rect[0] + rect[2] / 2;
+    let cy = rect[1] + rect[3] / 2;
+    let root = crate::win::root_window(hwnd);
+    crate::input::post_click(root, cx, cy, right, double)?;
+    Ok(format!(
+        "clicked ({cx},{cy}) via message-level input (background; no a11y pattern for this gesture)"
+    ))
+}
+
+/// strategy=event: skip the pattern chain and drive the element's rectangle with
+/// real input. Used when the caller explicitly wants event semantics.
+pub fn click_element_event(hwnd: HWND, rid: &[i32], double: bool, right: bool) -> Result<String> {
+    let el = find_by_rid(hwnd, rid)?;
+    click_element_rect(&el, hwnd, double, right)
+}
+
 /// a11y-only click: refuses coordinate fallback (ZCode strategy=a11y).
-pub fn click_element_strict(hwnd: HWND, rid: &[i32], double: bool, right: bool) -> Result<String> {
-    if double || right {
+pub fn click_element_strict(hwnd: HWND, rid: &[i32], double: bool, right: bool) -> Result<String> {    if double || right {
         bail!("strategy=a11y cannot express right/double clicks (use strategy=auto or coordinates)");
     }
     let el = find_by_rid(hwnd, rid)?;
@@ -474,6 +563,188 @@ pub fn get_value_element(hwnd: HWND, rid: &[i32]) -> Result<String> {
     Ok(p.get_value()?)
 }
 
+/// Value read for wait conditions: ValuePattern, then RangeValue, then Legacy.
+pub fn value_any_element(hwnd: HWND, rid: &[i32]) -> Result<String> {
+    let el = find_by_rid(hwnd, rid)?;
+    if let Ok(p) = el.get_pattern::<UIValuePattern>() {
+        return Ok(p.get_value()?);
+    }
+    if let Ok(p) = el.get_pattern::<UIRangeValuePattern>() {
+        return Ok(p.get_value()?.to_string());
+    }
+    if let Ok(p) = el.get_pattern::<UILegacyIAccessiblePattern>() {
+        return Ok(p.get_value()?);
+    }
+    bail!("element has no readable value (ValuePattern/RangeValue/Legacy)")
+}
+
+pub fn toggle_of_element(hwnd: HWND, rid: &[i32]) -> Result<String> {
+    let el = find_by_rid(hwnd, rid)?;
+    toggle_state(&el).ok_or_else(|| anyhow!("element does not expose TogglePattern"))
+}
+
+pub fn selected_of_element(hwnd: HWND, rid: &[i32]) -> Result<bool> {
+    let el = find_by_rid(hwnd, rid)?;
+    selection_item_selected(&el).ok_or_else(|| anyhow!("element does not expose SelectionItemPattern"))
+}
+
+pub fn select_add_element(hwnd: HWND, rid: &[i32]) -> Result<String> {
+    let el = find_by_rid(hwnd, rid)?;
+    let p = el
+        .get_pattern::<UISelectionItemPattern>()
+        .map_err(|_| anyhow!("element does not expose SelectionItemPattern"))?;
+    p.add_to_selection()
+        .map_err(|e| anyhow!("add_to_selection: {e}"))?;
+    Ok("added element to the selection (SelectionItemPattern.AddToSelection)".into())
+}
+
+pub fn select_remove_element(hwnd: HWND, rid: &[i32]) -> Result<String> {
+    let el = find_by_rid(hwnd, rid)?;
+    let p = el
+        .get_pattern::<UISelectionItemPattern>()
+        .map_err(|_| anyhow!("element does not expose SelectionItemPattern"))?;
+    p.remove_from_selection()
+        .map_err(|e| anyhow!("remove_from_selection: {e}"))?;
+    Ok("removed element from the selection (SelectionItemPattern.RemoveFromSelection)".into())
+}
+
+pub fn expanded_of_element(hwnd: HWND, rid: &[i32]) -> Result<String> {
+    let el = find_by_rid(hwnd, rid)?;
+    expand_state(&el).ok_or_else(|| anyhow!("element does not expose ExpandCollapsePattern"))
+}
+
+pub fn enabled_of_element(hwnd: HWND, rid: &[i32]) -> Result<bool> {
+    let el = find_by_rid(hwnd, rid)?;
+    Ok(el.is_enabled()?)
+}
+
+/// Read a bounded TextPattern document range. Returns (text, truncated).
+pub fn text_element(hwnd: HWND, rid: &[i32], max_chars: usize) -> Result<(String, bool)> {
+    let el = find_by_rid(hwnd, rid)?;
+    let p = el
+        .get_pattern::<UITextPattern>()
+        .map_err(|_| anyhow!("element does not expose UIA TextPattern"))?;
+    let range = p.get_document_range().map_err(|e| anyhow!("document range: {e}"))?;
+    let max = max_chars.clamp(1, 1_000_000);
+    let raw = range
+        .get_text((max as i32).saturating_add(1))
+        .map_err(|e| anyhow!("get_text: {e}"))?;
+    let truncated = raw.chars().count() > max;
+    Ok((raw.chars().take(max).collect(), truncated))
+}
+
+fn element_brief(el: &UIElement) -> serde_json::Value {
+    serde_json::json!({
+        "name": el.get_name().unwrap_or_default(),
+        "type": el.get_control_type().map(type_name).unwrap_or_default(),
+        "rect": el.get_bounding_rectangle().map(|r| rect_of(&r)).unwrap_or([0, 0, 0, 0]),
+        "rid": el.get_runtime_id().unwrap_or_default(),
+    })
+}
+
+fn header_briefs(items: Vec<UIElement>, max: usize) -> Vec<serde_json::Value> {
+    items.iter().take(max).map(element_brief).collect()
+}
+
+/// Table headers and row/column-major order; also reports TableItem headers when
+/// the element is a cell rather than the table itself.
+pub fn table_element(hwnd: HWND, rid: &[i32], max_headers: usize) -> Result<serde_json::Value> {
+    let el = find_by_rid(hwnd, rid)?;
+    let max = max_headers.clamp(1, 100);
+    let mut out = serde_json::Map::new();
+    let mut found = false;
+    if let Ok(p) = el.get_pattern::<UITablePattern>() {
+        found = true;
+        out.insert(
+            "row_headers".into(),
+            serde_json::json!(header_briefs(
+                p.get_row_headers().map_err(|e| anyhow!("row headers: {e}"))?,
+                max
+            )),
+        );
+        out.insert(
+            "column_headers".into(),
+            serde_json::json!(header_briefs(
+                p.get_column_headers().map_err(|e| anyhow!("column headers: {e}"))?,
+                max
+            )),
+        );
+        out.insert(
+            "row_or_column_major".into(),
+            serde_json::json!(format!(
+                "{:?}",
+                p.get_row_or_column_major().unwrap_or(uiautomation::types::RowOrColumnMajor::RowMajor)
+            )),
+        );
+    }
+    if let Ok(p) = el.get_pattern::<UITableItemPattern>() {
+        found = true;
+        out.insert(
+            "row_header_items".into(),
+            serde_json::json!(header_briefs(
+                p.get_row_header_items().map_err(|e| anyhow!("row header items: {e}"))?,
+                max
+            )),
+        );
+        out.insert(
+            "column_header_items".into(),
+            serde_json::json!(header_briefs(
+                p.get_column_header_items().map_err(|e| anyhow!("column header items: {e}"))?,
+                max
+            )),
+        );
+    }
+    if !found {
+        bail!("element does not expose UIA TablePattern or TableItemPattern");
+    }
+    Ok(serde_json::Value::Object(out))
+}
+
+fn property_from_name(name: &str) -> Result<UIProperty> {
+    match name.to_ascii_lowercase().as_str() {
+        "name" => Ok(UIProperty::Name),
+        "automation-id" | "automationid" => Ok(UIProperty::AutomationId),
+        "class" | "class-name" | "classname" => Ok(UIProperty::ClassName),
+        "help-text" | "helptext" => Ok(UIProperty::HelpText),
+        "item-type" | "itemtype" => Ok(UIProperty::ItemType),
+        "item-status" | "itemstatus" => Ok(UIProperty::ItemStatus),
+        other => bail!(
+            "unsupported item property '{other}' (name|automation-id|class-name|help-text|item-type|item-status)"
+        ),
+    }
+}
+
+/// Ask an ItemContainer provider for an item by a string property.
+pub fn find_item_element(
+    hwnd: HWND,
+    rid: &[i32],
+    property: &str,
+    value: &str,
+) -> Result<serde_json::Value> {
+    let el = find_by_rid(hwnd, rid)?;
+    let p = el
+        .get_pattern::<UIItemContainerPattern>()
+        .map_err(|_| anyhow!("element does not expose UIA ItemContainerPattern"))?;
+    let prop = property_from_name(property)?;
+    let item = p
+        .find_item_by_property(el.clone(), prop, Variant::from(value))
+        .map_err(|e| anyhow!("FindItemByProperty: {e}"))?;
+    Ok(element_brief(&item))
+}
+
+/// Scroll a scrollable/virtualized item into view through its own provider.
+pub fn scroll_item_element(hwnd: HWND, rid: &[i32], align_top: bool) -> Result<String> {
+    let el = find_by_rid(hwnd, rid)?;
+    let p = el
+        .get_pattern::<UIScrollItemPattern>()
+        .map_err(|_| anyhow!("element does not expose UIA ScrollItemPattern"))?;
+    p.scroll_into_view()
+        .map_err(|e| anyhow!("scroll_into_view: {e}"))?;
+    Ok(format!(
+        "scrolled item into view via UIA ScrollItemPattern (align_to_top={align_top})"
+    ))
+}
+
 /// Dump a Grid/Table provider as a 2D matrix of cell names (bounded by `max_cells`).
 pub fn grid_dump(hwnd: HWND, rid: &[i32], max_cells: usize) -> Result<serde_json::Value> {
     let el = find_by_rid(hwnd, rid)?;
@@ -511,7 +782,14 @@ fn cell_brief(el: Option<UIElement>) -> serde_json::Value {
 
 /// Resolve one (row, col) cell; with `act`, drive it through the normal a11y chain by way of
 /// the cell's own runtime id, falling back to its rectangle when the provider gives none.
-pub fn grid_cell(hwnd: HWND, rid: &[i32], row: i32, col: i32, act: bool) -> Result<serde_json::Value> {
+pub fn grid_cell(
+    hwnd: HWND,
+    rid: &[i32],
+    row: i32,
+    col: i32,
+    act: bool,
+    background: bool,
+) -> Result<serde_json::Value> {
     let el = find_by_rid(hwnd, rid)?;
     let g = el
         .get_pattern::<UIGridPattern>()
@@ -526,15 +804,25 @@ pub fn grid_cell(hwnd: HWND, rid: &[i32], row: i32, col: i32, act: bool) -> Resu
     if act {
         let cell_rid = cell.get_runtime_id().unwrap_or_default();
         let detail = if !cell_rid.is_empty() {
-            click_element(hwnd, &cell_rid, false, false)?
+            if background {
+                click_element_background(hwnd, &cell_rid, false, false)?
+            } else {
+                click_element(hwnd, &cell_rid, false, false)?
+            }
         } else {
             let r = rect_of(&cell.get_bounding_rectangle().map_err(|e| anyhow!("rect: {e}"))?);
             if r[2] <= 0 || r[3] <= 0 {
                 bail!("cell ({row},{col}) has neither a runtime id nor a usable rectangle");
             }
             let (cx, cy) = (r[0] + r[2] / 2, r[1] + r[3] / 2);
-            crate::input::click(cx, cy, false, false)?;
-            format!("cell has no runtime id; clicked ({cx},{cy}) at its rectangle")
+            if background {
+                let root = crate::win::root_window(hwnd);
+                crate::input::post_click(root, cx, cy, false, false)?;
+                format!("cell has no runtime id; clicked ({cx},{cy}) via message-level input")
+            } else {
+                crate::input::click(cx, cy, false, false)?;
+                format!("cell has no runtime id; clicked ({cx},{cy}) at its rectangle")
+            }
         };
         out["acted"] = serde_json::json!(detail);
     }
@@ -672,18 +960,32 @@ pub fn get_range_element(hwnd: HWND, rid: &[i32]) -> Result<serde_json::Value> {
 
 /// Local grounding (Trae com.bytedance/grounding analog, on-device instead of cloud):
 /// resolve a text query to element indices + screen coordinates.
-pub fn ground(hwnd: HWND, query: &str) -> Result<Vec<Node>> {
+pub struct Grounding {
+    pub tree: Tree,
+    pub hits: Vec<Node>,
+}
+
+/// Grounding walks the same tree that becomes the element cache, so the indices
+/// it returns can be used by the next action instead of pointing into a
+/// different (older) traversal.
+pub fn ground_tree(hwnd: HWND, query: &str) -> Result<Grounding> {
     let tree = walk_window(hwnd, 14, 2000, false, false)?;
     let q = query.to_lowercase();
     let hits: Vec<Node> = tree
         .nodes
-        .into_iter()
+        .iter()
         .filter(|n| {
             (!n.name.is_empty() && n.name.to_lowercase().contains(&q))
                 || (!n.class.is_empty() && n.class.to_lowercase().contains(&q))
         })
+        .cloned()
         .collect();
-    Ok(hits)
+    Ok(Grounding { tree, hits })
+}
+
+/// Hits only (used to re-locate an element by name during a click fallback).
+pub fn ground(hwnd: HWND, query: &str) -> Result<Vec<Node>> {
+    Ok(ground_tree(hwnd, query)?.hits)
 }
 
 pub fn tree_signature(hwnd: HWND) -> Result<String> {

@@ -3,11 +3,15 @@
 $ErrorActionPreference = "Continue"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
-$cua = "$root\bin\cua.exe"
+$cua = $env:CUA_TEST_BIN
+if (-not $cua -or -not (Test-Path $cua)) { $cua = "$root\bin\cua.exe" }
 if (-not (Test-Path $cua)) { $cua = "$root\target\debug\cua.exe" }
-$testpad = "$root\bin\testpad.exe"
+$testpad = $env:CUA_TEST_TESTPAD
+if (-not $testpad -or -not (Test-Path $testpad)) { $testpad = "$root\bin\testpad.exe" }
 if (-not (Test-Path $testpad)) { $testpad = "$root\target\debug\testpad.exe" }
-$cache = Join-Path $env:LOCALAPPDATA "cua\cache"
+$dataRoot = if ($env:CUA_DATA_DIR) { $env:CUA_DATA_DIR } else { Join-Path $env:LOCALAPPDATA "cua" }
+$cache = Join-Path $dataRoot "cache"
+Write-Host ("== binary: {0} ({1})" -f $cua, (Get-FileHash $cua -Algorithm SHA256).Hash.Substring(0, 12)) -ForegroundColor DarkGray
 $fixturesUri = ([System.Uri](Join-Path $root "tests\fixtures")).AbsoluteUri.TrimEnd("/")
 New-Item -ItemType Directory -Force -Path $cache | Out-Null
 $script:pass = 0; $script:fail = 0; $script:failures = @()
@@ -34,7 +38,7 @@ Write-Host "== cua e2e phase-2 (cli: $cua)" -ForegroundColor Cyan
 # ---------- 0. clean slate ----------
 & $cua sandbox stop 2>$null | Out-Null
 taskkill /IM testpad.exe /F 2>$null | Out-Null
-Get-ChildItem (Join-Path $env:LOCALAPPDATA "cua\recordings") -Filter *.jsonl -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+Get-ChildItem (Join-Path $dataRoot "recordings") -Filter *.jsonl -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 800
 
 # ---------- fixture ----------
@@ -166,7 +170,7 @@ taskkill /IM testpad.exe /F 2>$null | Out-Null
 Start-Sleep -Milliseconds 600
 
 # ---------- E. config override ----------
-$cfg = Join-Path $env:LOCALAPPDATA "cua\config.json"
+$cfg = Join-Path $dataRoot "config.json"
 [IO.File]::WriteAllText($cfg, '{"require_shot_id_for_coords": false, "deny_processes": [], "deny_key_modifiers": ["win"], "levels": {}}', (New-Object Text.UTF8Encoding $false))
 Start-Sleep -Milliseconds 200
 $r = J (RunCua click --x 50 --y 50)
@@ -191,7 +195,8 @@ $r = J (RunCua sandbox scroll --dy 2 --window "CuaTestPad")
 Check "F3 sandbox scroll ok" ($r.status -eq "ok") "$($r.detail)"
 $sbw = (J (RunCua sandbox apps)).windows | Where-Object { $_.title -like "*CuaTestPad*" -and $_.visible } | Select-Object -First 1
 $dx1 = $sbw.rect[0] + 60; $dy1 = $sbw.rect[1] + 120; $dx2 = $dx1 + 200; $dy2 = $dy1 + 60
-$r = J (RunCua sandbox drag --x1 $dx1 --y1 $dy1 --x2 $dx2 --y2 $dy2)
+$sbDragShot = J (RunCua sandbox shot --window "CuaTestPad" --out "$cache\e2-sb-drag.png")
+$r = J (RunCua sandbox drag --x1 $dx1 --y1 $dy1 --x2 $dx2 --y2 $dy2 --shot-id $sbDragShot.state_id)
 Check "F4 sandbox drag ok" ($r.status -eq "ok") "$($r.detail)"
 $r = J (RunCua sandbox key --keys "alt+f4")
 Check "F5 sandbox alt+f4 refused w/o confirm" ($r.status -eq "refused") "$($r.status)"
@@ -234,6 +239,16 @@ $env:PATH = "$env:SystemRoot\System32"
 $err = RunErr browser status
 $env:PATH = $prevPath
 Check "G5 missing ubb cli reports not found" ($LASTEXITCODE -eq 1 -and $err -like "*not found*") ($err.Substring(0, [Math]::Min(70, $err.Length)))
+# a hung bridge must not hang cua forever
+$stubHang = Join-Path $cache "ubb-stub-hang.mjs"
+Set-Content -Path $stubHang -Value 'setTimeout(()=>{}, 60000)' -Encoding Ascii
+$env:CUA_UBB = $stubHang
+$env:CUA_UBB_TIMEOUT_MS = "1000"
+$sw = [Diagnostics.Stopwatch]::StartNew()
+$r = J (RunCua browser status)
+$sw.Stop()
+Check "G6 hung ubb call times out and is killed" ($r.status -eq "failed" -and $r.timed_out -eq $true -and $sw.ElapsedMilliseconds -lt 8000) "status=$($r.status) timed_out=$($r.timed_out) ms=$($sw.ElapsedMilliseconds)"
+Remove-Item Env:CUA_UBB_TIMEOUT_MS -ErrorAction SilentlyContinue
 if ($prevUbb) { $env:CUA_UBB = $prevUbb } else { Remove-Item Env:CUA_UBB -ErrorAction SilentlyContinue }
 
 # ---------- H. window ops deep ----------

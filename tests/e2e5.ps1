@@ -6,9 +6,13 @@
 $ErrorActionPreference = "Continue"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
-$cua = "$root\bin\cua.exe"
+$cua = $env:CUA_TEST_BIN
+if (-not $cua -or -not (Test-Path $cua)) { $cua = "$root\bin\cua.exe" }
 if (-not (Test-Path $cua)) { $cua = "$root\target\release\cua.exe" }
-$cache = Join-Path $env:LOCALAPPDATA "cua\cache"
+if (-not (Test-Path $cua)) { $cua = "$root\target\debug\cua.exe" }
+$dataRoot = if ($env:CUA_DATA_DIR) { $env:CUA_DATA_DIR } else { Join-Path $env:LOCALAPPDATA "cua" }
+$cache = Join-Path $dataRoot "cache"
+Write-Host ("== binary: {0} ({1})" -f $cua, (Get-FileHash $cua -Algorithm SHA256).Hash.Substring(0, 12)) -ForegroundColor DarkGray
 New-Item -ItemType Directory -Force -Path $cache | Out-Null
 $script:pass = 0; $script:fail = 0; $script:skips = 0; $script:failures = @()
 

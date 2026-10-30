@@ -7,6 +7,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const RECEIPT_SCHEMA: &str = "cua-action-receipt-v1";
 
 pub fn data_dir() -> std::path::PathBuf {
+    // Tests and isolated agent sessions set this so they never touch the
+    // user's config, recordings, sandbox state or cache.
+    if let Ok(d) = std::env::var("CUA_DATA_DIR") {
+        if !d.trim().is_empty() {
+            return std::path::PathBuf::from(d);
+        }
+    }
     let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| {
         std::env::var("USERPROFILE").unwrap_or_else(|_| ".".into())
     });
@@ -56,6 +63,62 @@ pub struct Receipt {
     pub elapsed_ms: Option<u128>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state_id: Option<String>,
+    /// not_requested | passed | failed | unknown
+    #[serde(default = "verification_default")]
+    pub verification: String,
+    /// complete | incomplete (e.g. the action ran but its record could not be written)
+    #[serde(default = "evidence_default")]
+    pub evidence: String,
+    /// auto | a11y | event | background | background-a11y (when the action has a mode)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_mode: Option<String>,
+}
+
+fn verification_default() -> String {
+    "not_requested".into()
+}
+
+fn evidence_default() -> String {
+    "complete".into()
+}
+
+pub struct ActionMeta {
+    pub cmd: String,
+    pub argv: Vec<String>,
+    pub record: Option<String>,
+}
+
+impl ActionMeta {
+    pub fn new(cmd: &str, argv: Vec<String>, record: &Option<String>) -> Self {
+        ActionMeta { cmd: cmd.to_string(), argv, record: record.clone() }
+    }
+}
+
+/// Shared tail for normal and sandbox actions: persist the recording and make a
+/// failure visible as incomplete evidence instead of pretending it was recorded.
+pub fn finish_action(meta: &ActionMeta, mut r: Receipt, sig_after: Option<&str>) -> Receipt {
+    if let Some(name) = &meta.record {
+        match record_append(name, &meta.cmd, &serde_json::json!(meta.argv), &r, sig_after) {
+            Ok(()) => {
+                if r.status == "ok" {
+                    r.detail = Some(format!(
+                        "{}; recorded to '{}'",
+                        r.detail.clone().unwrap_or_default(),
+                        name
+                    ));
+                }
+            }
+            Err(e) => {
+                r.evidence = "incomplete".into();
+                r.detail = Some(format!(
+                    "{}; action ran but recording to '{}' failed: {e:#}",
+                    r.detail.clone().unwrap_or_default(),
+                    name
+                ));
+            }
+        }
+    }
+    r
 }
 
 impl Receipt {
@@ -71,6 +134,9 @@ impl Receipt {
             detail: None,
             elapsed_ms: None,
             state_id: None,
+            verification: "not_requested".into(),
+            evidence: "complete".into(),
+            input_mode: None,
         }
     }
     pub fn ok(mut self, target: serde_json::Value, detail: &str) -> Self {
@@ -121,26 +187,171 @@ pub fn new_state_id() -> String {
     format!("s-{:x}", h)
 }
 
+/// Observation cache namespace. A second agent/session sets CUA_SESSION so its
+/// last-state and element indices cannot overwrite another session's. The
+/// default keeps the historical filenames for compatibility.
+pub fn session() -> String {
+    std::env::var("CUA_SESSION")
+        .ok()
+        .map(|s| sanitize(&s))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "default".to_string())
+}
+
+fn scoped(name: &str, ext: &str) -> String {
+    let s = session();
+    if s == "default" {
+        format!("{name}.{ext}")
+    } else {
+        format!("{name}-{s}.{ext}")
+    }
+}
+
 pub fn save_last_state(state_id: &str, hwnd: isize, tree_sig: &str) {
-    let p = ensure_data_dir().join("cache").join("last-state.json");
-    let v = serde_json::json!({"state_id": state_id, "hwnd": hwnd, "sig": tree_sig, "ts": now_iso()});
+    let p = ensure_data_dir().join("cache").join(scoped("last-state", "json"));
+    let v = serde_json::json!({"state_id": state_id, "hwnd": hwnd, "sig": tree_sig, "session": session(), "ts": now_iso()});
     let _ = std::fs::write(p, serde_json::to_vec(&v).unwrap_or_default());
 }
 
 pub fn load_last_state() -> Option<serde_json::Value> {
-    let p = ensure_data_dir().join("cache").join("last-state.json");
+    let p = ensure_data_dir().join("cache").join(scoped("last-state", "json"));
     std::fs::read(p).ok().and_then(|b| serde_json::from_slice(&b).ok())
 }
 
 pub fn save_elements(hwnd: isize, elements: &serde_json::Value) -> std::path::PathBuf {
-    let p = ensure_data_dir().join("cache").join(format!("elements-{}.json", hwnd));
+    let p = ensure_data_dir()
+        .join("cache")
+        .join(scoped(&format!("elements-{hwnd}"), "json"));
     let _ = std::fs::write(&p, serde_json::to_vec(elements).unwrap_or_default());
     p
 }
 
 pub fn load_elements(hwnd: isize) -> Option<serde_json::Value> {
-    let p = ensure_data_dir().join("cache").join(format!("elements-{}.json", hwnd));
+    let p = ensure_data_dir()
+        .join("cache")
+        .join(scoped(&format!("elements-{hwnd}"), "json"));
     std::fs::read(p).ok().and_then(|b| serde_json::from_slice(&b).ok())
+}
+
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "obs".into());
+    let tmp = path.with_file_name(format!(".{name}.tmp-{}", std::process::id()));
+    std::fs::write(&tmp, bytes)?;
+    if std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(path);
+        std::fs::rename(&tmp, path)?;
+    }
+    Ok(())
+}
+
+/// An observation is immutable: nodes, signature, truncation flag and screenshot
+/// metadata are written once under its id. The last-observation pointer selects
+/// which immutable snapshot index actions resolve against.
+pub fn save_observation(
+    id: &str,
+    hwnd: isize,
+    sig: &str,
+    truncated: bool,
+    nodes: &serde_json::Value,
+    screenshot: Option<&serde_json::Value>,
+) -> Result<std::path::PathBuf> {
+    let p = ensure_data_dir().join("cache").join(format!("obs-{id}.json"));
+    let v = serde_json::json!({
+        "schema": "cua-observation-v1",
+        "id": id,
+        "session": session(),
+        "hwnd": hwnd,
+        "sig": sig,
+        "truncated": truncated,
+        "created": now_iso(),
+        "nodes": nodes,
+        "screenshot": screenshot,
+    });
+    write_atomic(&p, &serde_json::to_vec(&v)?)?;
+    prune_observations_in(&ensure_data_dir().join("cache"), OBS_RETAIN);
+    Ok(p)
+}
+
+pub fn save_last_observation(hwnd: isize, id: &str) {
+    let p = ensure_data_dir()
+        .join("cache")
+        .join(scoped(&format!("last-observation-{hwnd}"), "json"));
+    let v = serde_json::json!({"id": id, "hwnd": hwnd, "session": session(), "ts": now_iso()});
+    let _ = write_atomic(&p, &serde_json::to_vec(&v).unwrap_or_default());
+}
+
+pub fn last_observation_id(hwnd: isize) -> Option<String> {
+    let p = ensure_data_dir()
+        .join("cache")
+        .join(scoped(&format!("last-observation-{hwnd}"), "json"));
+    std::fs::read(p)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v["id"].as_str().map(|s| s.to_string()))
+}
+
+pub fn load_observation(hwnd: isize) -> Option<serde_json::Value> {
+    let id = last_observation_id(hwnd)?;
+    let p = ensure_data_dir().join("cache").join(format!("obs-{id}.json"));
+    std::fs::read(p)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+}
+
+fn pinned_observation_id() -> Option<String> {
+    std::env::var("CUA_OBSERVATION_ID")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
+fn load_observation_by_id(id: &str, hwnd: isize) -> Option<serde_json::Value> {
+    let p = ensure_data_dir().join("cache").join(format!("obs-{id}.json"));
+    std::fs::read(p)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .filter(|v| v["hwnd"].as_i64() == Some(hwnd as i64))
+}
+
+/// Nodes for index actions: an explicitly pinned observation (`CUA_OBSERVATION_ID`)
+/// wins, otherwise the latest observation pointer is used, with the legacy
+/// elements cache as the final fallback.
+pub fn load_observation_nodes(hwnd: isize) -> Option<serde_json::Value> {
+    if let Some(id) = pinned_observation_id() {
+        return load_observation_by_id(&id, hwnd).and_then(|v| v.get("nodes").cloned());
+    }
+    load_observation(hwnd)
+        .and_then(|v| v.get("nodes").cloned())
+        .or_else(|| load_elements(hwnd))
+}
+
+const OBS_RETAIN: usize = 500;
+
+fn prune_observations_in(dir: &std::path::Path, keep: usize) {
+    let Ok(read) = std::fs::read_dir(dir) else { return };
+    let pinned = pinned_observation_id();
+    let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = read
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            name.starts_with("obs-") && name.ends_with(".json")
+                && pinned.as_ref().map(|id| name != format!("obs-{id}.json")).unwrap_or(true)
+        })
+        .filter_map(|e| {
+            let p = e.path();
+            let t = e.metadata().ok()?.modified().ok()?;
+            Some((t, p))
+        })
+        .collect();
+    if files.len() <= keep {
+        return;
+    }
+    files.sort_by_key(|(t, _)| *t);
+    for (_, p) in files.iter().take(files.len() - keep) {
+        let _ = std::fs::remove_file(p);
+    }
 }
 
 // ---------------- safety (Qoder no-negotiables + confirmation levels) ----------------
@@ -307,6 +518,7 @@ pub fn record_append(name: &str, cmd: &str, args: &serde_json::Value, receipt: &
         "cmd": cmd,
         "args": args,
         "status": receipt.status,
+        "input_mode": receipt.input_mode,
         "state_sig_after": sig_after,
     });
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(p)?;
@@ -334,4 +546,53 @@ pub fn fnv1a(bytes: &[u8]) -> u64 {
         h = h.wrapping_mul(0x100000001b3);
     }
     h
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_keeps_safe_names_and_replaces_the_rest() {
+        assert_eq!(sanitize("rec-01_a"), "rec-01_a");
+        assert_eq!(sanitize("a/b:c*?"), "a_b_c__");
+        assert!(!sanitize("../../x").contains(".."));
+    }
+
+    #[test]
+    fn receipt_exit_codes_are_stable() {
+        let ok = Receipt::new("x").ok(serde_json::json!({}), "done");
+        let refused = Receipt::new("x").refused(serde_json::json!({}), "no");
+        let failed = Receipt::new("x").fail(serde_json::json!({}), "err");
+        assert_eq!(ok.exit_code(), 0);
+        assert_eq!(refused.exit_code(), 2);
+        assert_eq!(failed.exit_code(), 1);
+        assert!(!refused.dispatched);
+        assert!(ok.dispatched);
+        assert_eq!(ok.verification, "not_requested");
+        assert_eq!(ok.evidence, "complete");
+    }
+}
+
+#[cfg(test)]
+mod obs_tests {
+    use super::*;
+
+    #[test]
+    fn observation_pruning_keeps_the_newest_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "cua-obs-prune-{}-{}",
+            std::process::id(),
+            now_iso().replace([':', '.', '-', 'T', 'Z'], "")
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        for i in 0..5 {
+            std::fs::write(dir.join(format!("obs-{i}.json")), b"{}").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        prune_observations_in(&dir, 2);
+        let left = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).count();
+        assert_eq!(left, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -5,12 +5,16 @@
 $ErrorActionPreference = "Continue"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
-$cua = "$root\bin\cua.exe"
+$cua = $env:CUA_TEST_BIN
+if (-not $cua -or -not (Test-Path $cua)) { $cua = "$root\bin\cua.exe" }
 if (-not (Test-Path $cua)) { $cua = "$root\target\release\cua.exe" }
-$cache = Join-Path $env:LOCALAPPDATA "cua\cache"
+if (-not (Test-Path $cua)) { $cua = "$root\target\debug\cua.exe" }
+$dataRoot = if ($env:CUA_DATA_DIR) { $env:CUA_DATA_DIR } else { Join-Path $env:LOCALAPPDATA "cua" }
+$cache = Join-Path $dataRoot "cache"
+Write-Host ("== binary: {0} ({1})" -f $cua, (Get-FileHash $cua -Algorithm SHA256).Hash.Substring(0, 12)) -ForegroundColor DarkGray
 $recName = "bili-e2e"
 $trace = "bili-run"
-$script:pass = 0; $script:fail = 0; $script:failures = @()
+$script:pass = 0; $script:fail = 0; $script:skip = 0; $script:failures = @()
 
 function J($out) {
     $s = ($out -join "`n")
@@ -22,6 +26,9 @@ function J($out) {
 function Check($name, $cond, $detail = "") {
     if ($cond) { $script:pass++; Write-Host ("  PASS  {0}" -f $name) -ForegroundColor Green }
     else { $script:fail++; $script:failures += $name; Write-Host ("  FAIL  {0}  {1}" -f $name, $detail) -ForegroundColor Red }
+}
+function Skip($name, $why) {
+    $script:skip++; Write-Host ("  SKIP  {0}  ({1})" -f $name, $why) -ForegroundColor DarkGray
 }
 function RunCua { & $cua @args 2>$null }
 function Ground($sel, $q) { (J (RunCua grounding --window $sel --query $q)).matches | Select-Object -First 1 }
@@ -38,7 +45,7 @@ if (-not (Test-Path $exe)) {
 
 # ---------- 0. clean slate + start recording ----------
 & $cua rec stop 2>$null | Out-Null
-Remove-Item (Join-Path (Join-Path $env:LOCALAPPDATA (Join-Path "cua" "recordings")) ($trace + ".jsonl")) -Force -ErrorAction SilentlyContinue
+Remove-Item (Join-Path (Join-Path $dataRoot "recordings") ($trace + ".jsonl")) -Force -ErrorAction SilentlyContinue
 taskkill /IM "哔哩哔哩.exe" /F 2>$null | Out-Null
 Start-Sleep -Seconds 2
 $r = J (RunCua rec start --fps 2 --out $recName --max-seconds 600)
@@ -131,16 +138,48 @@ if ($pl) {
     $t2 = Md5 (Shot $ph "$cache\p6-f2.png").path
     Check "L14 the video is actually playing (frames differ)" ($t1 -ne "" -and $t1 -ne $t2) "$t1 / $t2"
 
-    # seek: arrow keys move the playhead; the time label must change
+    # seek: arrow keys move the playhead. Verify the key receipts first, then use
+    # a range-owned signal when the player exposes one; otherwise compare short
+    # time labels. A player that exposes neither gets an explicit skip, not a
+    # random pass/fail.
+    function TimeLabels($st) {
+        @($st.nodes | Where-Object { $_.name -match "\d{1,2}:\d{2}" -and $_.name.Length -lt 60 } |
+            ForEach-Object { $_.name } | Sort-Object -Unique)
+    }
+    # Put keyboard focus on the video surface first: raising the top-level window
+    # is not enough for players that keep focus on a toolbar or the page.
     $st = J (RunCua state --window $ph --no-shot)
-    $time = $st.nodes | Where-Object { $_.name -match "\d{1,2}:\d{2}" } | Select-Object -First 1
-    $before = $time.name
-    & $cua key --window $ph --keys "right" --record $trace | Out-Null
-    & $cua key --window $ph --keys "right" --record $trace | Out-Null
+    $seekShot = J (RunCua shot --window $ph --out "$cache\p6-seek.png")
+    $plr = $pl.rect
+    $focus = J (RunCua click --window $ph --x ($plr[0] + [int]($plr[2] / 2)) --y ($plr[1] + [int]($plr[3] / 2)) --shot-id $seekShot.state_id)
+    Start-Sleep -Milliseconds 600
+    $k1 = J (RunCua key --window $ph --keys "right" --record $trace)
+    $k2 = J (RunCua key --window $ph --keys "right" --record $trace)
     Start-Sleep -Seconds 2
-    $st = J (RunCua state --window $ph --no-shot)
-    $time2 = $st.nodes | Where-Object { $_.name -match "\d{1,2}:\d{2}" } | Select-Object -First 1
-    Check "L15 seeking with the right arrow moves the playhead" ("$before" -ne "$($time2.name)") "'$before' -> '$($time2.name)'"
+    $st2 = J (RunCua state --window $ph --no-shot)
+    Check "L15 seek focus + keys were accepted" ($focus.status -eq "ok" -and $k1.status -eq "ok" -and $k2.status -eq "ok") "focus=$($focus.status) k1=$($k1.status) k2=$($k2.status)"
+    $rng0 = $st.nodes | Where-Object { $null -ne $_.range -and $_.range[2] -gt 60 } | Select-Object -First 1
+    $rng1 = if ($rng0) { $st2.nodes | Where-Object { $_.i -eq $rng0.i } | Select-Object -First 1 } else { $null }
+    $before = TimeLabels $st
+    $after = TimeLabels $st2
+    $moved = $false
+    $why = ""
+    if ($rng0 -and $rng1 -and $rng0.range[0] -ne $rng1.range[0]) {
+        $moved = $true
+        $why = "range $($rng0.range[0]) -> $($rng1.range[0])"
+    } elseif ($before.Count -gt 0 -and @(Compare-Object $before $after).Count -gt 0) {
+        $moved = $true
+        $why = ($before -join "|") + " -> " + ($after -join "|")
+    } elseif (-not $rng0 -and $before.Count -eq 0) {
+        Skip "L15 seeking with the right arrow moves the playhead" "player exposes no seek signal"
+    } else {
+        $why = "range=$($rng0.range -join ',') labels=" + ($before -join "|") + " -> " + ($after -join "|")
+    }
+    if ($moved) {
+        Check "L15 seeking with the right arrow moves the playhead" $true $why
+    } elseif ($rng0 -or $before.Count -gt 0) {
+        Check "L15 seeking with the right arrow moves the playhead" $false $why
+    }
 
     # window geometry control
     $r = J (RunCua resize --window $ph --width 1100 --height 720 --x 120 --y 120)
@@ -163,7 +202,7 @@ $vid = if ($rs.target.encoded -eq "mp4") { $rs.target.video } else { Join-Path $
 Check "R4 artifact exists and is not trivial" ((Test-Path $vid) -and ((Get-Item $vid).Length -gt 50KB)) "$vid"
 
 # ---------- 8. the action trace itself ----------
-$tp = (Join-Path (Join-Path $env:LOCALAPPDATA (Join-Path "cua" "recordings")) ($trace + ".jsonl"))
+$tp = (Join-Path (Join-Path $dataRoot "recordings") ($trace + ".jsonl"))
 $lines = @()
 if (Test-Path $tp) { $lines = @(Get-Content $tp | Where-Object { $_.Trim() }) }
 $cmds = $lines | ForEach-Object { ($_ | ConvertFrom-Json).cmd } | Sort-Object -Unique
@@ -175,6 +214,6 @@ Check "R7 replay runs the trace and reports per-step status honestly" (@($rp.ste
 # ---------- 9. result ----------
 Write-Host ""
 Write-Host ("  recording artifact: {0}" -f $vid) -ForegroundColor Cyan
-Write-Host ("==== PHASE-6 RESULT: {0} passed, {1} failed" -f $script:pass, $script:fail) -ForegroundColor $(if ($script:fail -eq 0) { "Green" } else { "Red" })
+Write-Host ("==== PHASE-6 RESULT: {0} passed, {1} failed, {2} skipped" -f $script:pass, $script:fail, $script:skip) -ForegroundColor $(if ($script:fail -eq 0) { "Green" } else { "Red" })
 if ($script:fail -gt 0) { $script:failures | ForEach-Object { Write-Host ("  failed: " + $_) -ForegroundColor Red }; exit 1 }
 exit 0

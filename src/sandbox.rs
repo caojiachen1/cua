@@ -113,10 +113,47 @@ fn spawn_on_sandbox(exe: &str, args: Option<&str>) -> Result<u32> {
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+struct OwnedProcess {
+    pid: u32,
+    /// Process creation FILETIME. A missing value means "not verified", never
+    /// "safe to kill": PIDs are reused by unrelated processes.
+    #[serde(default)]
+    created: Option<u64>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 struct SandboxState {
     desktop: String,
     pids: Vec<u32>,
+    #[serde(default)]
+    processes: Vec<OwnedProcess>,
     started: String,
+}
+
+fn owned(pid: u32) -> OwnedProcess {
+    OwnedProcess { pid, created: crate::win::process_creation_time(pid) }
+}
+
+/// Kill only processes whose creation time still matches the recorded one.
+fn kill_owned(processes: &[OwnedProcess]) -> u32 {
+    let mut killed = 0u32;
+    for p in processes {
+        let Some(created) = p.created else { continue };
+        if crate::win::process_creation_time(p.pid) == Some(created) {
+            killed += crate::win::kill_process_tree(p.pid);
+        }
+    }
+    killed
+}
+
+/// Old state files have no creation times. Only the keeper can be identified
+/// safely (it is this executable); everything else waits for the desktop sweep.
+fn legacy_keeper(st: &SandboxState) -> Option<u32> {
+    let exe = std::env::current_exe().ok()?.file_name()?.to_string_lossy().to_string();
+    let pid = *st.pids.get(1)?;
+    crate::win::process_name(pid)
+        .filter(|n| n.eq_ignore_ascii_case(&exe))
+        .map(|_| pid)
 }
 
 fn state_path() -> std::path::PathBuf {
@@ -272,17 +309,51 @@ pub fn dispatch(op: SandboxOp) -> Result<i32> {
     match op {
         SandboxOp::Start { exe, args } => cmd_start(&exe, args),
         SandboxOp::Apps => cmd_apps(),
-        SandboxOp::State { window, depth, no_shot, out, patterns } => {
-            cmd_state(&window, depth, no_shot, out, patterns)
+        SandboxOp::Status => cmd_status(),
+        SandboxOp::State { window, depth, no_shot, out, diff, redact, patterns } => {
+            cmd_state(&window, depth, no_shot, out, diff, redact, patterns)
         }
         SandboxOp::Shot { window, out } => cmd_shot(&window, &out),
         SandboxOp::Click { window, index, x, y, shot_id, right, double } => {
             cmd_click(window, index, x, y, shot_id, right, double)
         }
-        SandboxOp::Type { text, window } => cmd_type(&text, window),
+        SandboxOp::Type { text, window, index } => cmd_type(&text, window, index),
         SandboxOp::Key { keys, window, confirm } => cmd_key(&keys, window, confirm),
-        SandboxOp::Scroll { dx, dy, window } => cmd_scroll(dx, dy, window),
-        SandboxOp::Drag { x1, y1, x2, y2 } => cmd_drag(x1, y1, x2, y2),
+        SandboxOp::Scroll { dx, dy, x, y, window, shot_id } => {
+            cmd_scroll(dx, dy, x, y, window, shot_id)
+        }
+        SandboxOp::Drag { x1, y1, x2, y2, window, shot_id } => {
+            cmd_drag(x1, y1, x2, y2, window, shot_id)
+        }
+        SandboxOp::Hover { window, index, x, y, shot_id } => {
+            cmd_hover(window, index, x, y, shot_id)
+        }
+        SandboxOp::Resize { window, width, height, x, y } => {
+            cmd_resize(&window, width, height, x, y)
+        }
+        SandboxOp::Minimize { window } => cmd_window_show(&window, "minimize"),
+        SandboxOp::Maximize { window } => cmd_window_show(&window, "maximize"),
+        SandboxOp::Restore { window } => cmd_window_show(&window, "restore"),
+        SandboxOp::Wait { window, gone, timeout_ms, interval_ms } => {
+            cmd_wait(&window, gone, timeout_ms, interval_ms)
+        }
+        SandboxOp::Clipboard { op } => cmd_clipboard(op),
+        SandboxOp::Grid { window, index, row, col, invoke, max_cells } => {
+            cmd_grid(&window, index, row, col, invoke, max_cells)
+        }
+        SandboxOp::Realize { window, index } => cmd_realize(&window, index),
+        SandboxOp::Table { window, index, max_headers } => cmd_table(&window, index, max_headers),
+        SandboxOp::FindItem { window, index, property, value } => {
+            cmd_find_item(&window, index, &property, &value)
+        }
+        SandboxOp::Ocr { window, max_lines } => cmd_ocr(&window, max_lines),
+        SandboxOp::Text { window, index, max_chars } => cmd_text(&window, index, max_chars),
+        SandboxOp::ScrollItem { window, index, align_top } => {
+            cmd_scroll_item(&window, index, align_top)
+        }
+        SandboxOp::Transform { window, index, move_to, size, zoom } => {
+            cmd_transform(&window, index, move_to, size, zoom)
+        }
         SandboxOp::GetValue { window, index } => cmd_get_value(&window, index),
         SandboxOp::SetValue { window, index, value, clear } => {
             let v = if clear {
@@ -296,6 +367,8 @@ pub fn dispatch(op: SandboxOp) -> Result<i32> {
         SandboxOp::Close { window, confirm } => cmd_close(&window, confirm),
         SandboxOp::Toggle { window, index } => cmd_toggle(&window, index),
         SandboxOp::Select { window, index } => cmd_select(&window, index),
+        SandboxOp::SelectAdd { window, index } => cmd_select_many(&window, index, true),
+        SandboxOp::SelectRemove { window, index } => cmd_select_many(&window, index, false),
         SandboxOp::Expand { window, index } => cmd_expand(&window, index),
         SandboxOp::Collapse { window, index } => cmd_collapse(&window, index),
         SandboxOp::SetRange { window, index, value } => cmd_set_range(&window, index, value),
@@ -355,8 +428,11 @@ pub fn cmd_start(exe: &str, args: Option<String>) -> Result<i32> {
     }
     // clean previous sandbox
     if let Some(prev) = load_state() {
-        for pid in &prev.pids {
-            crate::win::kill_process_tree(*pid);
+        kill_owned(&prev.processes);
+        if prev.processes.is_empty() {
+            if let Some(k) = legacy_keeper(&prev) {
+                crate::win::kill_process_tree(k);
+            }
         }
         let _ = std::fs::remove_file(state_path());
         std::thread::sleep(std::time::Duration::from_millis(300));
@@ -402,6 +478,7 @@ pub fn cmd_start(exe: &str, args: Option<String>) -> Result<i32> {
     let st = SandboxState {
         desktop: DESKTOP_NAME.into(),
         pids: vec![pid, keeper_pid],
+        processes: vec![owned(pid), owned(keeper_pid)],
         started: crate::util::now_iso(),
     };
     save_state(&st)?;
@@ -485,24 +562,58 @@ fn resolve_in_sandbox(sel: &str) -> Result<crate::win::WinInfo> {
         .ok_or_else(|| anyhow!("no sandbox window matching '{sel}' (try 'cua sandbox apps')"))
 }
 
-pub fn cmd_state(sel: &str, depth: usize, no_shot: bool, out: Option<String>, patterns: bool) -> Result<i32> {
+pub fn cmd_state(
+    sel: &str,
+    depth: usize,
+    no_shot: bool,
+    out: Option<String>,
+    diff: bool,
+    redact: bool,
+    patterns: bool,
+) -> Result<i32> {
     let info = resolve_in_sandbox(sel)?;
     let hwnd_isize = info.hwnd;
     let payload = with_sandbox(move || -> Result<serde_json::Value> {
         let hwnd = HWND(hwnd_isize as *mut _);
+        // Walk unredacted for the action cache; redact only the output copy.
         let tree = crate::uia::walk_window(hwnd, depth, 2000, false, patterns)?;
+        let out_nodes = if redact {
+            crate::uia::redacted_nodes(&tree.nodes)
+        } else {
+            tree.nodes.clone()
+        };
         let state_id = crate::util::new_state_id();
-        let elems: Vec<serde_json::Value> = tree
-            .nodes
-            .iter()
-            .map(|n| {
-                json!({"i": n.i, "type": n.ctype, "name": n.name, "class": n.class,
-                       "rect": n.rect, "rid": n.rid, "disabled": n.disabled, "offscreen": n.offscreen,
-                       "value": n.value, "toggle": n.toggle, "selected": n.selected,
-                       "expanded": n.expanded, "range": n.range, "patterns": n.patterns})
-            })
-            .collect();
-        crate::util::save_elements(hwnd_isize, &json!(elems));
+        let cache_elems = crate::uia::nodes_json(&tree.nodes);
+        let elems = crate::uia::nodes_json(&out_nodes);
+        let diff_v = if diff {
+            let prev_state = crate::util::load_last_state();
+            let mut prev_elems: Vec<serde_json::Value> =
+                crate::util::load_observation_nodes(hwnd_isize)
+                    .and_then(|e| serde_json::from_value::<Vec<serde_json::Value>>(e).ok())
+                    .unwrap_or_default();
+            if redact {
+                for n in prev_elems.iter_mut() {
+                    if let Some(s) = n["name"].as_str() {
+                        n["name"] = json!(crate::uia::redact_text(s));
+                    }
+                    if let Some(s) = n["value"].as_str() {
+                        n["value"] = json!(crate::uia::redact_text(s));
+                    }
+                }
+            }
+            match prev_state {
+                Some(p) if p["hwnd"].as_i64() == Some(hwnd_isize as i64) && !prev_elems.is_empty() => {
+                    let mut d = crate::diff_trees(&prev_elems, &out_nodes, redact);
+                    d["changed"] = serde_json::Value::Bool(p["sig"] != serde_json::Value::String(tree.sig.clone()));
+                    d
+                }
+                _ => json!({"changed": null, "note": "no previous state for this window"}),
+            }
+        } else {
+            serde_json::Value::Null
+        };
+        let cache_value = json!(cache_elems);
+        crate::util::save_elements(hwnd_isize, &cache_value);
         crate::util::save_last_state(&state_id, hwnd_isize, &tree.sig);
         let shot = if no_shot {
             None
@@ -520,16 +631,53 @@ pub fn cmd_state(sel: &str, depth: usize, no_shot: bool, out: Option<String>, pa
                 Err(e) => Some(json!({"error": format!("{e:#}")})),
             }
         };
+        let obs_path = crate::util::save_observation(
+            &state_id,
+            hwnd_isize,
+            &tree.sig,
+            tree.truncated,
+            &cache_value,
+            shot.as_ref(),
+        )?;
+        crate::util::save_last_observation(hwnd_isize, &state_id);
         Ok(json!({
             "state_id": state_id,
             "window": {"hwnd": hwnd_isize, "title": info.title, "class": info.class, "pid": info.pid, "process": info.process},
             "node_count": tree.nodes.len(),
+            "truncated": tree.truncated,
             "sig": tree.sig,
             "nodes": elems,
             "screenshot": shot,
+            "observation": obs_path.to_string_lossy(),
+            "diff": diff_v,
         }))
     })?;
     println!("{}", serde_json::to_string_pretty(&payload)?);
+    Ok(0)
+}
+
+/// Liveness of the whole sandbox: state file, desktop object, keeper pid, tracked pids.
+pub fn cmd_status() -> Result<i32> {
+    let st = load_state();
+    let desktop_alive = try_open_desktop().is_ok();
+    let mut procs: Vec<serde_json::Value> = Vec::new();
+    if let Some(s) = &st {
+        for pid in &s.pids {
+            let alive = crate::win::process_name(*pid).is_some();
+            procs.push(json!({"pid": pid, "alive": alive}));
+        }
+    }
+    let keeper = st.as_ref().and_then(|s| s.pids.get(1).copied());
+    let v = json!({
+        "schema": "cua-sandbox-status-v1",
+        "running": st.is_some(),
+        "desktop": DESKTOP_NAME,
+        "desktop_alive": desktop_alive,
+        "keeper_pid": keeper,
+        "processes": procs,
+        "started": st.as_ref().map(|s| s.started.clone()),
+    });
+    println!("{}", serde_json::to_string_pretty(&v)?);
     Ok(0)
 }
 
@@ -605,8 +753,19 @@ pub fn cmd_click(
                 let sel = sel.ok_or_else(|| anyhow!("--window required for index clicks"))?;
                 let info = resolve_in_sandbox(&sel)?;
                 let hwnd = HWND(info.hwnd as *mut _);
-                let rid = crate::rid_for_index(info.hwnd, idx)?;
-                let detail = crate::uia::click_element(hwnd, &rid, double, right)?;
+                // a11y chain; elements without a runtime id fall back to their
+                // (re-located) rectangle via message-level input, like the user desktop
+                let detail = match crate::target_for_index(info.hwnd, idx)? {
+                    crate::ElementTarget::Rid(rid) => {
+                        crate::uia::click_element_background(hwnd, &rid, double, right)?
+                    }
+                    crate::ElementTarget::Rect { rect, ctype, name } => {
+                        let (cx, cy, via) = crate::locate_rect(hwnd, &rect, &ctype, &name)?;
+                        let root = crate::win::root_window(hwnd);
+                        crate::input::post_click(root, cx, cy, right, double)?;
+                        format!("no runtime id; {via}, clicked ({cx},{cy}) via message-level input")
+                    }
+                };
                 Ok(("ok".into(), detail))
             }
             (_, Some(px), Some(py)) => {
@@ -636,23 +795,36 @@ pub fn cmd_click(
     })
 }
 
-pub fn cmd_type(text: &str, window: Option<String>) -> Result<i32> {
+pub fn cmd_type(text: &str, window: Option<String>, index: Option<usize>) -> Result<i32> {
     let text = text.to_string();
     sandbox_action("sandbox-type", move || {
-        let (top, title) = match &window {
+        let (top, hwnd_isize, title) = match &window {
             Some(sel) => {
                 let info = resolve_in_sandbox(sel)?;
-                (HWND(info.hwnd as *mut _), info.title)
+                (HWND(info.hwnd as *mut _), info.hwnd, info.title)
             }
             None => {
                 let wins = enum_desktop_windows_all()?;
                 let w = wins.iter().find(|w| w.foreground).or_else(|| wins.iter().find(|w| w.visible)).ok_or_else(|| anyhow!("no sandbox window"))?;
-                (HWND(w.hwnd as *mut _), w.title.clone())
+                (HWND(w.hwnd as *mut _), w.hwnd, w.title.clone())
             }
         };
         // msg-level input: SendInput is blocked on non-input desktops
-        let target = crate::input::find_input_target(top);
-        let n = crate::input::post_type(target, &text).map_err(|e| anyhow!("post_type: {e}"))?;
+        let n = match index {
+            Some(idx) => {
+                let (cx, cy) = match crate::target_for_index(hwnd_isize, idx)? {
+                    crate::ElementTarget::Rid(rid) => crate::uia::element_center(top, &rid)?.1,
+                    crate::ElementTarget::Rect { rect, ctype, name } => {
+                        let (cx, cy, _via) = crate::locate_rect(top, &rect, &ctype, &name)?;
+                        (cx, cy)
+                    }
+                };
+                crate::input::post_type_at_point(top, cx, cy, &text)
+                    .map_err(|e| anyhow!("post_type_at_point: {e}"))?
+            }
+            None => crate::input::post_type(crate::input::find_input_target(top), &text)
+                .map_err(|e| anyhow!("post_type: {e}"))?,
+        };
         Ok(("ok".into(), format!("typed {n} units into '{}' via message-level input (sandbox desktop)", title)))
     })
 }
@@ -661,7 +833,7 @@ pub fn cmd_key(keys: &str, window: Option<String>, confirm: bool) -> Result<i32>
     let combo = crate::input::parse_combo(keys)?;
     let keys = keys.to_string();
     sandbox_action("sandbox-key", move || {
-        if keys.eq_ignore_ascii_case("alt+f4") && !confirm {
+        if crate::input::is_alt_f4(&combo) && !confirm {
             return Ok(("refused".into(), "alt+f4 is Always-Confirm level — pass --confirm".into()));
         }
         let (top, title) = match &window {
@@ -688,48 +860,156 @@ pub fn cmd_key(keys: &str, window: Option<String>, confirm: bool) -> Result<i32>
     })
 }
 
-pub fn cmd_scroll(dx: i32, dy: i32, window: Option<String>) -> Result<i32> {
+pub fn cmd_scroll(
+    dx: i32,
+    dy: i32,
+    x: Option<i32>,
+    y: Option<i32>,
+    window: Option<String>,
+    shot_id: Option<String>,
+) -> Result<i32> {
     sandbox_action("sandbox-scroll", move || {
-        let (px, py) = match &window {
-            Some(sel) => {
+        // A point inside a window, or the centre of the selected window; the real
+        // cursor is session-global so it must never be touched from here.
+        let (hwnd, px, py, title, explicit) = match (&window, x, y) {
+            (Some(sel), Some(a), Some(b)) => {
                 let info = resolve_in_sandbox(sel)?;
-                let hwnd = HWND(info.hwnd as *mut _);
-                crate::win::activate_window(hwnd)?;
                 let r = info.rect;
-                (r[0] + r[2] / 2, r[1] + r[3] / 2)
+                if a < r[0] || b < r[1] || a >= r[0] + r[2].max(1) || b >= r[1] + r[3].max(1) {
+                    bail!("({a},{b}) is outside '{}'", info.title);
+                }
+                (HWND(info.hwnd as *mut _), a, b, info.title, true)
             }
-            None => crate::input::cursor_pos(),
+            (Some(sel), _, _) => {
+                let info = resolve_in_sandbox(sel)?;
+                let r = info.rect;
+                (HWND(info.hwnd as *mut _), r[0] + r[2] / 2, r[1] + r[3] / 2, info.title, false)
+            }
+            (None, Some(a), Some(b)) => {
+                let wins = enum_desktop_windows_all()?;
+                let w = wins
+                    .iter()
+                    .find(|w| {
+                        let r = w.rect;
+                        a >= r[0] && b >= r[1] && a < r[0] + r[2].max(1) && b < r[1] + r[3].max(1) && r[2] > 0
+                    })
+                    .ok_or_else(|| anyhow!("no sandbox window at ({a},{b})"))?;
+                (HWND(w.hwnd as *mut _), a, b, w.title.clone(), true)
+            }
+            _ => bail!("--window or --x/--y required (the sandbox never uses the real cursor position)"),
         };
-        // msg-level: SendInput is blocked on non-input desktops
-        let wins = enum_desktop_windows_all()?;
-        let w = wins
-            .iter()
-            .find(|w| {
-                let r = w.rect;
-                px >= r[0] && py >= r[1] && px < r[0] + r[2].max(1) && py < r[1] + r[3].max(1) && r[2] > 0
-            })
-            .or_else(|| wins.iter().find(|w| w.visible))
-            .ok_or_else(|| anyhow!("no sandbox window to scroll"))?;
-        crate::input::post_scroll(HWND(w.hwnd as *mut _), px, py, dx, dy)?;
-        Ok(("ok".into(), format!("scrolled dx={dx} dy={dy} via message-level input")))
+        if explicit {
+            let cfg = crate::util::load_config();
+            if cfg.require_shot_id_for_coords {
+                if let Err(reason) = crate::check_shot_id(shot_id.as_deref(), hwnd) {
+                    return Ok(("refused".into(), format!("{reason} — run 'cua sandbox state/shot' first")));
+                }
+            }
+        }
+        crate::input::post_scroll(hwnd, px, py, dx, dy)?;
+        Ok(("ok".into(), format!("scrolled dx={dx} dy={dy} at ({px},{py}) in '{title}' via message-level input")))
     })
 }
 
-pub fn cmd_drag(x1: i32, y1: i32, x2: i32, y2: i32) -> Result<i32> {
+pub fn cmd_drag(
+    x1: i32,
+    y1: i32,
+    x2: i32,
+    y2: i32,
+    window: Option<String>,
+    shot_id: Option<String>,
+) -> Result<i32> {
     sandbox_action("sandbox-drag", move || {
-        // msg-level drag on the window under the start point
-        let wins = enum_desktop_windows_all()?;
-        let w = wins
-            .iter()
-            .find(|w| {
-                let r = w.rect;
-                x1 >= r[0] && y1 >= r[1] && x1 < r[0] + r[2].max(1) && y1 < r[1] + r[3].max(1) && r[2] > 0
-            })
-            .or_else(|| wins.iter().find(|w| w.visible))
-            .ok_or_else(|| anyhow!("no sandbox window under drag start"))?;
-        let hwnd = w.hwnd;
+        // msg-level drag on the window under the start point, or --window's window
+        let (hwnd, title) = match &window {
+            Some(sel) => {
+                let info = resolve_in_sandbox(sel)?;
+                let r = info.rect;
+                if x1 < r[0] || y1 < r[1] || x1 >= r[0] + r[2].max(1) || y1 >= r[1] + r[3].max(1) {
+                    bail!("({x1},{y1}) is outside '{}'", info.title);
+                }
+                (info.hwnd, info.title)
+            }
+            None => {
+                let wins = enum_desktop_windows_all()?;
+                let w = wins
+                    .iter()
+                    .find(|w| {
+                        let r = w.rect;
+                        x1 >= r[0] && y1 >= r[1] && x1 < r[0] + r[2].max(1) && y1 < r[1] + r[3].max(1) && r[2] > 0
+                    })
+                    .ok_or_else(|| anyhow!("no sandbox window under drag start"))?;
+                (w.hwnd, w.title.clone())
+            }
+        };
+        let cfg = crate::util::load_config();
+        if cfg.require_shot_id_for_coords {
+            if let Err(reason) = crate::check_shot_id(shot_id.as_deref(), HWND(hwnd as *mut _)) {
+                return Ok(("refused".into(), format!("{reason} — run 'cua sandbox state/shot' first")));
+            }
+        }
         crate::input::post_drag(HWND(hwnd as *mut _), x1, y1, x2, y2)?;
-        Ok(("ok".into(), format!("dragged ({x1},{y1})->({x2},{y2}) via message-level input")))
+        Ok(("ok".into(), format!("dragged ({x1},{y1})->({x2},{y2}) in '{title}' via message-level input")))
+    })
+}
+
+pub fn cmd_hover(
+    window: Option<String>,
+    index: Option<usize>,
+    x: Option<i32>,
+    y: Option<i32>,
+    shot_id: Option<String>,
+) -> Result<i32> {
+    sandbox_action("sandbox-hover", move || {
+        let cfg = crate::util::load_config();
+        let (hwnd, px, py, title, explicit) = match (&window, index, x, y) {
+            (Some(sel), Some(idx), _, _) => {
+                let info = resolve_in_sandbox(sel)?;
+                let hwnd = HWND(info.hwnd as *mut _);
+                let (cx, cy) = match crate::target_for_index(info.hwnd, idx)? {
+                    crate::ElementTarget::Rid(rid) => crate::uia::element_center(hwnd, &rid)?.1,
+                    crate::ElementTarget::Rect { rect, ctype, name } => {
+                        let (cx, cy, _via) = crate::locate_rect(hwnd, &rect, &ctype, &name)?;
+                        (cx, cy)
+                    }
+                };
+                (hwnd, cx, cy, info.title, false)
+            }
+            (Some(sel), None, Some(a), Some(b)) => {
+                let info = resolve_in_sandbox(sel)?;
+                let r = info.rect;
+                if a < r[0] || b < r[1] || a >= r[0] + r[2].max(1) || b >= r[1] + r[3].max(1) {
+                    bail!("({a},{b}) is outside '{}'", info.title);
+                }
+                (HWND(info.hwnd as *mut _), a, b, info.title, true)
+            }
+            (Some(sel), None, _, _) => {
+                let info = resolve_in_sandbox(sel)?;
+                let r = info.rect;
+                (HWND(info.hwnd as *mut _), r[0] + r[2] / 2, r[1] + r[3] / 2, info.title, false)
+            }
+            (None, _, Some(a), Some(b)) => {
+                let wins = enum_desktop_windows_all()?;
+                let w = wins
+                    .iter()
+                    .find(|w| {
+                        let r = w.rect;
+                        a >= r[0] && b >= r[1] && a < r[0] + r[2].max(1) && b < r[1] + r[3].max(1) && r[2] > 0
+                    })
+                    .ok_or_else(|| anyhow!("no sandbox window at ({a},{b})"))?;
+                (HWND(w.hwnd as *mut _), a, b, w.title.clone(), true)
+            }
+            _ => return Ok(("failed".into(), "--window or --x/--y required".into())),
+        };
+        // Explicit coordinates are scoped to the window they were observed in,
+        // matching click: a fresh id for window A must not drive a point in B.
+        if explicit && cfg.require_shot_id_for_coords {
+            if let Err(reason) = crate::check_shot_id(shot_id.as_deref(), hwnd) {
+                return Ok(("refused".into(), format!("{reason} — run 'cua sandbox state/shot' first")));
+            }
+        }
+        crate::input::post_hover(hwnd, px, py)?;
+        Ok(("ok".into(), format!("hovered ({px},{py}) in '{title}' via message-level input (pointer untouched)")))
     })
 }
 
@@ -773,6 +1053,7 @@ pub fn cmd_launch_add(exe: &str, args: Option<String>) -> Result<i32> {
     }
     let pid = spawn_on_sandbox(exe, args.as_deref())?;
     st.pids.push(pid);
+    st.processes.push(owned(pid));
     save_state(&st)?;
     println!(
         "{}",
@@ -848,6 +1129,19 @@ pub fn cmd_select(sel: &str, index: usize) -> Result<i32> {
     })
 }
 
+pub fn cmd_select_many(sel: &str, index: usize, add: bool) -> Result<i32> {
+    let hwnd_isize = resolve_in_sandbox(sel)?.hwnd;
+    sandbox_action("sandbox-select-many", move || {
+        let rid = crate::rid_for_index(hwnd_isize, index)?;
+        let d = if add {
+            crate::uia::select_add_element(HWND(hwnd_isize as *mut _), &rid)?
+        } else {
+            crate::uia::select_remove_element(HWND(hwnd_isize as *mut _), &rid)?
+        };
+        Ok(("ok".into(), d))
+    })
+}
+
 pub fn cmd_expand(sel: &str, index: usize) -> Result<i32> {
     sandbox_a11y_action("sandbox-expand", sel, index, |hwnd, rid| {
         let (d, state) = crate::uia::expand_element(hwnd, rid)?;
@@ -879,6 +1173,289 @@ pub fn cmd_get_range(sel: &str, index: usize) -> Result<i32> {
     Ok(0)
 }
 
+// ---- window geometry on the hidden desktop (no user-visible effect) ----
+
+pub fn cmd_resize(
+    sel: &str,
+    width: Option<i32>,
+    height: Option<i32>,
+    x: Option<i32>,
+    y: Option<i32>,
+) -> Result<i32> {
+    let info = resolve_in_sandbox(sel)?;
+    let hwnd_isize = info.hwnd;
+    let title = info.title.clone();
+    sandbox_action("sandbox-resize", move || {
+        let hwnd = HWND(hwnd_isize as *mut _);
+        let r = crate::win::window_rect(hwnd)?;
+        let nx = x.unwrap_or(r[0]);
+        let ny = y.unwrap_or(r[1]);
+        let nw = width.unwrap_or(r[2]);
+        let nh = height.unwrap_or(r[3]);
+        if nw < 50 || nh < 50 {
+            return Ok(("refused".into(), format!("refusing resize below 50x50 (got {nw}x{nh})")));
+        }
+        use windows::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER};
+        unsafe {
+            SetWindowPos(hwnd, None, nx, ny, nw, nh, SWP_NOACTIVATE | SWP_NOZORDER)
+                .map_err(|e| anyhow!("SetWindowPos: {e}"))?;
+        }
+        let after = crate::win::window_rect(hwnd)?;
+        Ok((
+            "ok".into(),
+            format!(
+                "'{title}' resized from {}x{} at ({},{}) to {}x{} at ({nx},{ny}) (user desktop untouched)",
+                r[2], r[3], r[0], r[1], after[2], after[3]
+            ),
+        ))
+    })
+}
+
+fn cmd_window_show(sel: &str, op: &str) -> Result<i32> {
+    let info = resolve_in_sandbox(sel)?;
+    let hwnd_isize = info.hwnd;
+    let title = info.title.clone();
+    let op = op.to_string();
+    sandbox_action("sandbox-window", move || {
+        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE};
+        let hwnd = HWND(hwnd_isize as *mut _);
+        unsafe {
+            match op.as_str() {
+                "minimize" => {
+                    let _ = ShowWindow(hwnd, SW_MINIMIZE);
+                    Ok(("ok".into(), format!("'{title}' minimized on the hidden desktop")))
+                }
+                "maximize" => {
+                    let _ = ShowWindow(hwnd, SW_MAXIMIZE);
+                    Ok(("ok".into(), format!("'{title}' maximized on the hidden desktop")))
+                }
+                _ => {
+                    let _ = ShowWindow(hwnd, SW_RESTORE);
+                    Ok(("ok".into(), format!("'{title}' restored on the hidden desktop")))
+                }
+            }
+        }
+    })
+}
+
+pub fn cmd_wait(sel: &str, gone: bool, timeout_ms: u64, interval_ms: u64) -> Result<i32> {
+    let started = std::time::Instant::now();
+    let interval = std::time::Duration::from_millis(interval_ms.max(20));
+    let timeout = std::time::Duration::from_millis(timeout_ms.max(50));
+    let mut found_title: Option<String> = None;
+    loop {
+        let found = resolve_in_sandbox(sel).ok();
+        if gone {
+            if found.is_none() {
+                break;
+            }
+            found_title = found.map(|w| w.title);
+        } else {
+            if found.is_some() {
+                found_title = found.map(|w| w.title);
+                break;
+            }
+        }
+        if started.elapsed() >= timeout {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "schema": "cua-wait-v1",
+                    "desktop": DESKTOP_NAME,
+                    "window": sel,
+                    "gone": gone,
+                    "satisfied": false,
+                    "elapsed_ms": started.elapsed().as_millis(),
+                    "found": found_title,
+                }))?
+            );
+            return Ok(1);
+        }
+        std::thread::sleep(interval);
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "schema": "cua-wait-v1",
+            "desktop": DESKTOP_NAME,
+            "window": sel,
+            "gone": gone,
+            "satisfied": true,
+            "elapsed_ms": started.elapsed().as_millis(),
+            "found": found_title,
+        }))?
+    );
+    Ok(0)
+}
+
+// ---- clipboard (window-station global: shared with the user's desktop) ----
+
+fn cmd_clipboard(op: crate::ClipOp) -> Result<i32> {
+    match op {
+        crate::ClipOp::Get => {
+            let text = crate::clipboard_get()?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "schema": "cua-clipboard-v1",
+                    "desktop": DESKTOP_NAME,
+                    "note": "the clipboard belongs to the window station, so sandbox and user desktop share it",
+                    "text": text,
+                }))?
+            );
+            Ok(0)
+        }
+        crate::ClipOp::Set { text, record } => {
+            let _ = record;
+            let len = text.chars().count();
+            crate::clipboard_set(&text)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "schema": "cua-clipboard-v1",
+                    "desktop": DESKTOP_NAME,
+                    "note": "set on the shared session clipboard — visible to the user desktop too",
+                    "chars": len,
+                }))?
+            );
+            Ok(0)
+        }
+    }
+}
+
+// ---- a11y extras (grid / realize / transform), same semantics as the user desktop ----
+
+pub fn cmd_grid(sel: &str, index: usize, row: Option<i32>, col: Option<i32>, invoke: bool, max_cells: usize) -> Result<i32> {
+    let hwnd_isize = resolve_in_sandbox(sel)?.hwnd;
+    let payload = with_sandbox(move || -> Result<serde_json::Value> {
+        let hwnd = HWND(hwnd_isize as *mut _);
+        let rid = crate::rid_for_index(hwnd_isize, index)?;
+        let out = match (row, col) {
+            // The hidden desktop cannot use SendInput, so cell actions must stay
+            // on the message-level path even when the cell has a runtime id.
+            (Some(r), Some(c)) => crate::uia::grid_cell(hwnd, &rid, r, c, invoke, true)?,
+            _ => crate::uia::grid_dump(hwnd, &rid, max_cells)?,
+        };
+        Ok(json!({"schema": "cua-grid-v1", "window": hwnd_isize, "index": index, "grid": out}))
+    })?;
+    println!("{}", serde_json::to_string_pretty(&payload)?);
+    Ok(0)
+}
+
+pub fn cmd_table(sel: &str, index: usize, max_headers: usize) -> Result<i32> {
+    let hwnd_isize = resolve_in_sandbox(sel)?.hwnd;
+    let payload = with_sandbox(move || -> Result<serde_json::Value> {
+        let hwnd = HWND(hwnd_isize as *mut _);
+        let rid = crate::rid_for_index(hwnd_isize, index)?;
+        let table = crate::uia::table_element(hwnd, &rid, max_headers)?;
+        Ok(json!({
+            "schema": "cua-table-v1",
+            "window": hwnd_isize,
+            "index": index,
+            "table": table,
+        }))
+    })?;
+    println!("{}", serde_json::to_string_pretty(&payload)?);
+    Ok(0)
+}
+
+pub fn cmd_find_item(sel: &str, index: usize, property: &str, value: &str) -> Result<i32> {
+    let hwnd_isize = resolve_in_sandbox(sel)?.hwnd;
+    let property = property.to_string();
+    let value = value.to_string();
+    let payload = with_sandbox(move || -> Result<serde_json::Value> {
+        let hwnd = HWND(hwnd_isize as *mut _);
+        let rid = crate::rid_for_index(hwnd_isize, index)?;
+        let item = crate::uia::find_item_element(hwnd, &rid, &property, &value)?;
+        Ok(json!({
+            "schema": "cua-item-v1",
+            "window": hwnd_isize,
+            "index": index,
+            "property": property,
+            "value": value,
+            "found": true,
+            "element": item,
+        }))
+    })?;
+    println!("{}", serde_json::to_string_pretty(&payload)?);
+    Ok(0)
+}
+
+pub fn cmd_ocr(sel: &str, max_lines: usize) -> Result<i32> {
+    let info = resolve_in_sandbox(sel)?;
+    let hwnd_isize = info.hwnd;
+    let title = info.title.clone();
+    let payload = with_sandbox(move || -> Result<serde_json::Value> {
+        let hwnd = HWND(hwnd_isize as *mut _);
+        let s = crate::capture::shot_window(hwnd, false)?;
+        if !s.rendered {
+            bail!("capture produced no content (minimized/DRM window)");
+        }
+        let mut out = crate::ocr::limit_lines(
+            crate::ocr::recognize(s.width, s.height, &s.rgba)?,
+            max_lines,
+        );
+        out["schema"] = json!("cua-ocr-v1");
+        out["window"] = json!({"hwnd": hwnd_isize, "title": title});
+        out["image"] = json!({"width": s.width, "height": s.height});
+        Ok(out)
+    })?;
+    println!("{}", serde_json::to_string_pretty(&payload)?);
+    Ok(0)
+}
+
+pub fn cmd_text(sel: &str, index: usize, max_chars: usize) -> Result<i32> {
+    let hwnd_isize = resolve_in_sandbox(sel)?.hwnd;
+    let payload = with_sandbox(move || -> Result<serde_json::Value> {
+        let hwnd = HWND(hwnd_isize as *mut _);
+        let rid = crate::rid_for_index(hwnd_isize, index)?;
+        let (text, truncated) = crate::uia::text_element(hwnd, &rid, max_chars)?;
+        Ok(json!({
+            "schema": "cua-text-v1",
+            "window": hwnd_isize,
+            "index": index,
+            "chars": text.chars().count(),
+            "truncated": truncated,
+            "text": text,
+        }))
+    })?;
+    println!("{}", serde_json::to_string_pretty(&payload)?);
+    Ok(0)
+}
+
+pub fn cmd_scroll_item(sel: &str, index: usize, align_top: bool) -> Result<i32> {
+    let hwnd_isize = resolve_in_sandbox(sel)?.hwnd;
+    sandbox_action("sandbox-scroll-item", move || {
+        let rid = crate::rid_for_index(hwnd_isize, index)?;
+        let d = crate::uia::scroll_item_element(HWND(hwnd_isize as *mut _), &rid, align_top)?;
+        Ok(("ok".into(), d))
+    })
+}
+
+pub fn cmd_realize(sel: &str, index: usize) -> Result<i32> {
+    let hwnd_isize = resolve_in_sandbox(sel)?.hwnd;
+    sandbox_action("sandbox-realize", move || {
+        let rid = crate::rid_for_index(hwnd_isize, index)?;
+        let d = crate::uia::realize(HWND(hwnd_isize as *mut _), &rid)?;
+        Ok(("ok".into(), d))
+    })
+}
+
+pub fn cmd_transform(sel: &str, index: usize, move_to: Option<String>, size: Option<String>, zoom: Option<f64>) -> Result<i32> {
+    let hwnd_isize = resolve_in_sandbox(sel)?.hwnd;
+    let mov = move_to.as_deref().map(crate::parse_pair).transpose()?;
+    let sz = size.as_deref().map(crate::parse_pair).transpose()?;
+    sandbox_action("sandbox-transform", move || {
+        let rid = crate::rid_for_index(hwnd_isize, index)?;
+        if mov.is_none() && sz.is_none() && zoom.is_none() {
+            let caps = crate::uia::transform_report(HWND(hwnd_isize as *mut _), &rid)?;
+            return Ok(("ok".into(), format!("capabilities: {caps}")));
+        }
+        let d = crate::uia::transform_do(HWND(hwnd_isize as *mut _), &rid, mov, sz, zoom)?;
+        Ok(("ok".into(), d))
+    })
+}
+
 pub fn status() -> serde_json::Value {
     match load_state() {
         Some(st) => json!({"running": true, "desktop": st.desktop, "pids": st.pids, "started": st.started}),
@@ -888,32 +1465,43 @@ pub fn status() -> serde_json::Value {
 
 pub fn cmd_stop() -> Result<i32> {
     let st = load_state();
-    let mut pids: Vec<u32> = st.as_ref().map(|s| s.pids.clone()).unwrap_or_default();
-    // Sweep: anything owning a window on the hidden desktop is sandbox content
-    // (children re-parented away from the tracked pid would otherwise leak).
-    if let Ok(wins) = with_sandbox(enum_desktop_windows_all) {
-        for w in wins {
-            if w.pid != 0 && !pids.contains(&w.pid) {
-                pids.push(w.pid);
+    let me = std::process::id();
+    let mut targets: Vec<OwnedProcess> = st
+        .as_ref()
+        .map(|s| s.processes.iter().filter(|p| p.pid != me).cloned().collect())
+        .unwrap_or_default();
+    // Anything owning a window on the hidden desktop is sandbox content (a child
+    // re-parented away from the tracked PID would otherwise leak). Record its
+    // creation time now so the kill below is identity-checked.
+    if st.is_some() {
+        if let Ok(wins) = with_sandbox(enum_desktop_windows_all) {
+            for w in wins {
+                if w.pid != 0 && w.pid != me && !targets.iter().any(|p| p.pid == w.pid) {
+                    targets.push(owned(w.pid));
+                }
             }
         }
     }
-    // drop the state file first: the keeper exits and closes the job, which
-    // terminates every remaining process in it.
+    // Kill the apps before the keeper: closing the keeper's job would take them
+    // down first and hide what this stop actually cleaned up.
+    let mut killed = kill_owned(&targets);
+    if let Some(s) = &st {
+        if s.processes.is_empty() {
+            if let Some(k) = legacy_keeper(s) {
+                killed += crate::win::kill_process_tree(k);
+            }
+        }
+    }
+    // State last: the keeper watches this file and would close the job early.
     if st.is_some() {
         let _ = std::fs::remove_file(state_path());
-    }
-    let me = std::process::id();
-    let mut killed = 0u32;
-    for p in pids.iter().filter(|p| **p != me) {
-        killed += crate::win::kill_process_tree(*p);
     }
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
             "schema": "cua-sandbox-stop-v1",
             "killed_processes": killed,
-            "note": "sandbox job closed (KILL_ON_JOB_CLOSE); hidden desktop released when its last handle closes"
+            "note": "only identity-checked sandbox processes were killed; the job closes (KILL_ON_JOB_CLOSE) when the keeper exits"
         }))?
     );
     Ok(0)

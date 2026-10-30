@@ -23,7 +23,7 @@ pub struct Shot {
 
 pub fn shot_window(hwnd: HWND, client_only: bool) -> Result<Shot> {
     let (w, h) = window_pixel_size(hwnd)?;
-    if w <= 0 || h > 20000 || w > 20000 {
+    if w <= 0 || h <= 0 || w > 20000 || h > 20000 {
         bail!("bad window size {w}x{h}");
     }
     let shot = unsafe { print_window(hwnd, w, h, client_only) }?;

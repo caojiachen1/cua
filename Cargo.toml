@@ -34,6 +34,12 @@ features = [
   "Win32_System_JobObjects",
   "Win32_System_LibraryLoader",
   "Win32_Storage_Xps",
+  "Foundation",
+  "Foundation_Collections",
+  "Globalization",
+  "Graphics_Imaging",
+  "Media_Ocr",
+  "Storage_Streams",
 ]
 
 [profile.release]

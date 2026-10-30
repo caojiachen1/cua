@@ -5,14 +5,15 @@
 #![windows_subsystem = "windows"]
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
+use windows::Win32::Graphics::Gdi::{BeginPaint, CreateFontW, EndPaint, PAINTSTRUCT};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW,
     PostQuitMessage, RegisterClassW, SendMessageW, ShowWindow, TranslateMessage, CS_DBLCLKS,
     CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, HMENU, MSG, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE,
     WM_CHAR, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_GETTEXT, WM_GETTEXTLENGTH, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETTEXT, WNDCLASSW,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFONT, WM_SETTEXT,
+    WNDCLASSW,
     WS_CHILD, WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
 };
 
@@ -22,9 +23,12 @@ const IDC_CHECK: isize = 1003;
 const IDC_LIST: isize = 1004;
 const IDC_TRACK: isize = 1005;
 const IDC_HIT: isize = 1006;
+const IDC_LIST2: isize = 1007;
+const IDC_OCR: isize = 1008;
 
 const BS_AUTOCHECKBOX: u32 = 0x0003;
 const LBS_NOTIFY: u32 = 0x0001;
+const LBS_MULTIPLESEL: u32 = 0x0008;
 const TBS_AUTOTICKS: u32 = 0x0001;
 const LB_ADDSTRING: u32 = 0x0180;
 const TBM_SETRANGE: u32 = 0x0406;
@@ -141,6 +145,39 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 windows::Win32::Foundation::HINSTANCE(hinstance.0),
                 None,
             );
+            let list2 = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("LISTBOX"),
+                w!(""),
+                WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_VSCROLL.0 | LBS_NOTIFY | LBS_MULTIPLESEL),
+                440, 284, 200, 110,
+                hwnd,
+                HMENU(IDC_LIST2 as *mut _),
+                windows::Win32::Foundation::HINSTANCE(hinstance.0),
+                None,
+            );
+            if let Ok(list2) = list2 {
+                for item in ["red", "green", "blue"] {
+                    let mut w: Vec<u16> = item.encode_utf16().chain(std::iter::once(0)).collect();
+                    SendMessageW(list2, LB_ADDSTRING, WPARAM(0), LPARAM(w.as_mut_ptr() as isize));
+                }
+            }
+            // Large, high-contrast text for the OCR end-to-end check.
+            let ocr = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("OCR TEST 123"),
+                WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | 0x1), // SS_CENTER
+                440, 400, 240, 80,
+                hwnd,
+                HMENU(IDC_OCR as *mut _),
+                windows::Win32::Foundation::HINSTANCE(hinstance.0),
+                None,
+            );
+            if let Ok(ocr) = ocr {
+                let font = CreateFontW(32, 0, 0, 0, 700, 0, 0, 0, 0, 0, 0, 0, 0, w!("Segoe UI"));
+                SendMessageW(ocr, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+            }
             if let Ok(track) = track {
                 SendMessageW(track, TBM_SETRANGE, WPARAM(1), LPARAM(((0i32) | (100i32 << 16)) as isize));
                 SendMessageW(track, TBM_SETPOS, WPARAM(1), LPARAM(25));

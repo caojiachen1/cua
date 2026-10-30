@@ -8,7 +8,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
     MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSE_EVENT_FLAGS, MOUSEINPUT,
     VIRTUAL_KEY, VK_ADD, VK_APPS, VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DECIMAL, VK_DELETE, VK_DIVIDE,
-    VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_INSERT, VK_LEFT, VK_MENU, VK_MULTIPLY, VK_NEXT,
+    VK_DOWN, VK_END, VK_ESCAPE, VK_F4, VK_HOME, VK_INSERT, VK_LEFT, VK_MENU, VK_MULTIPLY, VK_NEXT,
     VK_NUMLOCK, VK_PAUSE, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SNAPSHOT, VK_SPACE,
     VK_SUBTRACT, VK_TAB, VK_UP,
 };
@@ -93,6 +93,14 @@ pub fn cursor_pos() -> (i32, i32) {
     }
 }
 
+fn send_inputs(inputs: &[INPUT], what: &str) -> Result<()> {
+    let n = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
+    if n != inputs.len() as u32 {
+        bail!("SendInput {what} partial/failed ({n}/{})", inputs.len());
+    }
+    Ok(())
+}
+
 pub fn click(x: i32, y: i32, right: bool, double: bool) -> Result<()> {
     move_to(x, y)?;
     std::thread::sleep(std::time::Duration::from_millis(30));
@@ -103,9 +111,9 @@ pub fn click(x: i32, y: i32, right: bool, double: bool) -> Result<()> {
     };
     let times = if double { 2 } else { 1 };
     for i in 0..times {
-        let _ = unsafe { SendInput(&[mouse_input(down, 0, 0, 0)], std::mem::size_of::<INPUT>() as i32) };
+        send_inputs(&[mouse_input(down, 0, 0, 0)], "button down")?;
         std::thread::sleep(std::time::Duration::from_millis(25));
-        let _ = unsafe { SendInput(&[mouse_input(up, 0, 0, 0)], std::mem::size_of::<INPUT>() as i32) };
+        send_inputs(&[mouse_input(up, 0, 0, 0)], "button up")?;
         if i + 1 < times {
             std::thread::sleep(std::time::Duration::from_millis(60));
         }
@@ -113,67 +121,70 @@ pub fn click(x: i32, y: i32, right: bool, double: bool) -> Result<()> {
     Ok(())
 }
 
+/// Independent per-axis wheel notches; the old shared max-loop sent both axes
+/// `max(|dx|,|dy|)` times, so `dx=1,dy=5` scrolled horizontally five notches.
+fn wheel_events(dx: i32, dy: i32) -> Vec<(bool, u32)> {
+    const WHEEL_DELTA: u32 = 120;
+    let mut out = Vec::new();
+    for _ in 0..dy.abs() {
+        out.push((false, (dy.signum() as i32 * WHEEL_DELTA as i32) as u32));
+    }
+    for _ in 0..dx.abs() {
+        out.push((true, (dx.signum() as i32 * WHEEL_DELTA as i32) as u32));
+    }
+    out
+}
+
 pub fn scroll(x: i32, y: i32, dx: i32, dy: i32) -> Result<()> {
     move_to(x, y)?;
     std::thread::sleep(std::time::Duration::from_millis(30));
     let mut inputs = Vec::new();
-    let steps = dy.abs().max(dx.abs()).max(1);
-    let per = 120; // WHEEL_DELTA
-    for _ in 0..steps {
-        if dy != 0 {
-            inputs.push(INPUT {
-                r#type: INPUT_MOUSE,
-                Anonymous: INPUT_0 {
-                    mi: MOUSEINPUT {
-                        dx: 0,
-                        dy: 0,
-                        mouseData: (dy.signum() * per) as u32,
-                        dwFlags: MOUSE_EVENT_FLAGS(MOUSEEVENTF_WHEEL.0),
-                        time: 0,
-                        dwExtraInfo: 0,
-                    },
+    for (horizontal, data) in wheel_events(dx, dy) {
+        inputs.push(INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx: 0,
+                    dy: 0,
+                    mouseData: data,
+                    dwFlags: MOUSE_EVENT_FLAGS(if horizontal { MOUSEEVENTF_HWHEEL.0 } else { MOUSEEVENTF_WHEEL.0 }),
+                    time: 0,
+                    dwExtraInfo: 0,
                 },
-            });
-        }
-        if dx != 0 {
-            inputs.push(INPUT {
-                r#type: INPUT_MOUSE,
-                Anonymous: INPUT_0 {
-                    mi: MOUSEINPUT {
-                        dx: 0,
-                        dy: 0,
-                        mouseData: (dx.signum() * per) as u32,
-                        dwFlags: MOUSE_EVENT_FLAGS(MOUSEEVENTF_HWHEEL.0),
-                        time: 0,
-                        dwExtraInfo: 0,
-                    },
-                },
-            });
-        }
+            },
+        });
     }
-    let n = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-    if n != inputs.len() as u32 {
-        bail!("SendInput scroll partial ({n}/{})", inputs.len());
+    if inputs.is_empty() {
+        bail!("scroll needs a non-zero dx or dy");
     }
-    Ok(())
+    send_inputs(&inputs, "scroll")
 }
 
 pub fn drag(x1: i32, y1: i32, x2: i32, y2: i32) -> Result<()> {
     move_to(x1, y1)?;
     std::thread::sleep(std::time::Duration::from_millis(80));
-    let _ = unsafe { SendInput(&[mouse_input(MouseFlags::DOWN_L, 0, 0, 0)], std::mem::size_of::<INPUT>() as i32) };
+    send_inputs(&[mouse_input(MouseFlags::DOWN_L, 0, 0, 0)], "drag button down")?;
+    let finish = |why: Option<anyhow::Error>| -> Result<()> {
+        // A failed step must not leave the physical button held down.
+        let up = send_inputs(&[mouse_input(MouseFlags::UP_L, 0, 0, 0)], "drag button up");
+        match why {
+            Some(e) => Err(e),
+            None => up,
+        }
+    };
     std::thread::sleep(std::time::Duration::from_millis(80));
     let steps = 24;
     for i in 1..=steps {
         let t = i as f32 / steps as f32;
         let x = (x1 as f32 + (x2 - x1) as f32 * t) as i32;
         let y = (y1 as f32 + (y2 - y1) as f32 * t) as i32;
-        move_to(x, y)?;
+        if let Err(e) = move_to(x, y) {
+            return finish(Some(e));
+        }
         std::thread::sleep(std::time::Duration::from_millis(12));
     }
     std::thread::sleep(std::time::Duration::from_millis(60));
-    let _ = unsafe { SendInput(&[mouse_input(MouseFlags::UP_L, 0, 0, 0)], std::mem::size_of::<INPUT>() as i32) };
-    Ok(())
+    finish(None)
 }
 
 // ---------------- keyboard ----------------
@@ -294,6 +305,12 @@ pub struct KeyCombo {
     pub text: Option<String>,    // intended printable text (IME-safe injection)
 }
 
+/// Always-Confirm level (Qoder policy): alt+f4 closes windows regardless of
+/// modifier/key order or spacing, so it is matched on the parsed combo.
+pub fn is_alt_f4(combo: &KeyCombo) -> bool {
+    combo.modifiers.contains(&(VK_MENU.0 as u16)) && combo.key.0 == VK_F4.0 as u16
+}
+
 pub fn parse_combo(spec: &str) -> Result<KeyCombo> {
     let parts: Vec<&str> = spec.split('+').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
     if parts.is_empty() {
@@ -315,6 +332,20 @@ pub fn parse_combo(spec: &str) -> Result<KeyCombo> {
     let (vk, needs_shift, ch) = named_vk(last).ok_or_else(|| anyhow!("unknown key '{last}'"))?;
     if needs_shift && !user_shift {
         vms.push(VK_SHIFT.0 as u16);
+    }
+    // No-negotiables matched on the parsed combo (a raw string guard would miss "alt + f4").
+    // System surfaces that must never be automated even with --confirm:
+    if vms.contains(&(VK_CONTROL.0 as u16))
+        && vms.contains(&(VK_SHIFT.0 as u16))
+        && vk == VK_ESCAPE.0 as u16
+    {
+        bail!("refused by safety policy: ctrl+shift+esc opens Task Manager, which is on the no-negotiable deny list");
+    }
+    if vms.contains(&(VK_CONTROL.0 as u16))
+        && vms.contains(&(VK_MENU.0 as u16))
+        && vk == VK_DELETE.0 as u16
+    {
+        bail!("refused by safety policy: ctrl+alt+del is a secure attention sequence and cannot be automated");
     }
     // Bare printable keys become text injection (unicode): with an IME active,
     // raw letter key events only start composition and never reach the edit.
@@ -423,7 +454,7 @@ pub fn find_input_target(top: HWND) -> HWND {
 unsafe extern "system" fn find_edit_cb(hwnd: HWND, lparam: windows::Win32::Foundation::LPARAM) -> windows::Win32::Foundation::BOOL {
     let class = crate::win::window_class(hwnd);
     let cl = class.to_ascii_lowercase();
-    if cl.contains("edit") || cl.contains("richedit") || cl.contains("renderwidget") || cl.contains("document") {
+    if cl.contains("edit") || cl.contains("richedit") || cl.contains("renderwidget") || cl.contains("document") || cl.contains("scintilla") {
         let p = lparam.0 as *mut isize;
         if !p.is_null() && *p == 0 {
             *p = hwnd.0 as isize;
@@ -432,19 +463,41 @@ unsafe extern "system" fn find_edit_cb(hwnd: HWND, lparam: windows::Win32::Found
     windows::Win32::Foundation::BOOL(1)
 }
 
+/// The child window that should receive mouse messages for a screen point
+/// (shared by post_click / post_scroll / post_drag / post_type_at_point).
+fn child_at_point(top: HWND, x: i32, y: i32) -> (HWND, i32, i32) {
+    unsafe {
+        let mut pt = windows::Win32::Foundation::POINT { x, y };
+        let _ = ScreenToClient(top, &mut pt);
+        let child = ChildWindowFromPointEx(top, pt, CWP_SKIPINVISIBLE);
+        if !child.is_invalid() && child != top {
+            let mut cp = windows::Win32::Foundation::POINT { x, y };
+            let _ = ScreenToClient(child, &mut cp);
+            (child, cp.x, cp.y)
+        } else {
+            (top, pt.x, pt.y)
+        }
+    }
+}
+
+fn post(hwnd: HWND, msg: u32, w: usize, l: isize, what: &str) -> Result<()> {
+    unsafe { PostMessageW(hwnd, msg, WPARAM(w), LPARAM(l)) }
+        .map_err(|e| anyhow!("PostMessageW {what} ({msg:#x}) failed: {e}"))
+}
+
 pub fn post_type(target: HWND, text: &str) -> Result<usize> {
     let mut n = 0usize;
-    unsafe {
-        for ch in text.chars() {
-            if ch == '\n' {
-                let _ = PostMessageW(target, WM_CHAR, WPARAM(13usize), LPARAM(0));
-                n += 1;
-                continue;
-            }
-            for unit in ch.encode_utf16(&mut [0u16; 2]) {
-                let _ = PostMessageW(target, WM_CHAR, WPARAM(*unit as usize), LPARAM(0));
-                n += 1;
-            }
+    for ch in text.chars() {
+        if ch == '\n' {
+            post(target, WM_CHAR, 13, 0, "WM_CHAR newline")
+                .map_err(|e| anyhow!("{e} after {n} units"))?;
+            n += 1;
+            continue;
+        }
+        for unit in ch.encode_utf16(&mut [0u16; 2]) {
+            post(target, WM_CHAR, *unit as usize, 0, "WM_CHAR")
+                .map_err(|e| anyhow!("{e} after {n} units"))?;
+            n += 1;
         }
     }
     if n == 0 {
@@ -453,73 +506,83 @@ pub fn post_type(target: HWND, text: &str) -> Result<usize> {
     Ok(n)
 }
 
+/// Message-level typing aimed at a specific screen point: the edit-like child under
+/// the point gets the WM_CHAR stream, so a window with several input fields can be
+/// addressed without raising it. Falls back to the first edit-like child.
+pub fn post_type_at_point(top: HWND, x: i32, y: i32, text: &str) -> Result<usize> {
+    let (child, _, _) = child_at_point(top, x, y);
+    let target = if child == top { find_input_target(top) } else { child };
+    post_type(target, text)
+}
+
+/// Message-level hover: a WM_MOUSEMOVE stream at the point, no cursor movement.
+/// Only apps that react to hover messages without tracking the global pointer care.
+pub fn post_hover(top: HWND, x: i32, y: i32) -> Result<()> {
+    let (target, cx, cy) = child_at_point(top, x, y);
+    let lp = ((cy as isize) << 16) | (cx as isize & 0xFFFF);
+    post(target, WM_MOUSEMOVE, 0, lp, "WM_MOUSEMOVE")
+}
+
 pub fn post_key(target: HWND, combo: &KeyCombo) -> Result<()> {
-    unsafe {
-        let (vk, scan) = (combo.key.0, combo.key.1.unwrap_or(0));
-        let ext = if is_extended_vk(vk) { 1usize } else { 0 };
-        let lp_down = (1usize) | ((scan as usize) << 16) | (ext << 24);
-        let lp_up = lp_down | (1 << 30) | (1 << 31);
-        for m in &combo.modifiers {
-            let s = windows::Win32::UI::Input::KeyboardAndMouse::MapVirtualKeyW(*m as u32, MAPVK_VK_TO_VSC) as usize;
-            let _ = PostMessageW(target, WM_KEYDOWN, WPARAM(*m as usize), LPARAM((1 | (s << 16)) as isize));
-        }
-        let _ = PostMessageW(target, WM_KEYDOWN, WPARAM(vk as usize), LPARAM(lp_down as isize));
-        // printable input: also send WM_CHAR so edit-like controls receive it.
-        // Skip when ctrl/alt are held: those are shortcuts, not text.
-        let has_command_mod = combo
-            .modifiers
-            .iter()
-            .any(|m| *m == VK_CONTROL.0 as u16 || *m == VK_MENU.0 as u16);
-        if !has_command_mod {
-            if let Some(mut ch) = combo.ch {
-                if combo.modifiers.contains(&(VK_SHIFT.0 as u16)) {
-                    if let Some(c) = char::from_u32(ch as u32) {
-                        let up = c.to_ascii_uppercase();
-                        if up.is_ascii_alphabetic() {
-                            ch = up as u16;
-                        }
+    let (vk, scan) = (combo.key.0, combo.key.1.unwrap_or(0));
+    let ext = if is_extended_vk(vk) { 1usize } else { 0 };
+    let lp_down = (1usize) | ((scan as usize) << 16) | (ext << 24);
+    let lp_up = lp_down | (1 << 30) | (1 << 31);
+    for m in &combo.modifiers {
+        let s = unsafe { MapVirtualKeyW(*m as u32, MAPVK_VK_TO_VSC) } as usize;
+        post(target, WM_KEYDOWN, *m as usize, (1 | (s << 16)) as isize, "modifier keydown")?;
+    }
+    post(target, WM_KEYDOWN, vk as usize, lp_down as isize, "keydown")?;
+    // printable input: also send WM_CHAR so edit-like controls receive it.
+    // Skip when ctrl/alt are held: those are shortcuts, not text.
+    let has_command_mod = combo
+        .modifiers
+        .iter()
+        .any(|m| *m == VK_CONTROL.0 as u16 || *m == VK_MENU.0 as u16);
+    if !has_command_mod {
+        if let Some(mut ch) = combo.ch {
+            if combo.modifiers.contains(&(VK_SHIFT.0 as u16)) {
+                if let Some(c) = char::from_u32(ch as u32) {
+                    let up = c.to_ascii_uppercase();
+                    if up.is_ascii_alphabetic() {
+                        ch = up as u16;
                     }
                 }
-                let _ = PostMessageW(target, WM_CHAR, WPARAM(ch as usize), LPARAM(lp_down as isize));
             }
+            post(target, WM_CHAR, ch as usize, lp_down as isize, "WM_CHAR for key")?;
         }
-        let _ = PostMessageW(target, WM_KEYUP, WPARAM(vk as usize), LPARAM(lp_up as isize));
-        for m in combo.modifiers.iter().rev() {
-            let s = windows::Win32::UI::Input::KeyboardAndMouse::MapVirtualKeyW(*m as u32, MAPVK_VK_TO_VSC) as usize;
-            let _ = PostMessageW(target, WM_KEYUP, WPARAM(*m as usize), LPARAM((1 | (s << 16) | (1 << 30) | (1 << 31)) as isize));
-        }
+    }
+    post(target, WM_KEYUP, vk as usize, lp_up as isize, "keyup")?;
+    for m in combo.modifiers.iter().rev() {
+        let s = unsafe { MapVirtualKeyW(*m as u32, MAPVK_VK_TO_VSC) } as usize;
+        post(
+            target,
+            WM_KEYUP,
+            *m as usize,
+            (1 | (s << 16) | (1 << 30) | (1 << 31)) as isize,
+            "modifier keyup",
+        )?;
     }
     Ok(())
 }
 
 pub fn post_click(top: HWND, x: i32, y: i32, right: bool, double: bool) -> Result<()> {
-    unsafe {
-        // ChildWindowFromPointEx takes PARENT-CLIENT coords; then rebase to the child.
-        let mut pt = windows::Win32::Foundation::POINT { x, y };
-        let _ = ScreenToClient(top, &mut pt);
-        let child = ChildWindowFromPointEx(top, pt, CWP_SKIPINVISIBLE);
-        let (target, client) = if !child.is_invalid() && child != top {
-            let mut cp = windows::Win32::Foundation::POINT { x, y };
-            let _ = ScreenToClient(child, &mut cp);
-            (child, cp)
-        } else {
-            (top, pt)
-        };
-        let mk: u32 = if right { 0x0002 } else { 0x0001 }; // MK_RBUTTON / MK_LBUTTON
-        let (down, up, dbl) = if right {
-            (WM_RBUTTONDOWN, WM_RBUTTONUP, WM_RBUTTONDOWN)
-        } else {
-            (WM_LBUTTONDOWN, WM_LBUTTONUP, WM_LBUTTONDBLCLK)
-        };
-        let lp = LPARAM(((client.y as isize) << 16) | (client.x as isize & 0xFFFF));
-        let _ = PostMessageW(target, WM_MOUSEMOVE, WPARAM(0), lp);
-        let msg_down = if double { dbl } else { down };
-        let _ = PostMessageW(target, msg_down, WPARAM(mk as usize), lp);
-        let _ = PostMessageW(target, up, WPARAM(0), lp);
-        if double {
-            let _ = PostMessageW(target, msg_down, WPARAM(mk as usize), lp);
-            let _ = PostMessageW(target, up, WPARAM(0), lp);
-        }
+    let (target, client_x, client_y) = child_at_point(top, x, y);
+    let mk: u32 = if right { 0x0002 } else { 0x0001 }; // MK_RBUTTON / MK_LBUTTON
+    let (down, up, dbl) = if right {
+        (WM_RBUTTONDOWN, WM_RBUTTONUP, WM_RBUTTONDOWN)
+    } else {
+        (WM_LBUTTONDOWN, WM_LBUTTONUP, WM_LBUTTONDBLCLK)
+    };
+    let lp = ((client_y as isize) << 16) | (client_x as isize & 0xFFFF);
+    post(target, WM_MOUSEMOVE, 0, lp, "WM_MOUSEMOVE")?;
+    post(target, down, mk as usize, lp, "button down")?;
+    post(target, up, 0, lp, "button up")?;
+    if double {
+        // The documented double-click sequence is DOWN, UP, DBLCLK, UP. Sending
+        // DBLCLK as both downs loses the initial press for controls that care.
+        post(target, dbl, mk as usize, lp, "WM_LBUTTONDBLCLK")?;
+        post(target, up, 0, lp, "button up (double)")?;
     }
     Ok(())
 }
@@ -529,65 +592,121 @@ const MK_LBUTTON_DOWN: usize = 0x0001; // MK_LBUTTON while button held
 /// Message-level wheel scroll (for sandbox desktops where SendInput is blocked).
 /// dy>0 scrolls up (wheel away), matching WHEEL_DELTA=120 per notch.
 pub fn post_scroll(top: HWND, x: i32, y: i32, dx: i32, dy: i32) -> Result<()> {
-    use windows::Win32::UI::WindowsAndMessaging::{WM_MOUSEWHEEL, WM_MOUSEHWHEEL};
-    unsafe {
-        let mut pt = windows::Win32::Foundation::POINT { x, y };
-        let _ = ScreenToClient(top, &mut pt);
-        let child = ChildWindowFromPointEx(top, pt, CWP_SKIPINVISIBLE);
-        let (target, client) = if !child.is_invalid() && child != top {
-            let mut cp = windows::Win32::Foundation::POINT { x, y };
-            let _ = ScreenToClient(child, &mut cp);
-            (child, cp)
-        } else {
-            (top, pt)
-        };
-        let steps = dy.abs().max(dx.abs()).max(1);
-        for _ in 0..steps {
-            if dy != 0 {
-                let wp = (((dy.signum() * 120) as usize) << 16) | 0; // delta<<16, no keys
-                let lp = LPARAM(((client.y as isize) << 16) | (client.x as isize & 0xFFFF));
-                let _ = PostMessageW(target, WM_MOUSEWHEEL, WPARAM(wp), lp);
-            }
-            if dx != 0 {
-                let wp = (((dx.signum() * 120) as usize) << 16) | 0;
-                let lp = LPARAM(((client.y as isize) << 16) | (client.x as isize & 0xFFFF));
-                let _ = PostMessageW(target, WM_MOUSEHWHEEL, WPARAM(wp), lp);
-            }
-        }
+    use windows::Win32::UI::WindowsAndMessaging::{WM_MOUSEHWHEEL, WM_MOUSEWHEEL};
+    if dx == 0 && dy == 0 {
+        bail!("scroll needs a non-zero dx or dy");
+    }
+    let (target, _, _) = child_at_point(top, x, y);
+    // Wheel messages carry screen coordinates in lParam (unlike the button
+    // messages above), so keep the point the caller supplied.
+    let lp = ((y as isize) << 16) | (x as isize & 0xFFFF);
+    for (horizontal, data) in wheel_events(dx, dy) {
+        let wp = ((data as usize) << 16) | 0; // delta<<16, no keys
+        post(
+            target,
+            if horizontal { WM_MOUSEHWHEEL } else { WM_MOUSEWHEEL },
+            wp,
+            lp,
+            "wheel",
+        )?;
     }
     Ok(())
 }
 
 /// Message-level drag: button down, interpolated moves with button held, button up.
 pub fn post_drag(top: HWND, x1: i32, y1: i32, x2: i32, y2: i32) -> Result<()> {
-    unsafe {
-        let mut pt = windows::Win32::Foundation::POINT { x: x1, y: y1 };
-        let _ = ScreenToClient(top, &mut pt);
-        let child = ChildWindowFromPointEx(top, pt, CWP_SKIPINVISIBLE);
-        let target = if !child.is_invalid() && child != top { child } else { top };
-        let to_client = |x: i32, y: i32| -> (i32, i32) {
-            let mut p = windows::Win32::Foundation::POINT { x, y };
+    let (target, cx1, cy1) = child_at_point(top, x1, y1);
+    let to_client = |x: i32, y: i32| -> (i32, i32) {
+        let mut p = windows::Win32::Foundation::POINT { x, y };
+        unsafe {
             let _ = ScreenToClient(target, &mut p);
-            (p.x, p.y)
-        };
-        let (cx1, cy1) = to_client(x1, y1);
-        let lp = LPARAM(((cy1 as isize) << 16) | (cx1 as isize & 0xFFFF));
-        let _ = PostMessageW(target, WM_MOUSEMOVE, WPARAM(0), lp);
-        let _ = PostMessageW(target, WM_LBUTTONDOWN, WPARAM(MK_LBUTTON_DOWN), lp);
-        let steps = 20;
-        for i in 1..=steps {
-            let t = i as f32 / steps as f32;
-            let (cx, cy) = to_client(
-                (x1 as f32 + (x2 - x1) as f32 * t) as i32,
-                (y1 as f32 + (y2 - y1) as f32 * t) as i32,
-            );
-            let lp = LPARAM(((cy as isize) << 16) | (cx as isize & 0xFFFF));
-            let _ = PostMessageW(target, WM_MOUSEMOVE, WPARAM(MK_LBUTTON_DOWN), lp);
-            std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        let (cx2, cy2) = to_client(x2, y2);
-        let lp = LPARAM(((cy2 as isize) << 16) | (cx2 as isize & 0xFFFF));
-        let _ = PostMessageW(target, WM_LBUTTONUP, WPARAM(0), lp);
+        (p.x, p.y)
+    };
+    let lp = ((cy1 as isize) << 16) | (cx1 as isize & 0xFFFF);
+    post(target, WM_MOUSEMOVE, 0, lp, "WM_MOUSEMOVE")?;
+    post(target, WM_LBUTTONDOWN, MK_LBUTTON_DOWN, lp, "WM_LBUTTONDOWN")?;
+    let mut interrupted: Option<anyhow::Error> = None;
+    let steps = 20;
+    for i in 1..=steps {
+        let t = i as f32 / steps as f32;
+        let (cx, cy) = to_client(
+            (x1 as f32 + (x2 - x1) as f32 * t) as i32,
+            (y1 as f32 + (y2 - y1) as f32 * t) as i32,
+        );
+        let lp = ((cy as isize) << 16) | (cx as isize & 0xFFFF);
+        if let Err(e) = post(target, WM_MOUSEMOVE, MK_LBUTTON_DOWN, lp, "WM_MOUSEMOVE (drag)") {
+            interrupted = Some(e);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    Ok(())
+    // Always release the logical button, even if a move failed.
+    let (cx2, cy2) = to_client(x2, y2);
+    let lp = ((cy2 as isize) << 16) | (cx2 as isize & 0xFFFF);
+    let up = post(target, WM_LBUTTONUP, 0, lp, "WM_LBUTTONUP");
+    match interrupted {
+        Some(e) => Err(e),
+        None => up,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shift_count(c: &KeyCombo) -> usize {
+        c.modifiers.iter().filter(|m| **m == VK_SHIFT.0 as u16).count()
+    }
+
+    #[test]
+    fn auto_shift_is_added_exactly_once() {
+        let c = parse_combo("ctrl+A").unwrap();
+        assert_eq!(shift_count(&c), 1, "modifiers={:?}", c.modifiers);
+    }
+
+    #[test]
+    fn explicit_shift_is_not_duplicated() {
+        let c = parse_combo("ctrl+shift+a").unwrap();
+        assert_eq!(shift_count(&c), 1, "modifiers={:?}", c.modifiers);
+    }
+
+    #[test]
+    fn alt_f4_is_recognised_regardless_of_spacing_or_order() {
+        for spec in ["alt+f4", "alt + f4", "alt + F4", "ALT+F4"] {
+            let c = parse_combo(spec).unwrap();
+            assert!(is_alt_f4(&c), "{spec} -> {:?}", c.key);
+        }
+    }
+
+    #[test]
+    fn dangerous_combos_stay_refused() {
+        for spec in ["win+r", "ctrl+shift+esc", "ctrl+alt+del"] {
+            assert!(parse_combo(spec).is_err(), "{spec} should be refused");
+        }
+    }
+
+    #[test]
+    fn sticky_keys_never_become_text() {
+        assert!(parse_combo("ctrl+A").unwrap().text.is_none());
+        assert_eq!(parse_combo("A").unwrap().text.as_deref(), Some("A"));
+        assert_eq!(parse_combo("enter").unwrap().text, None);
+    }
+
+    #[test]
+    fn wheel_axes_are_independent() {
+        let ev = wheel_events(1, 5);
+        assert_eq!(ev.iter().filter(|(h, _)| !*h).count(), 5);
+        assert_eq!(ev.iter().filter(|(h, _)| *h).count(), 1);
+        let neg = wheel_events(-2, 0);
+        assert_eq!(neg.len(), 2);
+        assert!(neg.iter().all(|(h, d)| *h && *d == (-120i32) as u32));
+    }
+
+    #[test]
+    fn extended_keys_are_flagged() {
+        assert!(is_extended_vk(VK_HOME.0 as u16));
+        assert!(is_extended_vk(VK_INSERT.0 as u16));
+        assert!(!is_extended_vk(VK_SPACE.0 as u16));
+    }
 }

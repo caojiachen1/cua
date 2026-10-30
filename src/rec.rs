@@ -2,7 +2,7 @@
 //! stitches them into an mp4 with ffmpeg when one is available, or into a self-contained
 //! HTML player when it is not. Frames are JPEG so a long session stays writable.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -17,7 +17,18 @@ pub struct RecState {
     pub quality: u8,
     pub window: Option<String>,
     pub pid: u32,
+    #[serde(default)]
+    pub created: Option<u64>,
     pub started: String,
+}
+
+fn worker_alive(st: &RecState) -> bool {
+    match st.created {
+        Some(c) => crate::win::process_creation_time(st.pid) == Some(c),
+        None => crate::win::process_name(st.pid)
+            .map(|n| n.eq_ignore_ascii_case("cua.exe"))
+            .unwrap_or(false),
+    }
 }
 
 fn state_path() -> PathBuf {
@@ -107,13 +118,31 @@ fn spawn_detached(exe: &Path, args: &[String]) -> Result<u32> {
     }
 }
 
+/// Every start gets its own directory. Reusing one by display name let a
+/// shorter re-recording inherit the previous run's tail frames.
+fn session_dir_name(name: &str) -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let stamp: String = util::now_iso()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    format!("{}-{}-{}-{}", util::sanitize(name), stamp, std::process::id(), seq)
+}
+
 pub fn cmd_start(window: Option<String>, fps: u32, out: Option<String>, max_seconds: u64) -> Result<i32> {
     if let Some(st) = load() {
-        bail!("a recording is already running: '{}' ({})", st.name, st.dir.display());
+        if worker_alive(&st) {
+            bail!("a recording is already running: '{}' ({})", st.name, st.dir.display());
+        }
+        // A crashed/exited worker must not block every future recording.
+        let _ = std::fs::remove_file(state_path());
     }
     let fps = fps.clamp(1, 15);
     let name = out.clone().unwrap_or_else(|| format!("rec-{}", util::now_iso().replace([':', '-'], "")));
-    let dir = util::ensure_data_dir().join("recordings").join(util::sanitize(&name));
+    let dir = util::ensure_data_dir()
+        .join("recordings")
+        .join(session_dir_name(&name));
     std::fs::create_dir_all(dir.join("frames"))?;
     let exe = std::env::current_exe()?;
     let mut args: Vec<String> = vec![
@@ -127,7 +156,8 @@ pub fn cmd_start(window: Option<String>, fps: u32, out: Option<String>, max_seco
         args.push(format!("\"{w}\""));
     }
     let pid = spawn_detached(&exe, &args)?;
-    let st = RecState { name, dir, fps, quality: 62, window, pid, started: util::now_iso() };
+    let created = crate::win::process_creation_time(pid);
+    let st = RecState { name, dir, fps, quality: 62, window, pid, created, started: util::now_iso() };
     let _ = std::fs::write(state_path(), serde_json::to_vec(&st)?);
     let r = util::Receipt::new("rec.start").ok(
         serde_json::json!({ "name": st.name, "fps": st.fps, "target": st.window.clone().unwrap_or_else(|| "screen".into()) }),
@@ -185,18 +215,43 @@ pub fn cmd_stop(out: Option<String>, keep_frames: bool) -> Result<i32> {
         r.print();
         return Ok(1);
     };
-    let _ = std::fs::write(st.dir.join("STOP"), "");
-    let mut waited = 0;
-    loop {
-        if st.dir.join("captured.json").exists() || waited > 40 {
+    let alive = worker_alive(&st);
+    let done = st.dir.join("captured.json");
+    if alive {
+        if let Err(e) = std::fs::write(st.dir.join("STOP"), "") {
+            let r = util::Receipt::new("rec.stop").fail(
+                serde_json::json!({ "dir": st.dir.display().to_string() }),
+                &format!("could not signal the capture worker to stop ({e}); recording state kept"),
+            );
+            r.print();
+            return Ok(1);
+        }
+    }
+    let mut confirmed = done.exists() || !alive;
+    for _ in 0..40 {
+        if confirmed {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
-        waited += 1;
+        confirmed = done.exists();
+    }
+    if !confirmed {
+        // The worker may still be capturing (e.g. blocked in PrintWindow). Keep
+        // the state and frames so a later stop can finish instead of silently
+        // reporting a clean stop and losing control of the recorder.
+        let r = util::Receipt::new("rec.stop").fail(
+            serde_json::json!({
+                "dir": st.dir.display().to_string(),
+                "pid": st.pid,
+                "name": st.name,
+            }),
+            "capture worker did not confirm stop within 10s; recording state and frames were kept",
+        );
+        r.print();
+        return Ok(1);
     }
     let frames = list_frames(&frames_dir(&st));
-    let secs = st.dir.join("captured.json");
-    let _ = std::fs::remove_file(&secs);
+    let _ = std::fs::remove_file(&done);
     let _ = std::fs::remove_file(state_path());
     if frames.is_empty() {
         let r = util::Receipt::new("rec.stop").fail(
@@ -226,7 +281,7 @@ pub fn cmd_stop(out: Option<String>, keep_frames: bool) -> Result<i32> {
         ),
     };
     if encoded != "mp4" {
-        write_player(&st.dir, frames.len(), st.fps)?;
+        write_player(&st.dir, &frames, st.fps)?;
     }
     if encoded == "mp4" && !keep_frames {
         let _ = std::fs::remove_dir_all(frames_dir(&st));
@@ -236,8 +291,48 @@ pub fn cmd_stop(out: Option<String>, keep_frames: bool) -> Result<i32> {
             "name": st.name, "frames": frames.len(), "fps": st.fps,
             "encoded": encoded, "video": if encoded == "mp4" { mp4.display().to_string() } else { String::new() },
             "dir": st.dir.display().to_string(),
+            "worker_alive_before_stop": alive,
         }),
         &detail,
+    );
+    r.print();
+    Ok(0)
+}
+
+fn kill_worker(st: &RecState) -> bool {
+    match st.created {
+        Some(c) if crate::win::process_creation_time(st.pid) == Some(c) => {
+            crate::win::kill_process_tree(st.pid) > 0
+        }
+        None => crate::win::process_name(st.pid)
+            .map(|n| n.eq_ignore_ascii_case("cua.exe"))
+            .unwrap_or(false)
+            && crate::win::kill_process_tree(st.pid) > 0,
+        _ => false,
+    }
+}
+
+/// Explicit escape hatch for `rec stop` timing out: kill the recorder only when
+/// its creation time still matches, then clear state and keep the frames.
+pub fn cmd_cancel() -> Result<i32> {
+    let Some(st) = load() else {
+        let r = util::Receipt::new("rec.cancel").fail(serde_json::json!({}), "no recording is running");
+        r.print();
+        return Ok(1);
+    };
+    let was_alive = worker_alive(&st);
+    let killed = if was_alive { kill_worker(&st) } else { false };
+    let frames = list_frames(&frames_dir(&st)).len();
+    let _ = std::fs::remove_file(state_path());
+    let r = util::Receipt::new("rec.cancel").ok(
+        serde_json::json!({
+            "name": st.name, "dir": st.dir.display().to_string(), "frames": frames,
+            "worker_was_alive": was_alive, "worker_pid": st.pid, "killed": killed,
+        }),
+        &format!(
+            "recording cancelled (worker alive={was_alive}, killed={killed}); {frames} frames kept in {}",
+            st.dir.display()
+        ),
     );
     r.print();
     Ok(0)
@@ -253,10 +348,11 @@ pub fn cmd_status() -> Result<i32> {
                     "recording": true, "name": st.name, "frames": n, "fps": st.fps,
                     "target": st.window.clone().unwrap_or_else(|| "screen".into()),
                     "started": st.started, "dir": st.dir.display().to_string(),
+                    "worker_alive": worker_alive(&st), "worker_pid": st.pid,
                 }))?
             );
         }
-        None => println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "recording": false }))?),
+        None => println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "recording": false, "worker_alive": false }))?),
     }
     Ok(0)
 }
@@ -287,20 +383,37 @@ fn encode(ff: &Path, frames: &Path, out: &Path, fps: u32) -> Result<u64> {
     Ok(std::fs::metadata(out).map(|m| m.len()).unwrap_or(0))
 }
 
-/// Dependency-free fallback: a single HTML file that replays the JPEG frames.
-fn write_player(dir: &Path, count: usize, fps: u32) -> Result<()> {
-    let mut imgs = String::new();
-    for i in 0..count {
-        imgs.push_str(&format!("<img src=\"frames/frame_{:06}.jpg\" alt=\"\">\n", i));
+/// Dependency-free fallback: a single HTML file that replays the JPEG frames. Frames are
+/// embedded as data URLs (bounded) so the artifact stands alone and stays reviewable; a
+/// multi-hour recording that would blow the budget falls back to file references.
+fn write_player(dir: &Path, frames: &[PathBuf], fps: u32) -> Result<()> {
+    const EMBED_BUDGET: u64 = 48 * 1024 * 1024; // base64 inflates ~4/3; keep the html sane
+    let total: u64 = frames.iter().filter_map(|p| std::fs::metadata(p).ok()).map(|m| m.len()).sum();
+    let embed = total <= EMBED_BUDGET;
+    let mut body = String::new();
+    for (i, p) in frames.iter().enumerate() {
+        let src = if embed {
+            let bytes = std::fs::read(p)
+                .with_context(|| format!("reading frame {}", p.display()))?;
+            if bytes.is_empty() {
+                bail!("frame {} is empty; refusing to write a player with a blank frame", p.display());
+            }
+            format!("data:image/jpeg;base64,{}", b64_encode(&bytes))
+        } else {
+            format!("frames/{}", p.file_name().unwrap_or_default().to_string_lossy())
+        };
+        body.push_str(&format!("<img src=\"{src}\" alt=\"\">\n"));
+        let _ = i;
     }
+    let count = frames.len();
     let html = format!(
         r#"<!doctype html><meta charset="utf-8"><title>cua recording</title>
 <style>body{{margin:0;background:#111;color:#ddd;font:14px system-ui;display:flex;flex-direction:column;height:100vh}}
 #stage{{flex:1;display:grid;place-items:center;overflow:hidden}}img{{max-width:100%;max-height:100%;display:none}}
 img.on{{display:block}}#bar{{padding:8px 12px;display:flex;gap:10px;align-items:center;background:#1b1b1b}}</style>
-<div id="stage">{imgs}</div>
+<div id="stage">{body}</div>
 <div id="bar"><button id="pp">⏸</button><input id="rng" type="range" min="0" max="{last}" value="0">
-<span id="lbl"></span><span>{count} frames @ {fps} fps</span></div>
+<span id="lbl"></span><span>{count} frames @ {fps} fps{mode}</span></div>
 <script>
 const f=[...document.images];let i=0,t=null;const speed={fps};
 function show(n){{i=(n+f.length)%f.length;f.forEach((e,k)=>e.classList.toggle('on',k===i));rng.value=i;lbl.textContent=`${{i+1}} / ${{f.length}}`;}}
@@ -310,11 +423,53 @@ pp.onclick=()=>t?stop():play();rng.oninput=e=>{{stop();show(+e.target.value)}};
 document.onkeydown=e=>{{if(e.key==='ArrowRight'){{stop();show(i+1)}}if(e.key==='ArrowLeft'){{stop();show(i-1)}}}};
 show(0);play();
 </script>"#,
-        imgs = imgs,
+        body = body,
         last = count.saturating_sub(1),
         count = count,
         fps = fps,
+        mode = if embed { " (embedded)" } else { "" },
     );
     std::fs::write(dir.join("player.html"), html)?;
     Ok(())
+}
+
+/// Small base64 (RFC 4648) encoder so the player needs no external crates.
+fn b64_encode(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_session_gets_a_distinct_directory() {
+        let a = session_dir_name("demo");
+        let b = session_dir_name("demo");
+        assert_ne!(a, b, "same display name must not share a frame directory");
+        assert!(a.starts_with("demo-"));
+        assert!(!a.contains(['/', ':']));
+        assert!(!a.contains('\\'));
+    }
+
+    #[test]
+    fn base64_round_trips_known_bytes() {
+        assert_eq!(b64_encode(b""), "");
+        assert_eq!(b64_encode(b"f"), "Zg==");
+        assert_eq!(b64_encode(b"fo"), "Zm8=");
+        assert_eq!(b64_encode(b"foo"), "Zm9v");
+        assert_eq!(b64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(b64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(b64_encode(b"foobar"), "Zm9vYmFy");
+    }
 }
