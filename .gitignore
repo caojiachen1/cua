@@ -5,3 +5,4 @@
 SUMMARY.md
 *.mp4
 tools/uia-report*.md
+.e2e/
