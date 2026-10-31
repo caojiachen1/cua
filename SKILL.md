@@ -37,9 +37,13 @@ cua state --window "Notepad"          # refresh after acting
 
 ```bash
 cua apps [--all]                                  # windows + foreground_hwnd/title
-cua state --window <sel> [--depth N] [--no-shot] [--out x.png] [--diff] [--redact] [--patterns]
+cua state --window <sel> [--depth N] [--no-shot] [--out x.png] [--diff] [--redact] [--patterns] [--raw]
 cua shot --window <sel> --out x.png               # PrintWindow: works on background/occluded windows
 cua shot --screen --out x.png
+cua element-at --x X --y Y                        # which element is at this point? (passive UIA,
+                                                  # no pointer/focus change; refined to the innermost
+                                                  # control across control+raw views and mapped back
+                                                  # to the observation index for `click --index N`)
 cua grounding --window <sel> --query "加粗"        # local UIA grounding (Trae analog) → indices+coords
 # grounding saves the tree it measured as an immutable observation, so its i values
 # are safe for click --index; state/shot are left untouched (coordinate guards keep
@@ -64,6 +68,34 @@ never shadow the real main window. Negative coordinates are supported (`--dy -20
 `range` [value,min,max]. `--patterns` adds the supported UIA pattern list
 (`Invoke`, `Toggle`, `SelectionItem`, `Value`, `RangeValue`, `ExpandCollapse`, …).
 `--diff` reports added/removed nodes **and** value changes.
+
+Parse completeness: `state` reports `truncated` (depth/node budget hit) plus
+`errors`/`last_error` (walker steps that still failed after one retry).
+Chromium/Electron's "S_OK but null child" answers are treated as clean branch
+ends, not errors. Deep apps (VSCode) need `--depth 22+` — their container chains
+exceed the default and `truncated:true` will say so (a first `state` on an
+Electron app may trigger one automatic warmup retry, reported as `warmup_retry`).
+`--raw` walks the raw view
+instead: it includes `IsControlElement=false` nodes the control view hides
+(decorative panes, MSAA-bridged legacy content, `Chrome Legacy Window`), marked
+`"ctl": false`; raw trees run deeper, so raise `--depth` too. Core element
+properties are fetched through a UIA cache request bundled into the tree walk
+(~1.6x faster walks, identical output); `CUA_UIA_NO_CACHE=1` opts out when
+diagnosing a provider with bad cache data.
+
+Snapshot binding: every command accepts a global `--observation-id <id>` that
+resolves all `--index` references against that immutable observation instead of
+the latest one. A wrong id fails the action (`not found or not of this window`)
+— it never silently re-observes. Screenshots report a graded `status`:
+`captured` / `suspected_black` / `no_pixels` / `capture_failed` (the boolean
+`rendered` stays for compatibility).
+
+Stale elements self-heal: when a runtime id dies (dialog reopened, list
+refreshed), actions re-locate the element from its cached attributes
+(automation id / name / class / type / parent / sibling position) with an
+ambiguity margin — lookalike candidates are refused, never mis-clicked — and an
+old-rid → new-rid override is recorded so later actions resolve directly. Only
+elements with no name/automation id at all need a fresh `state`.
 
 ## Actions (all emit receipts)
 

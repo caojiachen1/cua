@@ -233,6 +233,36 @@ pub fn load_elements(hwnd: isize) -> Option<serde_json::Value> {
     std::fs::read(p).ok().and_then(|b| serde_json::from_slice(&b).ok())
 }
 
+/// Runtime-id overrides recorded by successful attribute relocations.
+/// Observations are immutable snapshots, so a relocated element is recorded
+/// here (old rid -> live rid) instead of rewriting the observation; index
+/// actions keep their original indices and resolve through this map.
+pub fn save_rid_override(hwnd: isize, old: &[i32], new: &[i32]) {
+    let p = ensure_data_dir()
+        .join("cache")
+        .join(scoped(&format!("rid-fix-{hwnd}"), "json"));
+    let mut map: std::collections::HashMap<String, Vec<i32>> = std::fs::read(&p)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    let key = serde_json::to_string(old).unwrap_or_default();
+    if !key.is_empty() {
+        map.insert(key, new.to_vec());
+        let _ = std::fs::write(&p, serde_json::to_vec(&map).unwrap_or_default());
+    }
+}
+
+pub fn load_rid_override(hwnd: isize, old: &[i32]) -> Option<Vec<i32>> {
+    let p = ensure_data_dir()
+        .join("cache")
+        .join(scoped(&format!("rid-fix-{hwnd}"), "json"));
+    let map: std::collections::HashMap<String, Vec<i32>> = std::fs::read(&p)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())?;
+    let key = serde_json::to_string(old).ok()?;
+    map.get(&key).cloned()
+}
+
 fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     let name = path
         .file_name()
@@ -307,6 +337,26 @@ fn pinned_observation_id() -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
+/// Per-invocation observation binding (`--observation-id`), set by main before
+/// dispatch. Takes precedence over the CUA_OBSERVATION_ID environment pin;
+/// unlike the pointer fallback it never silently degrades to the latest
+/// observation — an id that does not resolve for the target window fails the
+/// action instead.
+static OBS_OVERRIDE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+pub fn set_observation_override(id: &str) {
+    let id = id.trim();
+    if !id.is_empty() {
+        if let Ok(mut g) = OBS_OVERRIDE.lock() {
+            *g = Some(id.to_string());
+        }
+    }
+}
+
+pub fn observation_override() -> Option<String> {
+    OBS_OVERRIDE.lock().ok().and_then(|g| g.clone())
+}
+
 fn load_observation_by_id(id: &str, hwnd: isize) -> Option<serde_json::Value> {
     let p = ensure_data_dir().join("cache").join(format!("obs-{id}.json"));
     std::fs::read(p)
@@ -315,10 +365,14 @@ fn load_observation_by_id(id: &str, hwnd: isize) -> Option<serde_json::Value> {
         .filter(|v| v["hwnd"].as_i64() == Some(hwnd as i64))
 }
 
-/// Nodes for index actions: an explicitly pinned observation (`CUA_OBSERVATION_ID`)
-/// wins, otherwise the latest observation pointer is used, with the legacy
-/// elements cache as the final fallback.
+/// Nodes for index actions: the explicit `--observation-id` override wins (no
+/// fallback — a wrong id must fail the action, not silently observe anew), then
+/// the `CUA_OBSERVATION_ID` pin, then the latest observation pointer, with the
+/// legacy elements cache as the final fallback.
 pub fn load_observation_nodes(hwnd: isize) -> Option<serde_json::Value> {
+    if let Some(id) = observation_override() {
+        return load_observation_by_id(&id, hwnd).and_then(|v| v.get("nodes").cloned());
+    }
     if let Some(id) = pinned_observation_id() {
         return load_observation_by_id(&id, hwnd).and_then(|v| v.get("nodes").cloned());
     }
@@ -331,7 +385,7 @@ const OBS_RETAIN: usize = 500;
 
 fn prune_observations_in(dir: &std::path::Path, keep: usize) {
     let Ok(read) = std::fs::read_dir(dir) else { return };
-    let pinned = pinned_observation_id();
+    let pinned = pinned_observation_id().or_else(observation_override);
     let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = read
         .filter_map(|e| e.ok())
         .filter(|e| {

@@ -242,6 +242,32 @@ if ($null -ne $sbStart.pid) {
         Check "P11c sandbox action is recorded" ($r.status -eq "ok" -and $lines.Count -eq 1 -and $lines[0] -like "*--sandbox*") "status=$($r.status) lines=$($lines.Count) match=$($lines.Count -eq 1 -and $lines[0] -like '*--sandbox*')"
         $rp = J (RunCua replay $trace)
         Check "P11d sandbox recording replays" ($rp.ok -eq $true -and @($rp.steps).Count -eq 1) "ok=$($rp.ok) steps=$(@($rp.steps).Count)"
+
+        # ---------- P22: sandbox Table/ItemContainer positive fixture (Explorer) ----------
+        # These two commands previously had no positive sandbox coverage; Explorer's
+        # item view carries Table + ItemContainer providers and runs on the hidden desktop.
+        $tblDir = Join-Path $env:TEMP ("cua-e2e8-tbl-" + [guid]::NewGuid().ToString("N").Substring(0, 6))
+        New-Item -ItemType Directory -Force -Path $tblDir | Out-Null
+        1..3 | ForEach-Object { Set-Content -Encoding ASCII -Path (Join-Path $tblDir ("alpha$_.txt")) -Value "probe $_" }
+        $sbExLaunch = J (RunCua sandbox launch --exe explorer.exe --args $tblDir)
+        Start-Sleep -Seconds 4
+        $sbExSt = $null
+        for ($k = 0; $k -lt 10; $k++) {
+            $sbExSt = J (RunCua sandbox state --window process:explorer --no-shot --depth 16 --patterns)
+            if (@($sbExSt.nodes | Where-Object { 'Table' -in $_.patterns }).Count -ge 1) { break }
+            Start-Sleep -Milliseconds 800
+        }
+        $sbTblNode = $sbExSt.nodes | Where-Object { 'Table' -in $_.patterns } | Select-Object -First 1
+        if ($null -eq $sbTblNode) {
+            Skip "P22 sandbox table/find-item" "explorer on hidden desktop exposes no Table provider"
+        } else {
+            $sbT = J (RunCua table --sandbox --window process:explorer --index $sbTblNode.i --max-headers 4)
+            Check "P22a sandbox Table reads real column headers" (
+                @($sbT.table.column_headers).Count -ge 3 -and $sbT.table.column_headers[0].name -ne ""
+            ) "headers=$(@($sbT.table.column_headers | ForEach-Object { $_.name }) -join ',')"
+            $sbF = J (RunCua find-item --sandbox --window process:explorer --index $sbTblNode.i --property name --value alpha2.txt)
+            Check "P22b sandbox ItemContainer finds an item by name" ($sbF.element.name -eq "alpha2.txt") "name=$($sbF.element.name)"
+        }
     }
     $stop = J (RunCua sandbox stop)
     Check "P12 sandbox stop only kills owned processes" ($stop.killed_processes -ge 2) "$($stop | ConvertTo-Json -Compress)"
@@ -398,6 +424,23 @@ $r = J (RunCua click --window $WA --x $hx --y $hy --background --shot-id $shA.st
 Start-Sleep -Milliseconds 300
 $vA = Val $WA $editA.i
 Check "P20 background click bypasses occlusion safely" ($r.status -eq "ok" -and $vA -like "*MDOWN*") "$($r.detail) v=$vA"
+
+# ---------- P21: per-action --observation-id binding ----------
+# B2 leftover: index actions must accept an explicit immutable observation id,
+# and a wrong id must fail loudly instead of silently re-observing.
+$stP21 = J (RunCua state --window $WA --no-shot)
+$obsId = $stP21.state_id
+$editP21 = Node $stP21 "Edit"
+if ($null -eq $editP21 -or $null -eq $obsId) {
+    Skip "P21 observation binding" "no state/testpad window"
+} else {
+    $gv = J (RunCua get-value --window $WA --index $editP21.i --observation-id $obsId)
+    Check "P21a explicit --observation-id resolves the pinned snapshot" ($null -ne $gv.value) "value=$($gv.value)"
+    $errOut = RunErr get-value --window $WA --index $editP21.i --observation-id "cua-e2e8-missing-obs"
+    Check "P21b wrong --observation-id fails loudly (no silent re-observe)" ($errOut -like "*not found or not of this window*") "$errOut"
+    $gv2 = J (RunCua get-value --window $WA --index $editP21.i)
+    Check "P21c default (no flag) still resolves the latest observation" ($null -ne $gv2.value) "value=$($gv2.value)"
+}
 
 # ---------- cleanup + result ----------
 & $cua sandbox stop 2>$null | Out-Null

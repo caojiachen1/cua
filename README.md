@@ -23,6 +23,8 @@ Uninstall: `powershell -ExecutionPolicy Bypass -File uninstall.ps1`.
 ```powershell
 cua apps                                               # windows + foreground window
 cua state --window Notepad --patterns                  # UIA tree + screenshot + state_id
+cua state --window "VSCode" --depth 22 --raw           # raw view: IsControlElement=false nodes too
+cua element-at --x 500 --y 238                         # which element is at this point? (passive)
 cua set-value --window Notepad --index 6 --value hi    # Value > RangeValue > Legacy
 cua click --window Notepad --index 4 --right           # right/double always use real events
 cua toggle --window App --index 3                      # also: select / expand / collapse / set-range
@@ -58,6 +60,17 @@ session's config, cache, sandbox state and recordings out of `%LOCALAPPDATA%\cua
 Node and exit silently; `--no-clean-env` inherits them. Electron/Chromium UIs need
 `--args "--force-renderer-accessibility"` before their DOM shows up in the UIA tree.
 
+UIA parse completeness: `state` flags `truncated` (budget hit) and `errors`/`last_error`
+(walker failures that survived one retry); Chromium's "S_OK but null child" answers count as
+clean branch ends. Deep container chains (VSCode and other Electron apps) need `--depth 22+`.
+When a runtime id goes stale, actions re-locate the element by its cached attributes
+(automation id / name / class / type / parent / sibling position) with an ambiguity margin —
+ambiguous matches are refused, not guessed — and record an old→new rid override.
+Core properties ride a UIA cache request bundled into the walk (~1.6× faster; `CUA_UIA_NO_CACHE=1`
+opts out). Every command accepts `--observation-id <id>` to resolve `--index` against that
+immutable snapshot — a wrong id fails instead of silently re-observing. Screenshots report a
+graded `status` (`captured` / `suspected_black` / `no_pixels` / `capture_failed`).
+
 Never automated: terminals, task manager, registry, `mmc`, Control Panel, password managers,
 Windows Settings (including `ms-settings:` URIs), and the Win key.
 
@@ -86,9 +99,9 @@ ladder without touching any app.
 The real-app suites need a quiet desktop: they click at screen coordinates, so an unrelated
 full-screen window (a music client left open, say) can swallow the click. Run them with no
 third-party app occupying the screen.
-through UIA patterns and window messages; UWP apps cannot start there, and DRM-protected
-windows refuse `PrintWindow`. Message-level input reaches classic controls
-(EDIT/RICHEDIT/BUTTON) but not XAML/DirectUI surfaces — use the a11y actions for those.
+The hidden desktop drives apps through UIA patterns and window messages; UWP apps cannot start
+there, and DRM-protected windows refuse `PrintWindow`. Message-level input reaches classic
+controls (EDIT/RICHEDIT/BUTTON) but not XAML/DirectUI surfaces — use the a11y actions for those.
 Browser control is a bridge: it needs the `ubb` daemon + extension, works on the user's real
 profile, and never opens a window of its own. `file://` pages need explicit file access on
 the extension; screenshotting a background tab needs `tab.select` first.

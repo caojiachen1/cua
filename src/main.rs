@@ -27,6 +27,11 @@ use win::{resolve_window, WinInfo};
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+    /// Resolve every --index against this immutable observation id instead of
+    /// the latest observation. A wrong id fails the action; it never silently
+    /// re-observes.
+    #[arg(long, global = true, value_name = "ID")]
+    observation_id: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -54,6 +59,8 @@ enum Cmd {
         redact: bool,
         #[arg(long, help = "also list supported UIA patterns per element (slower)")]
         patterns: bool,
+        #[arg(long, help = "walk the raw view instead of the control view: includes IsControlElement=false nodes the control view hides (decorative panes, MSAA-bridged legacy content)")]
+        raw: bool,
     },
     /// Screenshot a window (works for background/occluded) or the screen
     Shot {
@@ -70,6 +77,14 @@ enum Cmd {
         window: String,
         #[arg(long)]
         query: String,
+    },
+    /// Which UIA element sits at a screen coordinate (ElementFromPoint refined to
+    /// the innermost control on control+raw views; passive — no pointer/focus change)
+    ElementAt {
+        #[arg(long, allow_hyphen_values = true)]
+        x: i32,
+        #[arg(long, allow_hyphen_values = true)]
+        y: i32,
     },
     /// Current pointer position and window under it
     Cursor,
@@ -920,6 +935,9 @@ fn main() {
         .stack_size(16 * 1024 * 1024)
         .spawn(|| {
             let cli = Cli::parse();
+            if let Some(id) = &cli.observation_id {
+                util::set_observation_override(id);
+            }
             dispatch(cli.cmd)
         })
         .expect("spawn cua-main");
@@ -932,11 +950,12 @@ fn dispatch(cmd: Cmd) -> i32 {
         match cmd {
             Cmd::Check => cmd_check(),
             Cmd::Apps { all } => cmd_apps(all),
-            Cmd::State { window, depth, no_shot, out, diff, redact, patterns } => {
-                cmd_state(&window, depth, no_shot, out, diff, redact, patterns)
+            Cmd::State { window, depth, no_shot, out, diff, redact, patterns, raw } => {
+                cmd_state(&window, depth, no_shot, out, diff, redact, patterns, raw)
             }
             Cmd::Shot { window, screen, out } => cmd_shot(window, screen, &out),
             Cmd::Grounding { window, query } => cmd_grounding(&window, &query),
+            Cmd::ElementAt { x, y } => cmd_element_at(x, y),
             Cmd::Cursor => cmd_cursor(),
             Cmd::Ocr { window, screen, file, max_lines } => {
                 cmd_ocr(window, screen, file, max_lines)
@@ -1387,11 +1406,35 @@ fn cmd_state(
     diff: bool,
     redact: bool,
     patterns: bool,
+    raw: bool,
 ) -> Result<i32> {
     let t = resolve_target(sel)?;
     // Walk unredacted: the element cache must keep real names for actions.
     // Redaction is applied to the output copy only.
-    let tree = uia::walk_window(t.hwnd, depth, 2000, false, patterns)?;
+    let opts = uia::WalkOptions {
+        max_depth: depth,
+        max_nodes: 2000,
+        redact: false,
+        with_patterns: patterns,
+        view: if raw { uia::WalkView::Raw } else { uia::WalkView::Control },
+    };
+    let mut tree = uia::walk_window_opts(t.hwnd, opts)?;
+    let mut warmup_retry = false;
+    let root_class = tree.nodes.first().map(|n| n.class.clone()).unwrap_or_default();
+    let chromium_shell = root_class.contains("Chrome_WidgetWin") && tree.nodes.len() < 40;
+    if !raw && (tree.nodes.len() <= 3 || chromium_shell) {
+        // Chromium/Electron only builds its UIA tree after the first client
+        // query; the very first walk can come back as a small shell (even a
+        // 14-node one). One warmup retry makes the first `cua state` on an
+        // Electron app return the real tree.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        if let Ok(second) = uia::walk_window_opts(t.hwnd, opts) {
+            if second.nodes.len() > tree.nodes.len() {
+                tree = second;
+                warmup_retry = true;
+            }
+        }
+    }
     let out_nodes = if redact {
         uia::redacted_nodes(&tree.nodes)
     } else {
@@ -1430,10 +1473,11 @@ fn cmd_state(
         Value::Null
     };
 
-    // elements registry for index-based actions (real names), output is redacted
+    // elements registry for index-based actions (real names); the cache keeps the
+    // full relocation payload, the printed copy is lean
     let cache_value = json!(uia::nodes_json(&tree.nodes));
     util::save_elements(t.info.hwnd, &cache_value);
-    let elems = uia::nodes_json(&out_nodes);
+    let elems = uia::nodes_json_lean(&out_nodes);
     util::save_last_state(&state_id, t.info.hwnd, &tree.sig);
 
     // screenshot
@@ -1449,7 +1493,7 @@ fn cmd_state(
         match shot {
             Ok(s) => {
                 capture::save_png(&s, &path)?;
-                Some(json!({"path": path.to_string_lossy(), "width": s.width, "height": s.height, "rendered": s.rendered}))
+                Some(json!({"path": path.to_string_lossy(), "width": s.width, "height": s.height, "rendered": s.rendered, "status": s.status}))
             }
             Err(e) => Some(json!({"error": format!("{e:#}")})),
         }
@@ -1470,6 +1514,10 @@ fn cmd_state(
         "window": target_json(&t),
         "node_count": tree.nodes.len(),
         "truncated": tree.truncated,
+        "errors": tree.errors,
+        "last_error": tree.last_error,
+        "view": if raw { "raw" } else { "control" },
+        "warmup_retry": if warmup_retry { Value::Bool(true) } else { Value::Null },
         "sig": tree.sig,
         "nodes": elems,
         "screenshot": shot_path,
@@ -1498,6 +1546,7 @@ fn cmd_shot(window: Option<String>, screen: bool, out: &str) -> Result<i32> {
         "width": shot.width,
         "height": shot.height,
         "rendered": shot.rendered,
+        "status": shot.status,
     });
     println!("{}", serde_json::to_string_pretty(&v)?);
     Ok(0)
@@ -1542,6 +1591,66 @@ fn cmd_grounding(sel: &str, query: &str) -> Result<i32> {
         "observation_id": obs_id,
         "observation": obs_path.to_string_lossy(),
         "note": "local UIA grounding; the returned indices belong to the immutable observation saved by this call (state/shot are unchanged)"
+    });
+    println!("{}", serde_json::to_string_pretty(&v)?);
+    Ok(0)
+}
+
+/// `cua element-at --x --y`: which UIA element is at this screen point?
+/// Passive UIA only (ElementFromPoint refined to the innermost control across
+/// control+raw views): never moves the pointer or touches focus, so it is safe
+/// to run while a game owns the foreground.
+fn cmd_element_at(x: i32, y: i32) -> Result<i32> {
+    let hit = uia::element_at_point(x, y)?;
+    // Map into the observation cache of the hit's own top-level window, so the
+    // agent can go straight from "what is here?" to `click --index N`.
+    let hwnd_isize = hit.root_hwnd;
+    let rid_i64 = |rid: &[i32]| -> Vec<i64> { rid.iter().map(|v| *v as i64).collect() };
+    let cache = (hwnd_isize != 0)
+        .then(|| util::load_observation_nodes(hwnd_isize))
+        .flatten();
+    let find_index = |want: &[i32]| -> Option<usize> {
+        cache.as_ref().and_then(|nodes| {
+            nodes.as_array().and_then(|arr| {
+                arr.iter().position(|n| {
+                    n["rid"].as_array().map(|a| {
+                        a.iter().filter_map(|v| v.as_i64()).collect::<Vec<i64>>() == rid_i64(want)
+                    }).unwrap_or(false)
+                })
+            })
+        })
+    };
+    // The refined hit is often an inner container of the observed element (e.g.
+    // the icon label inside a TreeItem); fall back to the nearest cached ancestor.
+    let exact = find_index(&hit.rid);
+    let (index, via) = match exact {
+        Some(i) => (Some(i), "exact-rid"),
+        None => hit
+            .ancestor_rids
+            .iter()
+            .find_map(|rid| find_index(rid).map(|i| (Some(i), "nearest-ancestor")))
+            .unwrap_or((None, "unmapped")),
+    };
+    let v = json!({
+        "schema": "cua-element-at-v1",
+        "x": x,
+        "y": y,
+        "index": index,
+        "via": via,
+        "element": {
+            "name": hit.name,
+            "type": hit.ctype,
+            "class": hit.class,
+            "aid": hit.aid,
+            "rect": hit.rect,
+            "rid": hit.rid,
+            "control": hit.control,
+            "tab_item": hit.tab_item,
+        },
+        "center": [hit.rect[0] + hit.rect[2] / 2, hit.rect[1] + hit.rect[3] / 2],
+        "observation_window": hwnd_isize,
+        "ancestors": hit.ancestor_rids.len(),
+        "note": "passive UIA probe (no pointer/focus change); index refers to the last state/grounding observation of the window that owns the point",
     });
     println!("{}", serde_json::to_string_pretty(&v)?);
     Ok(0)
@@ -1778,8 +1887,21 @@ pub enum ElementTarget {
 }
 
 fn cached_node(hwnd: isize, idx: usize) -> Result<serde_json::Value> {
+    if let Some(id) = util::observation_override() {
+        // an explicit binding must fail loudly instead of falling back
+        match util::load_observation_nodes(hwnd) {
+            Some(cache) => return node_from_cache(&cache, idx),
+            None => bail!(
+                "observation '{id}' not found or not of this window (--observation-id binding is strict; drop the flag or re-observe)"
+            ),
+        }
+    }
     let cache = util::load_observation_nodes(hwnd)
         .ok_or_else(|| anyhow!("no state for this window — run 'cua state --window ...' first"))?;
+    node_from_cache(&cache, idx)
+}
+
+fn node_from_cache(cache: &serde_json::Value, idx: usize) -> Result<serde_json::Value> {
     let arr = cache.as_array().ok_or_else(|| anyhow!("corrupt element cache"))?;
     arr.iter()
         .find(|n| n["i"].as_u64() == Some(idx as u64))
@@ -2550,19 +2672,26 @@ fn cmd_clipboard(op: ClipOp) -> Result<i32> {
 
 pub fn clipboard_get() -> Result<String> {
     use windows::Win32::System::DataExchange::{GetClipboardData, OpenClipboard, CloseClipboard};
-    use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+    use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
     use windows::Win32::System::Ole::CF_UNICODETEXT;
     unsafe {
         OpenClipboard(None).map_err(|e| anyhow!("OpenClipboard: {e}"))?;
         let result = (|| -> Result<String> {
             let h = GetClipboardData(CF_UNICODETEXT.0 as u32).map_err(|e| anyhow!("GetClipboardData: {e}"))?;
             let hg = windows::Win32::Foundation::HGLOBAL(h.0);
+            // Bound the UTF-16 scan by the real allocation size before touching
+            // the pointer: the byte count is authoritative, not a 1 MiB guess.
+            let bytes = GlobalSize(hg) as usize;
+            if bytes < 2 {
+                bail!("clipboard object too small ({bytes} bytes)");
+            }
             let ptr = GlobalLock(hg) as *const u16;
             if ptr.is_null() {
                 bail!("GlobalLock failed");
             }
+            let max_units = bytes / 2;
             let mut len = 0usize;
-            while *ptr.add(len) != 0 && len < 1 << 20 {
+            while len < max_units && *ptr.add(len) != 0 {
                 len += 1;
             }
             let s = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len));
@@ -2591,12 +2720,19 @@ pub fn clipboard_set(text: &str) -> Result<()> {
             let h = GlobalAlloc(GMEM_MOVEABLE, bytes).map_err(|e| anyhow!("GlobalAlloc: {e}"))?;
             let ptr = GlobalLock(h) as *mut u16;
             if ptr.is_null() {
+                // ownership never left us: free instead of leaking
+                let _ = windows::Win32::Foundation::GlobalFree(h);
                 bail!("GlobalLock failed");
             }
             std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
             let _ = GlobalUnlock(h);
             SetClipboardData(CF_UNICODETEXT.0 as u32, HANDLE(h.0))
-                .map_err(|e| anyhow!("SetClipboardData: {e}"))?;
+                .map_err(|e| {
+                    // SetClipboardData failed: the system did not take ownership,
+                    // so the allocation must be returned or it leaks
+                    let _ = windows::Win32::Foundation::GlobalFree(h);
+                    anyhow!("SetClipboardData: {e}")
+                })?;
             Ok(())
         })();
         let _ = CloseClipboard();

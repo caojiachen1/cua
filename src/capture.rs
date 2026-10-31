@@ -18,7 +18,12 @@ pub struct Shot {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
-    pub rendered: bool, // false => PrintWindow returned nothing usable (e.g. DRM/minimized)
+    pub rendered: bool, // compat: false => nothing usable (e.g. DRM/minimized)
+    /// graded capture result per the coordinate/capture contract:
+    /// "captured" | "suspected_black" | "no_pixels" | "capture_failed".
+    /// A legitimately black frame stays "captured" only if PrintWindow reported
+    /// success; an all-black frame from a failed print is "suspected_black".
+    pub status: &'static str,
 }
 
 pub fn shot_window(hwnd: HWND, client_only: bool) -> Result<Shot> {
@@ -57,6 +62,7 @@ pub fn shot_screen(all_monitors: bool) -> Result<Shot> {
         let _ = DeleteDC(mem);
         let _ = ReleaseDC(windows::Win32::Foundation::HWND::default(), hdc);
         shot.rendered = true;
+        shot.status = "captured";
         Ok(shot)
     }
 }
@@ -80,7 +86,7 @@ unsafe fn print_window(hwnd: HWND, w: i32, h: i32, client_only: bool) -> Result<
     if client_only {
         flags = PRINT_WINDOW_FLAGS(flags.0 | PW_CLIENTONLY.0);
     }
-    let _ok = PrintWindow(hwnd, mem, flags).as_bool();
+    let ok = PrintWindow(hwnd, mem, flags).as_bool();
     // deselect before GetDIBits (documented requirement)
     let _ = SelectObject(mem, old);
     let mut shot = blit_to_rgba(mem, bmp, w, h);
@@ -89,7 +95,17 @@ unsafe fn print_window(hwnd: HWND, w: i32, h: i32, client_only: bool) -> Result<
     let _ = ReleaseDC(hwnd, hdc);
     // QQ Music's TXGuiFoundation returns FALSE from PrintWindow yet still fills the bitmap,
     // so the BOOL cannot decide on its own; the pixels do (minimized/DRM render nothing).
-    shot.rendered = has_content(&shot.rgba);
+    let content = has_content(&shot.rgba);
+    shot.rendered = content;
+    shot.status = match (ok, content) {
+        (true, true) => "captured",
+        // black frame with a successful print may be legitimately dark content
+        (true, false) => "suspected_black",
+        // FALSE + no pixels: minimized/DRM window rendered nothing
+        (false, false) => "no_pixels",
+        // FALSE but pixels present: provider quirk (QQ Music), trust the pixels
+        (false, true) => "captured",
+    };
     Ok(shot)
 }
 
@@ -148,6 +164,7 @@ unsafe fn blit_to_rgba(
         height: h as u32,
         rgba: buf,
         rendered: true,
+        status: "captured",
     }
 }
 
