@@ -388,6 +388,7 @@ mod tests {
             uia_index: None,
             uia_rid: None,
             uia_type: None,
+            container: None,
             caption_status: None,
             relations: vec![],
             age_ms: None,
