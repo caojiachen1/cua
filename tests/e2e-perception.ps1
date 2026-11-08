@@ -13,7 +13,7 @@ if (-not (Test-Path $testpad)) { $testpad = "$root\target\debug\testpad.exe" }
 
 $models = $env:CUA_MODEL_DIR
 if (-not $models) { $models = Join-Path $root ".models" }
-$haveModels = Test-Path (Join-Path $models "ppocr-v4\det640.onnx")
+$haveModels = Test-Path (Join-Path $models "ppocr-v4\ch_PP-OCRv4_det_infer.onnx")
 if (-not $haveModels) {
     Write-Host "SKIP e2e-perception: no model assets (set CUA_MODEL_DIR)" -ForegroundColor Yellow
     exit 0
@@ -186,10 +186,17 @@ Check "P24 visualize writes an annotated PNG" (
     $viz.schema -eq "cua-perception-visualize-v1" -and
     $viz.counts.total -ge 1 -and $viz.annotated_width -gt $viz.width
 ) "out=$vizOut total=$($viz.counts.total) canvas=$($viz.annotated_width)x$($viz.annotated_height)"
-$fallback = J (RunCua state --window $W --perception hybrid --detail fast --ocr-profile ppocr-zh-desktop --deadline-ms 10000)
-Check "P25 optional tract OCR profile still works" (
-    $fallback.stages.ocr.status -eq "complete" -and $fallback.perception.backend.ocr -match "tract"
-) "ocr=$($fallback.stages.ocr.status) backend=$($fallback.perception.backend.ocr)"
+$tractDir = Join-Path $models "ppocr-v4"
+$tractReady = (Test-Path (Join-Path $tractDir "det640.onnx")) -and
+    (Test-Path (Join-Path $tractDir "rec320.onnx")) -and (Test-Path (Join-Path $tractDir "cls192.onnx"))
+if ($tractReady) {
+    $fallback = J (RunCua state --window $W --perception hybrid --detail fast --ocr-profile ppocr-zh-desktop --deadline-ms 10000)
+    Check "P25 optional tract OCR profile still works" (
+        $fallback.stages.ocr.status -eq "complete" -and $fallback.perception.backend.ocr -match "tract"
+    ) "ocr=$($fallback.stages.ocr.status) backend=$($fallback.perception.backend.ocr)"
+} else {
+    Skip "P25 optional tract OCR profile" "developer-exported det640/rec320/cls192 graphs not installed"
+}
 
 $full = J (RunCua state --window $W --perception hybrid --detail full --deadline-ms 25000)
 $cap = @($full.elements | Where-Object { $_.caption })

@@ -1,5 +1,5 @@
 // perception/download.rs — install the runtime assets from the project's
-// public ModelScope repo. No model bytes are embedded in the CLI.
+// public ModelScope repos. No model bytes are embedded in the CLI.
 use std::io::{Read, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 
 use super::models;
 
-const LICENSE_NOTICE: &str = "This installs derived runtime assets: OmniParser YOLOv9-E and Florence-2 weights (MIT in their subdirectories), PP-OCRv4 (Apache-2.0), EasyOCR CRAFT/english_g2 (Apache-2.0), and this project's converted ONNX/Burnpack files. The OmniParser repository's root code is CC-BY-4.0. Review the notices in the ModelScope repo before enabling perception. Re-run with --accept-license if you agree.";
+const LICENSE_NOTICE: &str = "This installs derived runtime assets: OmniParser YOLOv9-E and Florence-2 weights (MIT in their subdirectories), PP-OCRv4 (Apache-2.0), EasyOCR CRAFT/english_g2 (Apache-2.0), and this project's converted ONNX/Burnpack files. The OmniParser repository's root code is CC-BY-4.0. The hosted repos carry weights only; the upstream projects hold the full license texts. Re-run with --accept-license if you agree.";
 
 pub const LARGE_DOWNLOAD_BYTES: u64 = 1_500_000_000;
 

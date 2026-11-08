@@ -78,8 +78,10 @@ graded `status` (`captured` / `suspected_black` / `no_pixels` / `capture_failed`
 `state` can add OCR, icon detection and Florence-2 captions on top of the UIA tree. The CLI
 is Rust; OCR defaults to the same **paddle-ocr-rs / RapidOCR PP-OCRv4** engine used by
 CommandFlow-rs (ONNX Runtime backend), icon detection uses Burn/WGPU YOLOv9-E, and captions
-use tract Florence-2. Python, OpenCV and LibTorch are not loaded by the CLI. The earlier
-pure-Rust tract OCR port remains available as `--ocr-profile ppocr-zh-desktop`.
+use Florence-2 through ONNX Runtime with DirectML. Python, OpenCV and LibTorch are not
+loaded by the CLI. The earlier pure-Rust tract OCR port remains available as
+`--ocr-profile ppocr-zh-desktop`; it needs the locally exported graphs and is not part of
+`models install`.
 
 ```powershell
 cua state --window App --perception auto --detail fast       # route by per-region evidence
@@ -116,7 +118,8 @@ the DirectML GPU session; ONNX Runtime CPU and tract are fallbacks.
 OCR profiles: `paddleocr` is the default and was better on the mixed
 Chinese/English OCR benchmark; `easyocr-en-reference` is the official
 OmniParser EasyOCR English path (CRAFT + english_g2, English-only); and
-`ppocr-zh-desktop` is the earlier tract port.
+`ppocr-zh-desktop` is the earlier tract port, available only where its exported graphs were
+built locally.
 
 Never automated: terminals, task manager, registry, `mmc`, Control Panel, password managers,
 Windows Settings (including `ms-settings:` URIs), and the Win key.
