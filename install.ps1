@@ -14,6 +14,11 @@ Write-Host "== [2/4] copy binaries to bin\" -ForegroundColor Cyan
 New-Item -ItemType Directory -Force -Path "$root\bin" | Out-Null
 Copy-Item "$root\target\release\cua.exe" "$root\bin\cua.exe" -Force
 Copy-Item "$root\target\release\testpad.exe" "$root\bin\testpad.exe" -Force
+# ONNX Runtime DirectML (Florence GPU path) and any runtime DLL copied by ort.
+foreach ($dll in @("DirectML.dll", "onnxruntime.dll")) {
+    $src = Join-Path "$root\target\release" $dll
+    if (Test-Path $src) { Copy-Item $src (Join-Path "$root\bin" $dll) -Force }
+}
 
 Write-Host "== [3/4] install skill to ~\.agents\skills\cua" -ForegroundColor Cyan
 $skillDir = Join-Path $env:USERPROFILE ".agents\skills\cua"
