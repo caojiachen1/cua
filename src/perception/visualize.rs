@@ -389,6 +389,7 @@ mod tests {
             uia_rid: None,
             uia_type: None,
             container: None,
+            fingerprint: None,
             caption_status: None,
             relations: vec![],
             age_ms: None,
