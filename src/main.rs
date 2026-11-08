@@ -7,6 +7,7 @@ mod action;
 mod capture;
 mod input;
 mod ocr;
+mod perception;
 mod rec;
 mod sandbox;
 mod ubb;
@@ -21,6 +22,90 @@ use serde_json::{json, Value};
 use action::{ActionOutcome, ActionRequest, InputMode};
 use util::{Receipt, SafetyConfig};
 use win::{resolve_window, WinInfo};
+
+#[derive(Subcommand)]
+enum PerceptionModelsOp {
+    /// Verify pinned model sizes and optional SHA-256 hashes.
+    Verify {
+        #[arg(long, help = "read every file and verify its SHA-256 (slow)")]
+        deep: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum PerceptionOp {
+    /// Verify the pinned OmniParser/OCR model assets.
+    Models {
+        #[command(subcommand)]
+        op: PerceptionModelsOp,
+    },
+    /// Click an element selected from an immutable observation (UIA pattern
+    /// first; visual elements use a fresh-frame + hit-test guarded real click).
+    ClickElement {
+        #[arg(long)]
+        observation_id: String,
+        #[arg(long)]
+        element_id: String,
+        #[arg(long, help = "use message-level input when the element has no UIA pattern")]
+        background: bool,
+        #[arg(long)]
+        right: bool,
+    },
+    /// Parse an image or window screenshot and write an annotated PNG plus JSON.
+    Visualize {
+        #[arg(long, conflicts_with = "window", help = "input image path")]
+        image: Option<String>,
+        #[arg(long, conflicts_with = "image", help = "capture this window first")]
+        window: Option<String>,
+        #[arg(long, help = "output PNG (default: <input>-perception.png or data dir)")]
+        out: Option<String>,
+        #[arg(long, value_enum, default_value_t = perception::types::Detail::Full)]
+        detail: perception::types::Detail,
+        #[arg(long, value_enum, default_value_t = perception::types::OcrProfile::PaddleOcr)]
+        ocr_profile: perception::types::OcrProfile,
+    },
+    /// Find OCR/UIA elements by text in an immutable observation.
+    MatchText {
+        #[arg(long)]
+        observation_id: String,
+        #[arg(long, conflicts_with = "regex")]
+        contains: Option<String>,
+        #[arg(long, conflicts_with = "contains")]
+        regex: Option<String>,
+        #[arg(long, default_value_t = false)]
+        case_sensitive: bool,
+        #[arg(long, default_value_t = 50)]
+        max: usize,
+    },
+    /// Run pure-Rust template matching over an observation screenshot.
+    MatchTemplate {
+        #[arg(long)]
+        observation_id: String,
+        #[arg(long)]
+        template: String,
+        #[arg(long, default_value_t = 0.90)]
+        threshold: f32,
+        #[arg(long, default_value = "1.0")]
+        scales: String,
+        #[arg(long, default_value_t = 8)]
+        max_matches: usize,
+    },
+    /// Explicitly authorized continuous template watch (never a background spy).
+    WatchTemplate {
+        #[arg(long)]
+        window: String,
+        #[arg(long)]
+        template: String,
+        #[arg(long, default_value_t = 0.90)]
+        threshold: f32,
+        #[arg(long, default_value_t = 2)]
+        confirm_frames: usize,
+        #[arg(long, default_value_t = 5000)]
+        timeout_ms: u64,
+        #[arg(long, default_value_t = 120)]
+        interval_ms: u64,
+    },
+}
 
 #[derive(Parser)]
 #[command(name = "cua", version, about = "Windows computer-use CLI (Trae + Qoder + ZCode fusion)")]
@@ -61,6 +146,16 @@ enum Cmd {
         patterns: bool,
         #[arg(long, help = "walk the raw view instead of the control view: includes IsControlElement=false nodes the control view hides (decorative panes, MSAA-bridged legacy content)")]
         raw: bool,
+        #[arg(long, value_enum, help = "perception: auto|uia|vision|hybrid (emits cua-observation-v2)")]
+        perception: Option<perception::types::Mode>,
+        #[arg(long, value_enum, help = "fast|balanced|full; fast returns OCR+detector before captions")]
+        detail: Option<perception::types::Detail>,
+        #[arg(long, value_enum, help = "OCR profile (default paddleocr)")]
+        ocr_profile: Option<perception::types::OcrProfile>,
+        #[arg(long, help = "total perception deadline in milliseconds")]
+        deadline_ms: Option<u64>,
+        #[arg(long, help = "emit an immutable fast snapshot, then a final caption revision")]
+        stream: bool,
     },
     /// Screenshot a window (works for background/occluded) or the screen
     Shot {
@@ -98,6 +193,11 @@ enum Cmd {
         file: Option<String>,
         #[arg(long, default_value_t = 200)]
         max_lines: usize,
+    },
+    /// Perception utilities: PaddleOCR (ORT), icon detection, captions, text/template lookup
+    Perception {
+        #[command(subcommand)]
+        op: PerceptionOp,
     },
     /// Move the pointer to an element or coordinate (hover; no click)
     Hover {
@@ -950,9 +1050,29 @@ fn dispatch(cmd: Cmd) -> i32 {
         match cmd {
             Cmd::Check => cmd_check(),
             Cmd::Apps { all } => cmd_apps(all),
-            Cmd::State { window, depth, no_shot, out, diff, redact, patterns, raw } => {
-                cmd_state(&window, depth, no_shot, out, diff, redact, patterns, raw)
+            Cmd::State { window, depth, no_shot, out, diff, redact, patterns, raw, perception, detail, ocr_profile, deadline_ms, stream } => {
+                if perception.is_some() || detail.is_some() || ocr_profile.is_some() || stream || deadline_ms.is_some() {
+                    if diff || redact || patterns || raw {
+                        bail!("--diff/--redact/--patterns/--raw are not supported together with --perception yet; use the v1 state path");
+                    }
+                    let t = resolve_target(&window)?;
+                    perception::pipeline::run(perception::pipeline::Request {
+                        hwnd: t.info.hwnd,
+                        window: target_json(&t),
+                        depth,
+                        mode: perception.unwrap_or(perception::types::Mode::Auto),
+                        detail: detail.unwrap_or(perception::types::Detail::Balanced),
+                        ocr_profile: ocr_profile.unwrap_or(perception::types::OcrProfile::PaddleOcr),
+                        no_shot,
+                        out,
+                        stream,
+                        deadline_ms,
+                    })
+                } else {
+                    cmd_state(&window, depth, no_shot, out, diff, redact, patterns, raw)
+                }
             }
+            Cmd::Perception { op } => cmd_perception(op),
             Cmd::Shot { window, screen, out } => cmd_shot(window, screen, &out),
             Cmd::Grounding { window, query } => cmd_grounding(&window, &query),
             Cmd::ElementAt { x, y } => cmd_element_at(x, y),
@@ -1654,6 +1774,304 @@ fn cmd_element_at(x: i32, y: i32) -> Result<i32> {
     });
     println!("{}", serde_json::to_string_pretty(&v)?);
     Ok(0)
+}
+
+fn load_observation_json(id: &str) -> Result<Value> {
+    let p = util::ensure_data_dir().join("cache").join(format!("obs-{id}.json"));
+    let bytes = std::fs::read(&p)
+        .map_err(|e| anyhow!("observation '{}' not found ({}): {e}", id, p.display()))?;
+    serde_json::from_slice(&bytes).map_err(|e| anyhow!("observation '{}' is not valid JSON: {e}", id))
+}
+
+fn cmd_perception(op: PerceptionOp) -> Result<i32> {
+    match op {
+        PerceptionOp::Models { op: PerceptionModelsOp::Verify { deep } } => {
+            let v = perception::models::verify_manifest(deep)?;
+            println!("{}", serde_json::to_string_pretty(&v)?);
+            Ok(if v["ok"].as_bool().unwrap_or(false) { 0 } else { 1 })
+        }
+        PerceptionOp::ClickElement { observation_id, element_id, background, right } => {
+            let obs_path = util::ensure_data_dir().join("cache").join(format!("obs-{observation_id}.json"));
+            let obs_age_ms = std::fs::metadata(&obs_path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(u64::MAX);
+            if obs_age_ms > 2000 {
+                bail!("refusing click: observation '{}' is stale ({obs_age_ms}ms > 2000ms); re-observe the target", observation_id);
+            }
+            let obs = load_observation_json(&observation_id)?;
+            let elements = obs["elements"].as_array().cloned().unwrap_or_default();
+            let e = elements.iter().find(|e| e["element_id"].as_str() == Some(element_id.as_str()))
+                .ok_or_else(|| anyhow!("element '{}' not found in observation '{}'", element_id, observation_id))?;
+            let hwnd = obs["hwnd"].as_i64().unwrap_or(0) as isize;
+            if hwnd == 0 {
+                bail!("observation has no hwnd");
+            }
+            let h = windows::Win32::Foundation::HWND(hwnd as *mut _);
+            let recorded_pid = obs["window"]["pid"].as_u64().unwrap_or(0) as u32;
+            if recorded_pid != 0 {
+                let cur = crate::win::snapshot_window(crate::win::root_window(h))
+                    .ok_or_else(|| anyhow!("observation window no longer exists"))?;
+                if cur.pid != recorded_pid {
+                    bail!(
+                        "refusing click: window pid changed since the snapshot ({} -> {}); re-observe",
+                        recorded_pid, cur.pid
+                    );
+                }
+            }
+            let rid: Vec<i32> = e["uia_rid"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_i64().map(|n| n as i32)).collect())
+                .unwrap_or_default();
+            let mut method;
+            let mut point = Value::Null;
+            if !rid.is_empty() {
+                method = if background {
+                    uia::click_element_background(h, &rid, false, right)?
+                } else {
+                    uia::click_element(h, &rid, false, right)?
+                };
+            } else {
+                // A visual/coordinate click needs a screenshot whose age and
+                // window geometry still match the snapshot. The snapshot is
+                // explicit authorization, but it is not a fresh-frame blanket.
+                let shot_path = obs["screenshot"]["path"].as_str()
+                    .ok_or_else(|| anyhow!("visual element needs an observation screenshot"))?;
+                let age_ms = std::fs::metadata(shot_path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(u64::MAX);
+                if age_ms > 5000 {
+                    bail!("refusing visual click: frame is stale ({age_ms}ms > 5000ms); re-observe the target");
+                }
+                let rect = e["rect_px"].as_array().ok_or_else(|| anyhow!("element has no rect_px"))?;
+                let fr = obs["frame"]["window_rect"].as_array().ok_or_else(|| anyhow!("observation has no window_rect"))?;
+                let cur = crate::win::window_rect(h)?;
+                let same = fr.len() >= 4
+                    && cur[0] == fr[0].as_i64().unwrap_or(i64::MIN) as i32
+                    && cur[1] == fr[1].as_i64().unwrap_or(i64::MIN) as i32
+                    && cur[2] == fr[2].as_i64().unwrap_or(i64::MIN) as i32
+                    && cur[3] == fr[3].as_i64().unwrap_or(i64::MIN) as i32;
+                if !same {
+                    bail!("refusing visual click: window geometry changed since the snapshot (re-observe)");
+                }
+                let origin = obs["frame"]["screen_origin"].as_array().ok_or_else(|| anyhow!("observation has no screen_origin"))?;
+                let ox = origin.first().and_then(|v| v.as_i64()).unwrap_or(0) as f32;
+                let oy = origin.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as f32;
+                let x = rect.first().and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                let y = rect.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                let w = rect.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                let hh = rect.get(3).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                let cx = (ox + x + w / 2.0).round() as i32;
+                let cy = (oy + y + hh / 2.0).round() as i32;
+                crate::win::ensure_point_hits(h, cx, cy)?;
+                input::click(cx, cy, right, false)?;
+                point = json!([cx, cy]);
+                method = format!("visual click at ({cx},{cy}) after freshness/hit-test checks; effect not verified");
+            }
+            println!("{}", serde_json::to_string_pretty(&json!({
+                "schema": "cua-perception-click-v1",
+                "observation_id": observation_id,
+                "element_id": element_id,
+                "status": "ok",
+                "dispatched": true,
+                "method": method,
+                "point": point,
+                "verified": false,
+                "note": "a returned call is not proof of an effect; re-observe before retrying",
+            }))?);
+            Ok(0)
+        }
+        PerceptionOp::Visualize { image, window, out, detail, ocr_profile } => {
+            let image_for_default = image.clone();
+            let (width, height, rgba, source_label) = match (image, window) {
+                (Some(path), None) => {
+                    let img = image::open(&path)?.to_rgba8();
+                    let (w, h) = img.dimensions();
+                    (w, h, img.into_raw(), path)
+                }
+                (None, Some(sel)) => {
+                    let t = resolve_target(&sel)?;
+                    let shot = capture::shot_window(t.hwnd, false)?;
+                    if !shot.rendered {
+                        bail!("capture produced no content (minimized/DRM window)");
+                    }
+                    (shot.width, shot.height, shot.rgba, format!("window:{}", t.info.title))
+                }
+                _ => bail!("provide exactly one of --image or --window"),
+            };
+            let analyzed = perception::visualize::analyze(width, height, &rgba, detail, ocr_profile)?;
+            let out_path = out
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| perception::visualize::default_output(image_for_default.as_deref()));
+            let (canvas_w, canvas_h) =
+                perception::visualize::render(width, height, &rgba, &analyzed.elements, &out_path)?;
+            let counts = analyzed.elements.iter().fold((0usize, 0usize, 0usize), |mut a, e| {
+                match e.provenance {
+                    perception::types::Source::Ocr => a.0 += 1,
+                    perception::types::Source::Detector => a.1 += 1,
+                    perception::types::Source::Fused | perception::types::Source::Caption => a.2 += 1,
+                    perception::types::Source::Uia => {}
+                }
+                a
+            });
+            let sidecar = out_path.with_extension("json");
+            let summary = json!({
+                "schema": "cua-perception-visualize-v1",
+                "source": source_label,
+                "output": out_path.to_string_lossy(),
+                "json": sidecar.to_string_lossy(),
+                "width": width,
+                "height": height,
+                "annotated_width": canvas_w,
+                "annotated_height": canvas_h,
+                "ocr_backend": analyzed.ocr_backend,
+                "detector_backend": analyzed.detector_backend,
+                "detail": detail.as_str(),
+                "ocr_profile": ocr_profile.as_str(),
+                "elapsed_ms": analyzed.elapsed_ms,
+                "counts": {"ocr": counts.0, "icons": counts.1, "captions": counts.2, "total": analyzed.elements.len()},
+                "warnings": analyzed.warnings,
+                "elements": analyzed.elements,
+            });
+            std::fs::write(&sidecar, serde_json::to_vec_pretty(&summary)?)?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+            Ok(0)
+        }
+        PerceptionOp::MatchText { observation_id, contains, regex, case_sensitive, max } => {
+            let obs = load_observation_json(&observation_id)?;
+            let mode = if regex.is_some() { perception::text::MatchMode::Regex } else { perception::text::MatchMode::Contains };
+            let query = regex.clone().or(contains.clone()).unwrap_or_default();
+            if query.is_empty() {
+                bail!("--contains or --regex is required");
+            }
+            let elements = obs["elements"].as_array().cloned().unwrap_or_default();
+            let mut matches = Vec::new();
+            for e in &elements {
+                let text = e["text"].as_str().or_else(|| e["caption"].as_str()).unwrap_or("");
+                if text.is_empty() {
+                    continue;
+                }
+                if perception::text::compare(text, &query, mode, case_sensitive) {
+                    matches.push(json!({
+                        "element_id": e["element_id"],
+                        "type": e["type"],
+                        "text": text,
+                        "rect_px": e["rect_px"],
+                        "uia_index": e["uia_index"],
+                        "uia_rid": e["uia_rid"],
+                        "channels": e["target"]["channels"],
+                        "provenance": e["provenance"],
+                    }));
+                    if matches.len() >= max {
+                        break;
+                    }
+                }
+            }
+            println!("{}", serde_json::to_string_pretty(&json!({
+                "schema": "cua-perception-match-v1",
+                "observation_id": observation_id,
+                "query": query,
+                "match_mode": if regex.is_some() { "regex" } else { "contains" },
+                "matches": matches,
+            }))?);
+            Ok(0)
+        }
+        PerceptionOp::MatchTemplate { observation_id, template, threshold, scales, max_matches } => {
+            let obs = load_observation_json(&observation_id)?;
+            let path = obs["screenshot"]["path"].as_str()
+                .ok_or_else(|| anyhow!("observation '{}' has no screenshot", observation_id))?;
+            let img = image::open(path)?.to_rgba8();
+            let (w, h) = img.dimensions();
+            let gray = perception::template::Gray::from_rgba(w, h, img.as_raw());
+            let tpl = perception::template::Template::load(std::path::Path::new(&template))?;
+            let scales: Vec<f32> = scales.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+            let scales = if scales.is_empty() { vec![1.0] } else { scales };
+            let found = perception::template::find(&gray, &tpl, threshold, &scales, max_matches);
+            let origin = obs["frame"]["screen_origin"].as_array()
+                .and_then(|a| Some([a.first()?.as_i64()? as i32, a.get(1)?.as_i64()? as i32]))
+                .unwrap_or([0, 0]);
+            let matches: Vec<Value> = found.matches.iter().map(|m| json!({
+                "rect_px": m.rect.to_array(),
+                "rect_screen": [m.rect.x + origin[0] as f32, m.rect.y + origin[1] as f32, m.rect.w, m.rect.h],
+                "score": m.score,
+                "scale": m.scale,
+            })).collect();
+            println!("{}", serde_json::to_string_pretty(&json!({
+                "schema": "cua-perception-template-v1",
+                "observation_id": observation_id,
+                "ambiguous": found.ambiguous,
+                "best_score": found.best_score,
+                "matches": matches,
+            }))?);
+            Ok(0)
+        }
+        PerceptionOp::WatchTemplate { window, template, threshold, confirm_frames, timeout_ms, interval_ms } => {
+            let mut t = resolve_target(&window)?;
+            let tpl = perception::template::Template::load(std::path::Path::new(&template))?;
+            let started = std::time::Instant::now();
+            let mut streak = 0usize;
+            let mut prev: Option<[f32; 4]> = None;
+            let mut frames = 0u64;
+            let mut last_score = 0f32;
+            loop {
+                if started.elapsed().as_millis() as u64 > timeout_ms {
+                    println!("{}", serde_json::to_string_pretty(&json!({
+                        "schema": "cua-perception-watch-v1",
+                        "window": target_json(&t), "matched": false, "frames": frames,
+                        "elapsed_ms": started.elapsed().as_millis() as u64,
+                        "reason": "timeout", "best_score": last_score,
+                    }))?);
+                    return Ok(1);
+                }
+                if !crate::win::is_window_alive(t.hwnd) {
+                    t = resolve_target(&window)?;
+                }
+                let shot = match capture::shot_window(t.hwnd, false) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        // A replaced/recreated window is a new target, not a
+                        // reason to silently keep using the old handle.
+                        t = resolve_target(&window)?;
+                        capture::shot_window(t.hwnd, false)?
+                    }
+                };
+                frames += 1;
+                let gray = perception::template::Gray::from_rgba(shot.width, shot.height, &shot.rgba);
+                let found = perception::template::find(&gray, &tpl, threshold, &[1.0], 2);
+                let hit = found.matches.first().filter(|m| m.score >= threshold);
+                if let Some(m) = hit {
+                    last_score = m.score;
+                    let r = m.rect.to_array();
+                    let same = prev.map(|p| {
+                        let pr = perception::coordinates::Rect::new(p[0], p[1], p[2], p[3]);
+                        pr.iou(&m.rect) > 0.5
+                    }).unwrap_or(false);
+                    if same { streak += 1; } else { streak = 1; }
+                    prev = Some(r);
+                    if streak >= confirm_frames.max(1) {
+                        let origin = crate::win::window_rect(t.hwnd)?;
+                        println!("{}", serde_json::to_string_pretty(&json!({
+                            "schema": "cua-perception-watch-v1",
+                            "window": target_json(&t), "matched": true, "frames": frames,
+                            "streak": streak, "elapsed_ms": started.elapsed().as_millis() as u64,
+                            "score": m.score,
+                            "rect_px": r,
+                            "rect_screen": [r[0] + origin[0] as f32, r[1] + origin[1] as f32, r[2], r[3]],
+                        }))?);
+                        return Ok(0);
+                    }
+                } else {
+                    streak = 0;
+                    prev = None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(interval_ms.max(1)));
+            }
+        }
+    }
 }
 
 fn cmd_ocr(

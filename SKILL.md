@@ -48,7 +48,11 @@ cua grounding --window <sel> --query "加粗"        # local UIA grounding (Trae
 # grounding saves the tree it measured as an immutable observation, so its i values
 # are safe for click --index; state/shot are left untouched (coordinate guards keep
 # their last screenshot id)
-cua ocr --window <sel> [--max-lines 200]          # local Windows OCR; also --screen / --file
+cua ocr --window <sel> [--max-lines 200]          # legacy Windows OCR; also --screen / --file
+# perception parser: PaddleOCR default, then YOLOv9-E icons + Florence-2 captions
+cua state --window <sel> --perception auto --detail fast
+cua perception visualize --image shot.png --detail full --out annotated.png
+
 # state_id is an immutable obs-<id>.json; shot only refreshes the coordinate guard,
 # and index actions resolve against the latest element observation.
 cua cursor                                        # pointer x/y + window under it

@@ -7,8 +7,10 @@ receipts with safety guards.
 
 ## Install
 
-Needs Windows 10/11 x64, Rust (MSVC), PowerShell 5.1+. Browser tasks need the `ubb` CLI and
-its Edge extension connected (`cua browser status` → `extension: true`).
+Needs Windows 10/11 x64, Rust (MSVC), CMake/C++ build tools (for the PaddleOCR native
+dependency), and PowerShell 5.1+. The first perception build downloads the ONNX Runtime
+native runtime. Browser tasks need the `ubb` CLI and its Edge extension connected
+(`cua browser status` → `extension: true`).
 
 ```powershell
 git clone https://github.com/caojiachen1/cua.git
@@ -71,13 +73,46 @@ opts out). Every command accepts `--observation-id <id>` to resolve `--index` ag
 immutable snapshot — a wrong id fails instead of silently re-observing. Screenshots report a
 graded `status` (`captured` / `suspected_black` / `no_pixels` / `capture_failed`).
 
+## Perception (PaddleOCR + OmniParser visuals)
+
+`state` can add OCR, icon detection and Florence-2 captions on top of the UIA tree. The CLI
+is Rust; OCR defaults to the same **paddle-ocr-rs / RapidOCR PP-OCRv4** engine used by
+CommandFlow-rs (ONNX Runtime backend), icon detection uses Burn/WGPU YOLOv9-E, and captions
+use tract Florence-2. Python, OpenCV and LibTorch are not loaded by the CLI. The earlier
+pure-Rust tract OCR port remains available as `--ocr-profile ppocr-zh-desktop`.
+
+```powershell
+cua state --window App --perception auto --detail fast       # route by per-region evidence
+cua state --window App --perception hybrid --detail full     # captions for unlabeled icons
+cua state --window App --perception uia --no-shot            # no capture, no inference
+cua state --window App --perception auto --stream            # partial fast snapshot + final revision
+cua perception visualize --image shot.png --detail full      # annotated PNG + JSON sidecar
+cua perception visualize --window App --out parsed.png       # capture, parse, annotate
+cua perception match-text --observation-id <id> --contains "Save"
+cua perception match-template --observation-id <id> --template .\icon.png
+cua perception watch-template --window App --template .\icon.png --confirm-frames 2
+cua perception click-element --observation-id <id> --element-id "vision:..."
+```
+
+`auto` evaluates reading/locating/actionability/coverage/capture per region. A permission
+denial stays terminal (vision never bypasses it); a bad capture does not invalidate a usable
+UIA tree. Visual elements carry `rect_px`, provenance and separate confidences; an empty
+`target.channels` means unknown, not permission. Visual clicks require a screenshot younger
+than 5 s, unchanged window geometry and a hit test, and still report `verified: false`.
+
+The pinned official assets, including the original PP-OCRv4 ONNX files required by
+PaddleOCR, are installed with `tools\install-models.ps1` (copy into
+`%LOCALAPPDATA%\cua\models`) and checked by `cua perception models verify --deep`. The
+offline exporter `tools/dev/export_omni_onnx.py` is a development tool only; it produces
+the fixed ONNX/Burn assets from the official TorchScript/Florence weights.
+
 Never automated: terminals, task manager, registry, `mmc`, Control Panel, password managers,
 Windows Settings (including `ms-settings:` URIs), and the Win key.
 
 ## Tests
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tests\run-all.ps1    # 8 suites, 372 passed + 1 env skip
+powershell -ExecutionPolicy Bypass -File tests\run-all.ps1    # 9 suites, including perception
 powershell -ExecutionPolicy Bypass -File tools\uia-probe.ps1 -Apps qqmusic,cloudmusic  # capability report
 ```
 

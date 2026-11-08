@@ -11,6 +11,9 @@ if (-not $env:CUA_TEST_BIN) {
     if (-not $cands) { throw "no cua.exe found - run 'cargo build --release' first" }
     $env:CUA_TEST_BIN = @($cands | Sort-Object { (Get-Item $_).LastWriteTime } -Descending)[0]
 }
+if (-not $env:CUA_MODEL_DIR -and (Test-Path (Join-Path $repo ".models"))) {
+    $env:CUA_MODEL_DIR = Join-Path $repo ".models"
+}
 if (-not $env:CUA_TEST_TESTPAD) {
     $cands = @("$repo\target\release\testpad.exe", "$repo\target\debug\testpad.exe", "$repo\bin\testpad.exe") |
         Where-Object { Test-Path $_ }
@@ -26,7 +29,7 @@ Write-Host ("== cli    : {0}" -f $env:CUA_TEST_BIN) -ForegroundColor Cyan
 Write-Host ("== sha256 : {0}" -f (Get-FileHash $env:CUA_TEST_BIN -Algorithm SHA256).Hash) -ForegroundColor Cyan
 Write-Host ("== data   : {0}" -f $env:CUA_DATA_DIR) -ForegroundColor Cyan
 
-$suites = @("e2e.ps1", "e2e2.ps1", "e2e3.ps1", "e2e4.ps1", "e2e5.ps1", "e2e6.ps1", "e2e7.ps1", "e2e8.ps1")
+$suites = @("e2e.ps1", "e2e2.ps1", "e2e3.ps1", "e2e4.ps1", "e2e5.ps1", "e2e6.ps1", "e2e7.ps1", "e2e8.ps1", "e2e-perception.ps1")
 $failed = @()
 foreach ($s in $suites) {
     Write-Host ""

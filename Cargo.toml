@@ -11,6 +11,21 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 uiautomation = "0.16"
+tract-onnx = { version = "0.21", default-features = false }
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+sha2 = "0.11.1"
+regex = "1.13.1"
+rayon = "1.12.0"
+burn = { version = "0.22", default-features = false, features = ["std", "wgpu", "flex"] }
+burn-store = { version = "0.22", default-features = false, features = ["std"] }
+hex = "0.4.3"
+# CommandFlow-rs' PaddleOCR engine (RapidOCR PP-OCRv4, ORT backend).
+paddle-ocr-rs = { git = "https://github.com/caojiachen1/paddle-ocr-rs", rev = "74c120bd5c25404dc9487781a86b28d3a9959e98" }
+# paddle-ocr-rs 0.7 expects the rc.12 ORT API; newer rc.15 pre-releases are
+# semver-compatible and would otherwise be selected.
+ort = { version = "=2.0.0-rc.12", default-features = false }
+imageproc = "0.25"
+ab_glyph = "0.2"
 
 [dependencies.windows]
 version = "0.58"
@@ -45,3 +60,9 @@ features = [
 [profile.release]
 opt-level = 2
 lto = false
+
+# wgpu-hal 30 uses windows 0.62; gpu-allocator's broad range otherwise
+# resolves to 0.59 and the D3D12 types no longer unify. The vendored copy only
+# narrows that dependency range (no code changes).
+[patch.crates-io]
+gpu-allocator = { path = "vendor-gpu-allocator" }

@@ -6,3 +6,12 @@ SUMMARY.md
 *.mp4
 tools/uia-report*.md
 .e2e/
+.models/
+.venv-oracle/
+.e2e-perception/
+.tmp-burn-yolo/
+.e2e-*/
+target-final/
+docs/perception-samples/
+docs/perception-example.png
+docs/commandflow-uia-comparison.md

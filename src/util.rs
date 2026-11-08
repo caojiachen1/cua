@@ -305,6 +305,23 @@ pub fn save_observation(
     Ok(p)
 }
 
+/// Persist a complete v2 snapshot. The immutable cache keeps the full UIA
+/// nodes under `nodes` (index actions resolve against that exact tree) and the
+/// v2 `elements` alongside it.
+pub fn save_observation_value(id: &str, hwnd: isize, value: &serde_json::Value) -> Result<std::path::PathBuf> {
+    let p = ensure_data_dir().join("cache").join(format!("obs-{id}.json"));
+    let mut v = value.clone();
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("schema".into(), serde_json::json!("cua-observation-v2"));
+        obj.insert("id".into(), serde_json::json!(id));
+        obj.insert("hwnd".into(), serde_json::json!(hwnd));
+        obj.entry("created").or_insert_with(|| serde_json::json!(now_iso()));
+    }
+    write_atomic(&p, &serde_json::to_vec(&v)?)?;
+    prune_observations_in(&ensure_data_dir().join("cache"), OBS_RETAIN);
+    Ok(p)
+}
+
 pub fn save_last_observation(hwnd: isize, id: &str) {
     let p = ensure_data_dir()
         .join("cache")

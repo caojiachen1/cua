@@ -126,6 +126,15 @@ pub fn window_class(hwnd: HWND) -> String {
     }
 }
 
+/// Per-monitor DPI scale for a window (1.0 at 96 DPI). The process is
+/// per-monitor DPI aware, so window and capture coordinates stay in physical
+/// pixels; this is metadata for consumers, not a coordinate conversion.
+pub fn dpi_scale(hwnd: HWND) -> f32 {
+    use windows::Win32::UI::HiDpi::GetDpiForWindow;
+    let dpi = unsafe { GetDpiForWindow(hwnd) };
+    if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 }
+}
+
 pub fn window_rect(hwnd: HWND) -> Result<[i32; 4]> {
     unsafe {
         let mut r = RECT::default();
@@ -307,6 +316,9 @@ pub fn resolve_window(sel: &str) -> Result<HWND> {
 }
 
 fn pick(mut cands: Vec<WinInfo>, sel: &str) -> Result<HWND> {
+    // A window can disappear between enumeration and use; never hand a dead
+    // handle to capture/UIA just because it still appears in the snapshot.
+    cands.retain(|w| unsafe { IsWindow(HWND(w.hwnd as *mut _)).as_bool() });
     if cands.is_empty() {
         bail!("no window matching '{sel}'");
     }

@@ -684,6 +684,55 @@ fn pattern_names_for(el: &UIElement, ctype: &str) -> Vec<String> {
     v
 }
 
+/// Bounded actionability sample for the perception router. Probing every node's
+/// patterns is expensive, so this checks at most `max` non-offscreen,
+/// interactive/named nodes with runtime ids and returns (known, patterned/sampled).
+/// It never clicks or writes.
+pub fn sample_actionability(hwnd: HWND, nodes: &[Node], max: usize) -> (bool, f32) {
+    let candidates: Vec<&Node> = nodes
+        .iter()
+        .filter(|n| !n.offscreen && !n.rid.is_empty())
+        .filter(|n| {
+            matches!(
+                n.ctype.as_str(),
+                "Button"
+                    | "CheckBox"
+                    | "RadioButton"
+                    | "ComboBox"
+                    | "Edit"
+                    | "Hyperlink"
+                    | "ListItem"
+                    | "MenuItem"
+                    | "Slider"
+                    | "Spinner"
+                    | "SplitButton"
+                    | "TabItem"
+                    | "TreeItem"
+                    | "DataItem"
+            ) || !n.name.trim().is_empty()
+        })
+        .take(max.max(1))
+        .collect();
+    if candidates.is_empty() {
+        return (false, 0.0);
+    }
+    let mut sampled = 0usize;
+    let mut patterned = 0usize;
+    for n in candidates {
+        let Ok(el) = find_by_rid(hwnd, &n.rid) else { continue };
+        let ctype = el.get_control_type().map(type_name).unwrap_or_else(|_| n.ctype.clone());
+        sampled += 1;
+        if !pattern_names_for(&el, &ctype).is_empty() {
+            patterned += 1;
+        }
+    }
+    if sampled == 0 {
+        (false, 0.0)
+    } else {
+        (true, patterned as f32 / sampled as f32)
+    }
+}
+
 /// Rect + center for an element (used by hover and coordinate fallbacks).
 pub fn element_center(hwnd: HWND, rid: &[i32]) -> Result<([i32; 4], (i32, i32), String)> {
     let el = find_by_rid(hwnd, rid)?;
