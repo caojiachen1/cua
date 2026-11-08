@@ -45,6 +45,24 @@ function Skip($name, $why) {
 }
 function RunCua { & $cua @args 2>$null }
 function RunErr { (& $cua @args 2>&1) -join "`n" }
+# Any visual element whose centre falls inside a UIA list row: the visual stage
+# may return the colour swatch, its label or the row box, so pick by geometry
+# instead of by a name that OCR/detector output can drop between frames.
+function PickVisualRow($obs, $excludeRows = @()) {
+    $rows = @($obs.elements | Where-Object { $_.provenance -eq "uia" -and $_.uia_type -eq "ListItem" -and $_.rect_px -and $excludeRows -notcontains $_.text })
+    $vis = @($obs.elements | Where-Object { $_.provenance -ne "uia" -and $_.rect_px -and $_.rect_px[2] -gt 4 -and $_.rect_px[3] -gt 4 })
+    foreach ($v in $vis) {
+        $cx = $v.rect_px[0] + $v.rect_px[2] / 2
+        $cy = $v.rect_px[1] + $v.rect_px[3] / 2
+        foreach ($r in $rows) {
+            if ($cx -ge $r.rect_px[0] -and $cx -le ($r.rect_px[0] + $r.rect_px[2]) -and
+                $cy -ge $r.rect_px[1] -and $cy -le ($r.rect_px[1] + $r.rect_px[3])) {
+                return @{ element = $v; row = $r.text }
+            }
+        }
+    }
+    return $null
+}
 
 Write-Host "== cua pure-Rust perception E2E (cli: $cua)" -ForegroundColor Cyan
 Write-Host ("== models: {0}" -f $env:CUA_MODEL_DIR) -ForegroundColor DarkGray
@@ -117,7 +135,7 @@ $mt = J (RunCua perception match-text --observation-id $obsId --contains "alpha"
 Check "P14 match-text finds the OCR/UIA label" (@($mt.matches).Count -ge 1) "matches=$(@($mt.matches).Count)"
 
 $shot = [string]$fast.screenshot.path
-$btn = @($fast.elements | Where-Object { $_.text -eq "AppendMark" -and $_.provenance -ne "uia" }) | Select-Object -First 1
+$btn = @($fast.elements | Where-Object { $_.text -eq "AppendMark" }) | Select-Object -First 1
 $tpl = Join-Path $env:CUA_DATA_DIR "append-template.png"
 if ($btn -and (Test-Path $shot)) {
     Add-Type -AssemblyName System.Drawing
@@ -145,24 +163,34 @@ if ($btn -and (Test-Path $shot)) {
 if ($btn) {
     $fresh = J (RunCua state --window $W --perception hybrid --detail fast --deadline-ms 10000)
     $freshId = [string]$fresh.observation_id
-    $freshBtn = @($fresh.elements | Where-Object { $_.text -eq "AppendMark" -and $_.provenance -ne "uia" }) | Select-Object -First 1
-    if ($freshBtn) {
+    $pick = PickVisualRow $fresh
+    $freshSwatch = $pick.element
+    $rowName = $pick.row
+    if ($freshSwatch) {
+        $fr = $freshSwatch.rect_px
+        $fs = if ($fresh.frame.pixel_scale) { [double]$fresh.frame.pixel_scale } else { 1.0 }
+        $wantX = [int][Math]::Round($fresh.frame.screen_origin[0] + ($fr[0] + $fr[2] / 2) * $fs)
+        $wantY = [int][Math]::Round($fresh.frame.screen_origin[1] + ($fr[1] + $fr[3] / 2) * $fs)
         & $cua activate --window $W | Out-Null
-        Start-Sleep -Milliseconds 500
-        $click = J (RunCua perception click-element --observation-id $freshId --element-id $freshBtn.element_id)
-        Check "P17 visual click is guarded and dispatched" (
-            $click.status -eq "ok" -and $click.dispatched -eq $true -and $click.method -match "freshness/hit-test"
-        ) "$($click.method)"
+        Start-Sleep -Milliseconds 400
+        $click = J (RunCua perception click-element --observation-id $freshId --element-id $freshSwatch.element_id)
+        $afterClick = J (RunCua state --window $W --no-shot)
+        $redRow = @($afterClick.nodes | Where-Object { $_.type -eq "ListItem" -and $_.name -eq $rowName }) | Select-Object -First 1
+        Check "P17 visual click is guarded, DPI-scaled and lands" (
+            $click.status -eq "ok" -and $click.dispatched -eq $true -and $click.method -match "freshness/hit-test" -and
+            [Math]::Abs($click.point[0] - $wantX) -le 1 -and [Math]::Abs($click.point[1] - $wantY) -le 1 -and
+            $redRow.selected -eq $true
+        ) "method=$($click.method) point=$($click.point -join ',') want=$wantX,$wantY selected=$($redRow.selected)"
         Start-Sleep -Milliseconds 5200
-        $stale = RunErr perception click-element --observation-id $freshId --element-id $freshBtn.element_id
+        $stale = RunErr perception click-element --observation-id $freshId --element-id $freshSwatch.element_id
         Check "P18 stale frame visual click is refused" ($stale -match "stale") "$stale"
     } else {
-        Check "P17 visual click is guarded and dispatched" $false "fresh visual AppendMark missing"
-        Check "P18 stale frame visual click is refused" $false "fresh visual AppendMark missing"
+        Check "P17 visual click is guarded, DPI-scaled and lands" $false "fresh visual swatch missing"
+        Check "P18 stale frame visual click is refused" $false "fresh visual swatch missing"
     }
 } else {
-    Check "P17 visual click is guarded and dispatched" $false "no visual AppendMark"
-    Check "P18 stale frame visual click is refused" $false "no visual AppendMark"
+    Check "P17 visual click is guarded, DPI-scaled and lands" $false "no visual swatch"
+    Check "P18 stale frame visual click is refused" $false "no visual swatch"
 }
 
 $streamOut = RunCua state --window $W --perception hybrid --detail fast --stream --deadline-ms 10000
@@ -221,6 +249,76 @@ $easy = J (RunCua state --window $W --perception hybrid --detail fast --ocr-prof
 Check "P27 EasyOCR reference backend runs" (
     $easy.stages.ocr.status -eq "complete" -and $easy.perception.backend.ocr -match "easyocr"
 ) "ocr=$($easy.stages.ocr.status) backend=$($easy.perception.backend.ocr)"
+
+# ---------- incremental reuse, redaction, stored-observation rendering, install groups ----------
+$cached = $null
+for ($k = 0; $k -lt 3; $k++) {
+    $cached = J (RunCua state --window $W --perception hybrid --detail fast --deadline-ms 10000)
+    if ($cached.stages.ocr.cache_hit -eq $true) { break }
+}
+Check "P30 unchanged frame reuses the visual build" (
+    $cached.stages.ocr.cache_hit -eq $true -and $cached.stages.detector.cache_hit -eq $true -and
+    @($cached.elements).Count -ge 3 -and $cached.perception.backend.ocr -match "paddle"
+) "cache=$($cached.stages.ocr.cache_hit) ocr=$($cached.perception.backend.ocr) elements=$(@($cached.elements).Count)"
+
+$red = J (RunCua state --window $W --perception hybrid --detail fast --redact --deadline-ms 10000)
+$leaks = @($red.elements | Where-Object { $_.text -and $_.text -ne "***" })
+Check "P31 redact masks recognised text" (
+    $red.stages.caption.status -eq "skipped" -and $leaks.Count -eq 0 -and @($red.elements).Count -ge 3
+) "caption=$($red.stages.caption.status) leaks=$($leaks.Count)"
+
+$vizObs = Join-Path $env:CUA_DATA_DIR "obs-render.png"
+$vr = J (RunCua perception visualize --observation-id $obsId --out $vizObs)
+Check "P32 visualize renders a stored observation without re-parsing" (
+    (Test-Path $vizObs) -and (Test-Path ([IO.Path]::ChangeExtension($vizObs, "json"))) -and
+    $vr.source -like "observation:*" -and $vr.counts.total -ge 3
+) "source=$($vr.source) total=$($vr.counts.total)"
+
+$core = J (RunCua perception models install --accept-license --groups core)
+$coreEntries = @($core.installed).Count + @($core.skipped).Count
+Check "P33 install --groups core excludes the EasyOCR reference" (
+    $core.ok -eq $true -and (@($core.groups) -contains "core") -and $coreEntries -eq 8
+) "groups=$(@($core.groups) -join ',') entries=$coreEntries"
+
+# ---------- background (occluded) perception and message-level visual click ----------
+$cover = "title:CuaPercCover"
+& $cua launch --exe $testpad --args "--title CuaPercCover" | Out-Null
+& $cua wait --window $cover --timeout-ms 6000 | Out-Null
+$w1 = (J (RunCua state --window $W --no-shot)).window.rect
+& $cua resize --window $cover --x $w1[0] --y $w1[1] --width ($w1[2] + 40) --height ($w1[3] + 60) | Out-Null
+& $cua activate --window $cover | Out-Null
+& $cua wait --window $cover --foreground --timeout-ms 2500 | Out-Null
+Start-Sleep -Milliseconds 300
+$w1Hwnd = [int64](J (RunCua state --window $W --no-shot)).window.hwnd
+$fgBefore = (J (RunCua apps)).foreground_hwnd
+$bg = J (RunCua state --window $W --perception hybrid --detail fast --deadline-ms 10000)
+$bgVisual = @($bg.elements | Where-Object { $_.provenance -ne "uia" })
+Check "P28 occluded window still parses in the background" (
+    $bg.frame.capture_status -eq "captured" -and $bg.frame.rendered -eq $true -and
+    $bg.stages.ocr.status -eq "complete" -and $bg.stages.detector.status -eq "complete" -and
+    $bgVisual.Count -ge 3
+) "capture=$($bg.frame.capture_status) rendered=$($bg.frame.rendered) ocr=$($bg.stages.ocr.status) visual=$($bgVisual.Count)"
+$bgPick = PickVisualRow $bg @($rowName)
+$bgSwatch = $bgPick.element
+$bgRowName = $bgPick.row
+if ($bgSwatch) {
+    $br = $bgSwatch.rect_px
+    $bs = if ($bg.frame.pixel_scale) { [double]$bg.frame.pixel_scale } else { 1.0 }
+    $wantX = [int][Math]::Round($bg.frame.screen_origin[0] + ($br[0] + $br[2] / 2) * $bs)
+    $wantY = [int][Math]::Round($bg.frame.screen_origin[1] + ($br[1] + $br[3] / 2) * $bs)
+    $bc = J (RunCua perception click-element --observation-id $bg.observation_id --element-id $bgSwatch.element_id --background)
+    Start-Sleep -Milliseconds 500
+    $afterBg = J (RunCua state --window $W --no-shot)
+    $fgAfter = (J (RunCua apps)).foreground_hwnd
+    $greenRow = @($afterBg.nodes | Where-Object { $_.type -eq "ListItem" -and $_.name -eq $bgRowName }) | Select-Object -First 1
+    Check "P29 background visual click lands without focus change" (
+        $bc.status -eq "ok" -and $bc.method -match "message-level" -and
+        [Math]::Abs($bc.point[0] - $wantX) -le 1 -and [Math]::Abs($bc.point[1] - $wantY) -le 1 -and
+        $greenRow.selected -eq $true -and $fgAfter -ne $w1Hwnd
+    ) "method=$($bc.method) point=$($bc.point -join ',') want=$wantX,$wantY selected=$($greenRow.selected) fg=$fgBefore->$fgAfter target=$w1Hwnd"
+} else {
+    Skip "P29 background visual click lands without focus change" "no visual element inside a list row"
+}
 
 taskkill /IM testpad.exe /F 2>$null | Out-Null
 if ($ownData -and $env:CUA_E2E_CLEAN -eq "1") { Remove-Item -Recurse -Force $env:CUA_DATA_DIR -ErrorAction SilentlyContinue }

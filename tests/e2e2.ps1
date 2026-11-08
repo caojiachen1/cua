@@ -42,7 +42,7 @@ Get-ChildItem (Join-Path $dataRoot "recordings") -Filter *.jsonl -ErrorAction Si
 Start-Sleep -Milliseconds 800
 
 # ---------- fixture ----------
-& $cua launch --exe $testpad | Out-Null
+& $cua launch --exe $testpad --foreground | Out-Null
 Start-Sleep -Seconds 2
 $st = J (RunCua state --window "CuaTestPad")
 $edit = $st.nodes | Where-Object { $_.type -eq "Edit" } | Select-Object -First 1

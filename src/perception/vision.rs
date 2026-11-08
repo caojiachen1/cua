@@ -252,7 +252,10 @@ impl FlorenceBackend {
         }
     }
 
-    fn decode(&mut self, ids: &[i64], hidden: &[f32], batch: usize) -> Result<Vec<f32>> {
+    /// Decode one step. Only the logits for `step` are copied out of the
+    /// session output; the full [batch, seq, vocab] tensor stays in the
+    /// runtime buffer instead of being copied and then thrown away.
+    fn decode(&mut self, ids: &[i64], hidden: &[f32], batch: usize, step: usize, seq: usize) -> Result<Vec<f32>> {
         match self {
             Self::Ort { dec, .. } => {
                 let id_tensor = ort::value::Tensor::from_array((
@@ -271,7 +274,16 @@ impl FlorenceBackend {
                 let (_, data) = outputs[0]
                     .try_extract_tensor::<f32>()
                     .map_err(|e| anyhow!("ORT decoder output: {e}"))?;
-                Ok(data.to_vec())
+                let vocab = data.len() / (batch * seq);
+                if vocab == 0 {
+                    bail!("Florence decoder returned an empty vocabulary");
+                }
+                let mut rows = Vec::with_capacity(batch * vocab);
+                for row in 0..batch {
+                    let off = (row * seq + step) * vocab;
+                    rows.extend_from_slice(&data[off..off + vocab]);
+                }
+                Ok(rows)
             }
             Self::Tract { dec, .. } => {
                 let id_tensor = tract_onnx::prelude::Tensor::from_shape(
@@ -282,7 +294,17 @@ impl FlorenceBackend {
                     tract_onnx::prelude::Tensor::from_shape(&[batch, 13, 768], hidden)?;
                 let out = dec.run(tvec!(id_tensor.into(), h_tensor.into()))?;
                 let arr = out[0].to_array_view::<f32>()?;
-                Ok(arr.as_slice().unwrap().to_vec())
+                let data = arr.as_slice().unwrap();
+                let vocab = data.len() / (batch * seq);
+                if vocab == 0 {
+                    bail!("Florence decoder returned an empty vocabulary");
+                }
+                let mut rows = Vec::with_capacity(batch * vocab);
+                for row in 0..batch {
+                    let off = (row * seq + step) * vocab;
+                    rows.extend_from_slice(&data[off..off + vocab]);
+                }
+                Ok(rows)
             }
         }
     }
@@ -379,8 +401,11 @@ fn ort_session_pair(
             .map_err(|e| anyhow!("ORT session builder: {e}"))?;
         if gpu {
             b = b
-                .with_execution_providers([ort::ep::DirectML::default().with_device_id(0).build()])
-                .map_err(|e| anyhow!("ORT DirectML: {e}"))?;
+                .with_execution_providers([ort::ep::DirectML::default()
+                    .with_device_id(0)
+                    .build()
+                    .error_on_failure()])
+                .map_err(|e| anyhow!("ORT DirectML registration: {e}"))?;
         }
         b.commit_from_file(path)
             .map_err(|e| anyhow!("ORT load {}: {e}", path.display()))
@@ -499,8 +524,8 @@ impl Captioner {
                 if done.iter().all(|v| *v) {
                     break;
                 }
-                let logits = self.backend.decode(&ids, &hidden, batch)?;
-                let vocab = logits.len() / (batch * seq);
+                let logits = self.backend.decode(&ids, &hidden, batch, step, seq)?;
+                let vocab = logits.len() / batch;
                 if vocab == 0 {
                     bail!("Florence decoder returned an empty vocabulary");
                 }
@@ -508,8 +533,7 @@ impl Captioner {
                     if done[row] {
                         continue;
                     }
-                    let offset = (row * seq + step) * vocab;
-                    let row_logits = &logits[offset..offset + vocab];
+                    let row_logits = &logits[row * vocab..(row + 1) * vocab];
                     let best = best_token(row_logits, &generated[row]);
                     if best == CAPTION_EOS {
                         done[row] = true;

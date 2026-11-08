@@ -80,6 +80,9 @@ if (-not (Test-Path $qqExe)) {
         $btn = $st.nodes | Where-Object { $_.type -eq "Button" -and ($_.name -eq "播放" -or $_.name -eq "暂停") } | Select-Object -First 1
         Check "A4 play/pause button found by name" ($null -ne $btn) "nodes=$($st.node_count)"
         Check "A5 provider exposes no runtime id" (@($btn.rid).Count -eq 0) "rid=$($btn.rid -join ',')"
+        & $cua activate --window $W | Out-Null
+        & $cua wait --window $W --foreground --timeout-ms 3000 | Out-Null
+        Start-Sleep -Milliseconds 300
         $before = $btn.name
         $c = J (RunCua click --window $W --index $btn.i)
         Check "A6 click --index falls back to the cached rect" ($c.status -eq "ok" -and $c.detail -like "*no runtime id*") "$($c.detail)"

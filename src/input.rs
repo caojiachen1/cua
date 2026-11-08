@@ -465,8 +465,10 @@ unsafe extern "system" fn find_edit_cb(hwnd: HWND, lparam: windows::Win32::Found
 
 /// The child window that should receive mouse messages for a screen point
 /// (shared by post_click / post_scroll / post_drag / post_type_at_point).
+/// Client coordinates are divided by the window's DPI virtualization factor:
+/// an unaware window reads lParam in its own 96-DPI space.
 fn child_at_point(top: HWND, x: i32, y: i32) -> (HWND, i32, i32) {
-    unsafe {
+    let (target, cx, cy) = unsafe {
         let mut pt = windows::Win32::Foundation::POINT { x, y };
         let _ = ScreenToClient(top, &mut pt);
         let child = ChildWindowFromPointEx(top, pt, CWP_SKIPINVISIBLE);
@@ -477,6 +479,12 @@ fn child_at_point(top: HWND, x: i32, y: i32) -> (HWND, i32, i32) {
         } else {
             (top, pt.x, pt.y)
         }
+    };
+    let scale = crate::win::frame_scale(target);
+    if scale <= 1.0 {
+        (target, cx, cy)
+    } else {
+        (target, (cx as f32 / scale).round() as i32, (cy as f32 / scale).round() as i32)
     }
 }
 
@@ -598,8 +606,14 @@ pub fn post_scroll(top: HWND, x: i32, y: i32, dx: i32, dy: i32) -> Result<()> {
     }
     let (target, _, _) = child_at_point(top, x, y);
     // Wheel messages carry screen coordinates in lParam (unlike the button
-    // messages above), so keep the point the caller supplied.
-    let lp = ((y as isize) << 16) | (x as isize & 0xFFFF);
+    // messages above); a DPI-unaware window reads them in its virtualized space.
+    let scale = crate::win::frame_scale(target);
+    let (sx, sy) = if scale > 1.0 {
+        ((x as f32 / scale).round() as i32, (y as f32 / scale).round() as i32)
+    } else {
+        (x, y)
+    };
+    let lp = ((sy as isize) << 16) | (sx as isize & 0xFFFF);
     for (horizontal, data) in wheel_events(dx, dy) {
         let wp = ((data as usize) << 16) | 0; // delta<<16, no keys
         post(
@@ -616,12 +630,17 @@ pub fn post_scroll(top: HWND, x: i32, y: i32, dx: i32, dy: i32) -> Result<()> {
 /// Message-level drag: button down, interpolated moves with button held, button up.
 pub fn post_drag(top: HWND, x1: i32, y1: i32, x2: i32, y2: i32) -> Result<()> {
     let (target, cx1, cy1) = child_at_point(top, x1, y1);
+    let scale = crate::win::frame_scale(target);
     let to_client = |x: i32, y: i32| -> (i32, i32) {
         let mut p = windows::Win32::Foundation::POINT { x, y };
         unsafe {
             let _ = ScreenToClient(target, &mut p);
         }
-        (p.x, p.y)
+        if scale > 1.0 {
+            ((p.x as f32 / scale).round() as i32, (p.y as f32 / scale).round() as i32)
+        } else {
+            (p.x, p.y)
+        }
     };
     let lp = ((cy1 as isize) << 16) | (cx1 as isize & 0xFFFF);
     post(target, WM_MOUSEMOVE, 0, lp, "WM_MOUSEMOVE")?;

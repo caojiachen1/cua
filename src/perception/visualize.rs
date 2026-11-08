@@ -53,23 +53,36 @@ pub fn analyze(
     let mut detector_backend = String::new();
     let mut caption_backend = String::new();
 
-    match AnyOcr::load(profile) {
-        Ok(mut ocr) => {
-            ocr_backend = ocr.backend().to_string();
-            match ocr.recognize(width, height, rgba) {
-                Ok(lines) => ocr_lines = lines,
-                Err(e) => warnings.push(format!("ocr: {e:#}")),
-            }
+    // Same shape as the live pipeline: load both, then run both concurrently.
+    let (ocr_res, det_res) = std::thread::scope(|scope| {
+        let ocr = scope.spawn(|| {
+            let mut engine = AnyOcr::load(profile)?;
+            let backend = engine.backend().to_string();
+            let lines = engine.recognize(width, height, rgba)?;
+            Ok::<_, anyhow::Error>((backend, lines))
+        });
+        let det = scope.spawn(|| {
+            let detector = Detector::load()?;
+            let backend = detector.backend().to_string();
+            let items = detector.detect(width, height, rgba)?;
+            Ok::<_, anyhow::Error>((backend, items))
+        });
+        (
+            ocr.join().unwrap_or_else(|_| Err(anyhow!("OCR worker panicked"))),
+            det.join().unwrap_or_else(|_| Err(anyhow!("detector worker panicked"))),
+        )
+    });
+    match ocr_res {
+        Ok((backend, lines)) => {
+            ocr_backend = backend;
+            ocr_lines = lines;
         }
         Err(e) => warnings.push(format!("ocr: {e:#}")),
     }
-    match Detector::load() {
-        Ok(det) => {
-            detector_backend = det.backend().to_string();
-            match det.detect(width, height, rgba) {
-                Ok(items) => det_items = items,
-                Err(e) => warnings.push(format!("detector: {e:#}")),
-            }
+    match det_res {
+        Ok((backend, items)) => {
+            detector_backend = backend;
+            det_items = items;
         }
         Err(e) => warnings.push(format!("detector: {e:#}")),
     }

@@ -135,6 +135,33 @@ pub fn dpi_scale(hwnd: HWND) -> f32 {
     if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 }
 }
 
+/// DWM renders a DPI-unaware window at its own DPI (96) inside a
+/// physical-pixel surface, so PrintWindow frames are smaller than window
+/// pixels by this factor. 1.0 for every DPI-aware window, including windows on
+/// a monitor whose DPI differs from the system DPI.
+pub fn frame_scale(hwnd: HWND) -> f32 {
+    use windows::Win32::UI::HiDpi::{
+        AreDpiAwarenessContextsEqual, GetDpiForSystem, GetDpiForWindow,
+        GetWindowDpiAwarenessContext, DPI_AWARENESS_CONTEXT_UNAWARE,
+        DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED,
+    };
+    unsafe {
+        let ctx = GetWindowDpiAwarenessContext(hwnd);
+        let unaware = AreDpiAwarenessContextsEqual(ctx, DPI_AWARENESS_CONTEXT_UNAWARE).as_bool()
+            || AreDpiAwarenessContextsEqual(ctx, DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED).as_bool();
+        if !unaware {
+            return 1.0;
+        }
+        let win_dpi = GetDpiForWindow(hwnd);
+        let sys_dpi = GetDpiForSystem();
+        if win_dpi == 0 || sys_dpi == 0 {
+            return 1.0;
+        }
+        let s = sys_dpi as f32 / win_dpi as f32;
+        if s.is_finite() && (1.0..=4.0).contains(&s) { s } else { 1.0 }
+    }
+}
+
 pub fn window_rect(hwnd: HWND) -> Result<[i32; 4]> {
     unsafe {
         let mut r = RECT::default();
@@ -338,6 +365,185 @@ fn pick(mut cands: Vec<WinInfo>, sel: &str) -> Result<HWND> {
 }
 
 // ---- activation ----
+
+thread_local! {
+    static FOUND_PID_WND: std::cell::Cell<isize> = std::cell::Cell::new(0);
+}
+
+/// Root pid plus every process created under it. Launchers (notepad.exe's stub,
+/// Electron helpers) own the real window from a child process.
+fn pid_family(root: u32) -> Vec<u32> {
+    let mut parents: Vec<(u32, u32)> = Vec::new();
+    unsafe {
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return vec![root];
+        };
+        let mut e = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        if Process32FirstW(snap, &mut e).is_ok() {
+            loop {
+                parents.push((e.th32ProcessID, e.th32ParentProcessID));
+                if Process32NextW(snap, &mut e).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = windows::Win32::Foundation::CloseHandle(snap);
+    }
+    let mut family = vec![root];
+    let mut i = 0;
+    while i < family.len() {
+        let cur = family[i];
+        for (pid, ppid) in &parents {
+            if *ppid == cur && !family.contains(pid) {
+                family.push(*pid);
+            }
+        }
+        i += 1;
+    }
+    family
+}
+
+fn first_visible_window_of_pid(pid: u32) -> Option<HWND> {
+    unsafe extern "system" fn cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let pid = lparam.0 as u32;
+        let mut p = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut p));
+        if p == pid && IsWindowVisible(hwnd).as_bool() {
+            FOUND_PID_WND.with(|c| c.set(hwnd.0 as isize));
+            return BOOL(0);
+        }
+        BOOL(1)
+    }
+    FOUND_PID_WND.with(|c| c.set(0));
+    unsafe {
+        let _ = EnumWindows(Some(cb), LPARAM(pid as isize));
+    }
+    let raw = FOUND_PID_WND.with(|c| c.get());
+    if raw == 0 { None } else { Some(HWND(raw as *mut _)) }
+}
+
+/// Every existing top-level window handle. Used to spot windows that appear
+/// after a launch even when a broker (UWP/ApplicationFrameHost) owns them.
+pub fn top_level_hwnds() -> std::collections::HashSet<isize> {
+    unsafe extern "system" fn cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let set = &mut *(lparam.0 as *mut std::collections::HashSet<isize>);
+        set.insert(hwnd.0 as isize);
+        BOOL(1)
+    }
+    let mut set = std::collections::HashSet::new();
+    unsafe {
+        let _ = EnumWindows(Some(cb), LPARAM(&mut set as *mut _ as isize));
+    }
+    set
+}
+
+fn first_new_visible_window(
+    before: &std::collections::HashSet<isize>,
+    own_pid: u32,
+) -> Option<HWND> {
+    unsafe extern "system" fn cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let (before, own_pid, found) = &mut *(
+            lparam.0 as *mut (
+                &std::collections::HashSet<isize>,
+                u32,
+                Option<HWND>,
+            )
+        );
+        if found.is_some() {
+            return BOOL(0);
+        }
+        if before.contains(&(hwnd.0 as isize)) || !IsWindowVisible(hwnd).as_bool() {
+            return BOOL(1);
+        }
+        let mut p = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut p));
+        if p != *own_pid {
+            *found = Some(hwnd);
+            return BOOL(0);
+        }
+        BOOL(1)
+    }
+    let mut state = (before, own_pid, None);
+    unsafe {
+        let _ = EnumWindows(Some(cb), LPARAM(&mut state as *mut _ as isize));
+    }
+    state.2
+}
+
+/// Keep a just-started process out of the user's way: pin its first top-level
+/// window to the bottom of the z-order without activating it, and give the
+/// previous foreground window its focus back when the app raised itself
+/// anyway (WinUI/Electron apps ignore SW_SHOWNOACTIVATE).
+/// Returns (focus_restored, first_window).
+pub fn keep_launched_background(
+    pid: u32,
+    prev: HWND,
+    before: &std::collections::HashSet<isize>,
+    timeout: std::time::Duration,
+) -> (bool, Option<HWND>) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, HWND_BOTTOM, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
+    };
+    let started = std::time::Instant::now();
+    let min_watch = std::time::Duration::from_millis(900);
+    let settle = std::time::Duration::from_millis(400);
+    let mut restored = false;
+    let mut handled: Option<HWND> = None;
+    let mut last_steal: Option<std::time::Instant> = None;
+    let mut family = vec![pid];
+    let mut tick: u32 = 0;
+    while started.elapsed() < timeout {
+        if tick % 10 == 0 {
+            family = pid_family(pid);
+        }
+        tick += 1;
+        let own_pid = std::process::id();
+        let found = family
+            .iter()
+            .find_map(|p| first_visible_window_of_pid(*p))
+            .or_else(|| first_new_visible_window(before, own_pid));
+        if let Some(h) = found {
+            if handled != Some(h) {
+                handled = Some(h);
+                unsafe {
+                    let _ = SetWindowPos(
+                        h,
+                        HWND_BOTTOM,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+                    );
+                }
+            }
+            let fg = unsafe { GetForegroundWindow() };
+            if !prev.is_invalid() && fg != prev {
+                let mut fpid = 0u32;
+                unsafe { GetWindowThreadProcessId(fg, Some(&mut fpid)); }
+                let mut hpid = 0u32;
+                unsafe { GetWindowThreadProcessId(h, Some(&mut hpid)); }
+                if family.contains(&fpid) || fpid == hpid || fg == h {
+                    last_steal = Some(std::time::Instant::now());
+                    if matches!(activate_window(prev), Ok(true)) {
+                        restored = true;
+                    }
+                }
+            }
+        }
+        // early exit once the app has stopped grabbing focus for a while;
+        // slow starters (Blender) keep the watcher alive past the first frame
+        let quiet = last_steal.map(|t| t.elapsed() >= settle).unwrap_or(true);
+        if started.elapsed() >= min_watch && quiet {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(12));
+    }
+    (restored, handled)
+}
 
 pub fn activate_window(hwnd: HWND) -> Result<bool> {
     use windows::Win32::UI::Input::KeyboardAndMouse::{keybd_event, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_MENU};

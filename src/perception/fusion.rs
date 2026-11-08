@@ -59,61 +59,62 @@ fn icon_elems(dets: &[DetItem]) -> Vec<FusedIcon> {
 ///  - an icon inside an OCR box is dropped entirely
 ///  - content-bearing icons sort before unlabeled icons
 pub fn fuse_boxes(dets: &[DetItem], ocr: &[OcrItem], overlap_threshold: f32) -> VisualBuild {
-    let mut texts: Vec<OcrItem> = ocr.to_vec();
-    let mut icons = icon_elems(dets);
-    let mut kept: Vec<FusedIcon> = Vec::new();
-    for (i, icon) in icons.iter().enumerate() {
-        let mut valid = true;
-        for (j, other) in icons.iter().enumerate() {
+    let icons = icon_elems(dets);
+    let mut drop_icon = vec![false; icons.len()];
+    // Pass 1: overlapping duplicates keep the smaller, tighter box.
+    for i in 0..icons.len() {
+        for j in 0..icons.len() {
             if i == j {
                 continue;
             }
-            if icon.rect.overlap(&other.rect) > overlap_threshold
-                && icon.rect.area() > other.rect.area()
+            if icons[i].rect.overlap(&icons[j].rect) > overlap_threshold
+                && icons[i].rect.area() > icons[j].rect.area()
             {
-                valid = false;
+                drop_icon[i] = true;
                 break;
             }
         }
-        if !valid {
-            continue;
+    }
+    // Pass 2: an icon sitting inside a larger OCR line is the line's content.
+    for (i, icon) in icons.iter().enumerate() {
+        if !drop_icon[i] && ocr.iter().any(|t| t.rect.contains_ratio(&icon.rect) > 0.80) {
+            drop_icon[i] = true;
         }
-        let mut labels: Vec<String> = Vec::new();
-        let mut drop_icon = false;
-        let mut idx = 0;
-        while idx < texts.len() {
-            let t = &texts[idx];
-            if icon.rect.contains_ratio(&t.rect) > 0.80 {
-                labels.push(t.text.clone());
-                let conf = t.confidence;
-                texts.remove(idx);
-                if let Some(fi) = kept.last_mut() {
-                    let _ = fi;
-                }
-                // attach confidence below through the icon clone
-                let _ = conf;
-            } else if t.rect.contains_ratio(&icon.rect) > 0.80 {
-                drop_icon = true;
-                break;
-            } else {
-                idx += 1;
-            }
-        }
-        if drop_icon {
+    }
+    // Pass 3: attach labels without consuming the source list, so an icon that
+    // is dropped later can never take its OCR text down with it.
+    let mut taken = vec![false; ocr.len()];
+    let mut kept: Vec<FusedIcon> = Vec::new();
+    for (i, icon) in icons.iter().enumerate() {
+        if drop_icon[i] {
             continue;
         }
         let mut fi = icon.clone();
+        let mut labels: Vec<String> = Vec::new();
+        let mut confidence = None;
+        for (k, t) in ocr.iter().enumerate() {
+            if taken[k] || icon.rect.contains_ratio(&t.rect) <= 0.80 {
+                continue;
+            }
+            taken[k] = true;
+            labels.push(t.text.clone());
+            if confidence.is_none() {
+                confidence = t.confidence;
+            }
+        }
         if !labels.is_empty() {
             fi.text = Some(normalize(&labels.join(" ")));
-            fi.ocr_confidence = ocr
-                .iter()
-                .filter(|o| icon.rect.contains_ratio(&o.rect) > 0.80)
-                .filter_map(|o| o.confidence)
-                .next();
+            fi.ocr_confidence = confidence;
             fi.caption_status = "not_needed".into();
         }
         kept.push(fi);
     }
+    let texts: Vec<OcrItem> = ocr
+        .iter()
+        .enumerate()
+        .filter(|(k, _)| !taken[*k])
+        .map(|(_, t)| t.clone())
+        .collect();
     // Stable sort: content first, geometry as the deterministic tie-break.
     kept.sort_by(|a, b| {
         let ac = a.text.is_none() as u8;
@@ -134,7 +135,7 @@ pub fn fuse_boxes(dets: &[DetItem], ocr: &[OcrItem], overlap_threshold: f32) -> 
 
 /// Convert a UIA node into an immutable element. Only content-bearing leaves
 /// and interactive controls are published; huge containers are not evidence.
-pub fn uia_element(n: &Node, frame_id: &str, origin: [i32; 2]) -> Option<Element> {
+pub fn uia_element(n: &Node, frame_id: &str, origin: [i32; 2], scale: f32) -> Option<Element> {
     let name = n.name.trim();
     let has_value = n.value.as_deref().map(|v| !v.trim().is_empty()).unwrap_or(false);
     if name.is_empty() && !has_value && n.patterns.is_empty() {
@@ -159,7 +160,12 @@ pub fn uia_element(n: &Node, frame_id: &str, origin: [i32; 2]) -> Option<Element
     Some(Element {
         element_id: format!("uia:{frame_id}:{}", n.i),
         kind: "uia".into(),
-        rect_px: [(n.rect[0] - origin[0]) as f32, (n.rect[1] - origin[1]) as f32, n.rect[2] as f32, n.rect[3] as f32],
+        rect_px: [
+            (n.rect[0] - origin[0]) as f32 / scale,
+            (n.rect[1] - origin[1]) as f32 / scale,
+            n.rect[2] as f32 / scale,
+            n.rect[3] as f32 / scale,
+        ],
         coordinate_space: "image_px".into(),
         text: if has_value { n.value.clone() } else if !name.is_empty() { Some(name.to_string()) } else { None },
         caption: None,
@@ -263,12 +269,16 @@ pub fn combine(uia: Vec<Element>, visual: Vec<Element>) -> Vec<Element> {
     let mut out = uia;
     for v in visual {
         let vr = Rect::new(v.rect_px[0], v.rect_px[1], v.rect_px[2], v.rect_px[3]);
-        let covered = out.iter().any(|u| {
+        if let Some(u) = out.iter_mut().find(|u| {
             u.provenance == Source::Uia
                 && u.text.is_some()
                 && Rect::new(u.rect_px[0], u.rect_px[1], u.rect_px[2], u.rect_px[3]).iou(&vr) > 0.4
-        });
-        if covered {
+        }) {
+            // The UIA leaf wins the geometry, but a Florence caption is still
+            // evidence: keep it instead of discarding the visual element whole.
+            if u.caption.is_none() {
+                u.caption = v.caption.clone();
+            }
             continue;
         }
         out.push(v);
@@ -301,6 +311,22 @@ mod tests {
         let b = fuse_boxes(&det, &texts, 0.7);
         assert!(b.icons.is_empty());
         assert_eq!(b.texts.len(), 1);
+    }
+
+    #[test]
+    fn dropped_icon_keeps_its_text() {
+        // The icon sits inside a big OCR line (so it is dropped) and contains a
+        // smaller label of its own: the label must survive as standalone text.
+        let det = vec![DetItem { rect: Rect::new(10.0, 10.0, 20.0, 20.0), score: 0.9 }];
+        let texts = vec![
+            ocr([0.0, 0.0, 200.0, 100.0], "Header"),
+            ocr([12.0, 12.0, 12.0, 8.0], "Tag"),
+        ];
+        let b = fuse_boxes(&det, &texts, 0.7);
+        assert!(b.icons.is_empty());
+        let names: Vec<&str> = b.texts.iter().map(|t| t.text.as_str()).collect();
+        assert!(names.contains(&"Header"), "lost the containing line: {names:?}");
+        assert!(names.contains(&"Tag"), "lost the icon label: {names:?}");
     }
 
     #[test]

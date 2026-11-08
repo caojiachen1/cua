@@ -67,8 +67,15 @@ fn text_overlaps(a: &str, b: &str) -> bool {
     a == b || a.contains(&b) || b.contains(&a)
 }
 
-fn candidate_matches_node(v: &VisualCandidate, n: &Node, origin: [i32; 2]) -> bool {
-    let nr = Rect::from_i32([n.rect[0] - origin[0], n.rect[1] - origin[1], n.rect[2], n.rect[3]]);
+fn candidate_matches_node(v: &VisualCandidate, n: &Node, origin: [i32; 2], scale: f32) -> bool {
+    // UIA rects are physical screen pixels; frame rects are image pixels. On a
+    // DPI-virtualized window those differ by `scale`, so both factors apply.
+    let nr = Rect::new(
+        (n.rect[0] - origin[0]) as f32 / scale,
+        (n.rect[1] - origin[1]) as f32 / scale,
+        n.rect[2] as f32 / scale,
+        n.rect[3] as f32 / scale,
+    );
     if nr.is_empty() {
         return false;
     }
@@ -98,7 +105,9 @@ pub fn evaluate(
     capture: CaptureFacts,
     visual: &[VisualCandidate],
     origin: [i32; 2],
+    scale: f32,
 ) -> RegionQuality {
+    let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
     let mut child_count: HashMap<usize, usize> = HashMap::new();
     for n in nodes {
         if let Some(pa) = n.pa {
@@ -155,7 +164,7 @@ pub fn evaluate(
         let matched = visual
             .iter()
             .filter(|v| {
-                content.iter().any(|n| candidate_matches_node(v, n, origin))
+                content.iter().any(|n| candidate_matches_node(v, n, origin, scale))
             })
             .count();
         Some(matched as f32 / visual.len() as f32)
@@ -167,7 +176,12 @@ pub fn evaluate(
             .iter()
             .filter(|n| !n.offscreen)
             .fold(None::<Rect>, |acc, n| {
-                let r = Rect::from_i32([n.rect[0] - origin[0], n.rect[1] - origin[1], n.rect[2], n.rect[3]]);
+                let r = Rect::new(
+                    (n.rect[0] - origin[0]) as f32 / scale,
+                    (n.rect[1] - origin[1]) as f32 / scale,
+                    n.rect[2] as f32 / scale,
+                    n.rect[3] as f32 / scale,
+                );
                 if r.is_empty() {
                     acc
                 } else {
@@ -194,7 +208,7 @@ pub fn evaluate(
 /// coverage, capture may still be good. The router treats this as a visual
 /// candidate, not as a zero score.
 pub fn empty(capture: CaptureFacts) -> RegionQuality {
-    evaluate(&[], false, false, capture, &[], [0, 0])
+    evaluate(&[], false, false, capture, &[], [0, 0], 1.0)
 }
 
 #[cfg(test)]
@@ -227,7 +241,7 @@ mod tests {
     #[test]
     fn unknown_coverage_is_not_zero() {
         let nodes = vec![node(1, "Save", "Button", [10, 10, 80, 30], &[])];
-        let q = evaluate(&nodes, false, true, CaptureFacts { ok: true, rendered: true, fresh_known: true }, &[], [0, 0]);
+        let q = evaluate(&nodes, false, true, CaptureFacts { ok: true, rendered: true, fresh_known: true }, &[], [0, 0], 1.0);
         assert_eq!(q.coverage, None);
         assert!(q.readable > 0.0);
     }
@@ -240,9 +254,39 @@ mod tests {
         ];
         let mut a = nodes[1].clone();
         a.pa = Some(0);
-        let q = evaluate(&[nodes[0].clone(), a], false, true, CaptureFacts { ok: true, rendered: true, fresh_known: true }, &[], [0, 0]);
+        let q = evaluate(&[nodes[0].clone(), a], false, true, CaptureFacts { ok: true, rendered: true, fresh_known: true }, &[], [0, 0], 1.0);
         assert_eq!(q.leaf_count, 1);
         assert!((q.actionable - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn coverage_respects_dpi_scale() {
+        // Window is DPI-virtualized: frame pixels are screen pixels / 1.5.
+        let nodes = vec![node(1, "Save", "Button", [150, 150, 120, 45], &["Invoke"])];
+        let vis = vec![VisualCandidate {
+            rect: Rect::new(100.0, 100.0, 80.0, 30.0),
+            text: Some("Save".into()),
+        }];
+        let scaled = evaluate(
+            &nodes,
+            false,
+            true,
+            CaptureFacts { ok: true, rendered: true, fresh_known: true },
+            &vis,
+            [0, 0],
+            1.5,
+        );
+        assert_eq!(scaled.coverage, Some(1.0));
+        let unscaled = evaluate(
+            &nodes,
+            false,
+            true,
+            CaptureFacts { ok: true, rendered: true, fresh_known: true },
+            &vis,
+            [0, 0],
+            1.0,
+        );
+        assert_eq!(unscaled.coverage, Some(0.0));
     }
 
     #[test]
@@ -252,7 +296,7 @@ mod tests {
             VisualCandidate { rect: Rect::new(10.0, 10.0, 80.0, 30.0), text: Some("Save".into()) },
             VisualCandidate { rect: Rect::new(300.0, 300.0, 40.0, 20.0), text: Some("Canvas".into()) },
         ];
-        let q = evaluate(&nodes, false, false, CaptureFacts { ok: true, rendered: true, fresh_known: true }, &vis, [0, 0]);
+        let q = evaluate(&nodes, false, false, CaptureFacts { ok: true, rendered: true, fresh_known: true }, &vis, [0, 0], 1.0);
         assert!((q.coverage.unwrap() - 0.5).abs() < 1e-5);
     }
 }

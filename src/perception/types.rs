@@ -98,22 +98,32 @@ pub struct Stage {
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub elapsed_ms: Option<u64>,
+    /// Time spent loading the stage's model/session, reported separately so a
+    /// cold start is never mistaken for inference cost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cache_hit: bool,
 }
 
 impl Stage {
     pub fn pending(reason: impl Into<String>) -> Self {
-        Self { status: StageStatus::Pending, reason: Some(reason.into()), elapsed_ms: None, cache_hit: false }
+        Self { status: StageStatus::Pending, reason: Some(reason.into()), elapsed_ms: None, load_ms: None, cache_hit: false }
     }
     pub fn complete(elapsed_ms: u64) -> Self {
-        Self { status: StageStatus::Complete, reason: None, elapsed_ms: Some(elapsed_ms), cache_hit: false }
+        Self { status: StageStatus::Complete, reason: None, elapsed_ms: Some(elapsed_ms), load_ms: None, cache_hit: false }
+    }
+    pub fn complete_loaded(elapsed_ms: u64, load_ms: u64) -> Self {
+        Self { status: StageStatus::Complete, reason: None, elapsed_ms: Some(elapsed_ms), load_ms: Some(load_ms), cache_hit: false }
+    }
+    pub fn cached(reason: impl Into<String>) -> Self {
+        Self { status: StageStatus::Complete, reason: Some(reason.into()), elapsed_ms: Some(0), load_ms: Some(0), cache_hit: true }
     }
     pub fn skipped(reason: impl Into<String>) -> Self {
-        Self { status: StageStatus::Skipped, reason: Some(reason.into()), elapsed_ms: None, cache_hit: false }
+        Self { status: StageStatus::Skipped, reason: Some(reason.into()), elapsed_ms: None, load_ms: None, cache_hit: false }
     }
     pub fn failed(reason: impl Into<String>) -> Self {
-        Self { status: StageStatus::Failed, reason: Some(reason.into()), elapsed_ms: None, cache_hit: false }
+        Self { status: StageStatus::Failed, reason: Some(reason.into()), elapsed_ms: None, load_ms: None, cache_hit: false }
     }
     pub fn is_complete(&self) -> bool {
         self.status == StageStatus::Complete
@@ -214,6 +224,10 @@ pub struct Element {
     pub age_ms: Option<u64>,
 }
 
+fn one() -> f32 {
+    1.0
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FrameInfo {
     pub frame_id: String,
@@ -224,6 +238,9 @@ pub struct FrameInfo {
     /// window rectangle at capture time (physical pixels)
     pub window_rect: [i32; 4],
     pub dpi_scale: f32,
+    /// frame pixels -> window/screen pixels (1.0 unless the window is DPI-unaware)
+    #[serde(default = "one")]
+    pub pixel_scale: f32,
     pub capture_status: String,
     pub rendered: bool,
     pub captured_at: String,

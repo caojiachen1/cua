@@ -44,7 +44,9 @@ cua select-add --window App --index 4                   # multi-select: also sel
 cua ocr --window Notepad                                # local Windows OCR; also --screen/--file
 cua ocr --file "$env:TEMP\shot.png" --max-lines 50
 cua sandbox start --exe D:\app.exe                     # run and control on an invisible desktop
-cua launch --exe "C:\Windows\System32\msinfo32.exe" --cwd D:\    # env sanitized by default
+cua launch --exe "C:\Windows\System32\msinfo32.exe" --cwd D:\    # env sanitized; opens in the background
+cua launch --exe app.exe --foreground                   # opt in to raising the new window
+cua launch --exe app.exe --minimized                    # start minimized, still no focus change
 cua rec start --fps 2 --out session                    # record the screen while you work
 cua rec stop                                           # -> mp4 with ffmpeg, else an HTML player
 cua rec cancel                                         # force-stop a stuck recorder, keep frames
@@ -89,26 +91,48 @@ cua state --window App --perception hybrid --detail full     # captions for unla
 cua state --window App --perception uia --no-shot            # no capture, no inference
 cua state --window App --perception auto --stream            # partial fast snapshot + final revision
 cua perception visualize --image shot.png --detail full      # annotated PNG + JSON sidecar
+cua perception visualize --observation-id <id> --out obs.png # render what the agent actually saw
 cua perception visualize --window App --out parsed.png       # capture, parse, annotate
-cua perception models install --accept-license                # ~1.5GB from ModelScope
+cua perception models install --accept-license                # core + reference assets
+cua perception models install --accept-license --groups core  # OCR + detector + caption only
 cua perception models verify --deep
 cua perception match-text --observation-id <id> --contains "Save"
 cua perception match-template --observation-id <id> --template .\icon.png
 cua perception watch-template --window App --template .\icon.png --confirm-frames 2
 cua perception click-element --observation-id <id> --element-id "vision:..."
+cua perception click-element --observation-id <id> --element-id "vision:..." --background
 ```
+
+`state --perception ... --redact` masks every recognised string with `***`, mosaics the text
+regions in the saved PNG and skips captions, so an observation can be kept or shared without
+the screen's content. Stage timings report `load_ms` apart from `elapsed_ms`, and an unchanged
+frame (same UIA signature, same sampled pixel hash, same OCR profile) reuses the previous
+visual build with `cache_hit` instead of re-running OCR/detection; set `CUA_PERCEPTION_CACHE=0`
+to disable that. `perception visualize --observation-id <id>` re-renders a stored observation
+without re-parsing, so the picture matches the elements the agent was given. `click-element`
+passes the same policy gate as every other action.
 
 `auto` evaluates reading/locating/actionability/coverage/capture per region. A permission
 denial stays terminal (vision never bypasses it); a bad capture does not invalidate a usable
 UIA tree. Visual elements carry `rect_px`, provenance and separate confidences; an empty
 `target.channels` means unknown, not permission. Visual clicks require a screenshot younger
-than 5 s, unchanged window geometry and a hit test, and still report `verified: false`.
+than 5 s and unchanged window geometry; a foreground click also needs a hit test, while
+`--background` posts WM_* mouse messages to the target (no focus change, works while the
+window is occluded). Both still report `verified: false`.
+
+Capture is PrintWindow-based, so an occluded or background window parses the same way as a
+foreground one. A DPI-unaware window renders at its own DPI inside a physical-size surface,
+so its frame is smaller than its window; observations carry `frame.pixel_scale` and every
+`rect_px` stays in frame space, which the click and template paths convert back to screen
+pixels.
 
 The runtime assets are downloaded from four public ModelScope repos:
 `cjc1887415157/yolov9e`, `cjc1887415157/florence2-caption`,
 `cjc1887415157/ppocr-v4`, and `cjc1887415157/easyocr-en-reference`, with
 `cua perception models install --accept-license` (about 1.6GB), and checked by
-`cua perception models verify --deep`. `tools\install-models.ps1`
+`cua perception models verify --deep`. `toolsench-perception.ps1` scores OCR recall and
+latency on the built-in fixture (or a `-Manifest` of images + expected strings), so accuracy
+claims can be re-run instead of eyeballed. `tools\install-models.ps1`
 can instead copy a locally prepared model directory. The offline exporter
 `tools/dev/export_omni_onnx.py` is a development tool only; it produces the fixed
 ONNX/Burn assets from the official TorchScript/Florence weights. Florence uses a fixed B=8 graph for dense icon sets; set

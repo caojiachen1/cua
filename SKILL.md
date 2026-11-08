@@ -29,7 +29,8 @@ After building cua, **ask the user once** before enabling the perception models:
 If the user agrees, run:
 
 ```powershell
-cua perception models install --accept-license
+cua perception models install --accept-license              # core + optional reference
+cua perception models install --accept-license --groups core # OCR/detector/caption only
 cua perception models verify --deep
 ```
 
@@ -72,7 +73,12 @@ cua grounding --window <sel> --query "加粗"        # local UIA grounding (Trae
 cua ocr --window <sel> [--max-lines 200]          # legacy Windows OCR; also --screen / --file
 # perception parser: PaddleOCR default, then YOLOv9-E icons + Florence-2 captions
 cua state --window <sel> --perception auto --detail fast
+cua state --window <sel> --perception vision --detail fast       # works occluded, no focus change
+cua perception click-element --observation-id <id> --element-id "vision:..." --background
 cua perception visualize --image shot.png --detail full --out annotated.png
+cua perception visualize --observation-id <id> --out obs.png  # exact elements the agent saw
+toolsench-perception.ps1 [-Manifest set.json]               # OCR recall + latency, repeatable
+cua state --window <sel> --perception hybrid --redact        # mask text + blur pixels
 
 # state_id is an immutable obs-<id>.json; shot only refreshes the coordinate guard,
 # and index actions resolve against the latest element observation.
@@ -152,8 +158,10 @@ cua transform --window W --index N                       # report can_move / can
 cua transform --window W --index N --move-to "x,y" [--size "w,h"] [--zoom N]
 cua realize --window W --index N                         # VirtualizedItem: materialize a list item
 cua clipboard set --text "..." | cua clipboard get
-cua launch --exe notepad.exe [--args "--flag x"] [--cwd DIR] [--no-clean-env]
-cua open --name calc    # .exe targets launch directly (sanitized env), others use ShellExecute
+cua launch --exe notepad.exe [--args "--flag x"] [--cwd DIR] [--no-clean-env]  # opens in the background
+cua launch --exe app.exe --foreground                    # opt in to raising the new window
+cua launch --exe app.exe --minimized                     # start minimized (also never steals focus)
+cua open --name calc    # .exe targets launch directly (sanitized env), others use ShellExecute; background by default
 cua activate|minimize|maximize|restore|close --window W  # close needs --confirm
 cua resize --window W [--width --height --x --y]        # SetWindowPos, no focus change
 cua batch --file steps.json                             # [[cmd,args...],...] (Trae batch)
@@ -193,8 +201,15 @@ name+type in a fresh walk and act on its current rectangle — the receipt says
 `no runtime id; re-located '<name>'`, or `cached rect (unnamed element)` — and refuse the
 action rather than clicking a stale position when the element is gone. Pattern actions
 (`set-value`, `toggle`, `get-value`) cannot target such nodes; the error says so.
+Observations cache the visual build for an unchanged frame (`stages.*.cache_hit`); set
+`CUA_PERCEPTION_CACHE=0` to force a fresh run. Stage `load_ms` is model load, `elapsed_ms`
+is inference. `perception click-element` goes through the same policy gate as `click`.
 Message-level `click --background` does reach these apps, so prefer it when the window
-cannot be raised. `type`/`key` without `--background` need the target to be foreground and
+cannot be raised; `perception click-element --background` does the same for visual elements
+(a `vision:*` id from an observation), so an occluded window can be parsed and clicked
+without taking focus. An observation older than 5 s is refused — re-observe instead of
+retrying the same element id. Observations on a DPI-unaware window carry `frame.pixel_scale`; keep
+`rect_px` in frame space and let cua convert to screen pixels. `type`/`key` without `--background` need the target to be foreground and
 **refuse outright** when `SetForegroundWindow` is blocked by focus-steal protection —
 otherwise the keystrokes would silently land in whatever the user has focused. Coordinate
 clicks (`--x/--y`, `drag`, `scroll`, and the rectangle fallback above) move the real cursor,

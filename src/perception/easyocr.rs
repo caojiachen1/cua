@@ -21,6 +21,52 @@ fn load_session(path: &std::path::Path) -> Result<Session> {
         .map_err(|e| anyhow!("EasyOCR load {}: {e}", path.display()))
 }
 
+/// Recognizer canvas height: EasyOCR always resizes crops to 64px tall.
+const REC_H: u32 = 64;
+/// Recognizer canvas width (`english_g2` was exported for 400px rows).
+const REC_W: u32 = 400;
+
+/// EasyOCR's NormalizePAD grey-level normalization.
+fn normalize_luma(v: u8) -> f32 {
+    (v as f32 / 255.0 - 0.5) / 0.5
+}
+
+/// Natural row width when the crop is scaled to 64px height preserving aspect.
+fn natural_width(cw: u32, ch: u32) -> u32 {
+    if ch == 0 {
+        return 1;
+    }
+    ((REC_H as f32 * cw.max(1) as f32 / ch as f32).ceil() as u32).max(1)
+}
+
+/// Build the `[1, 1, 64, 400]` CTC input for one crop.
+///
+/// Mirrors EasyOCR's `NormalizePAD`:
+/// * rows whose natural width fits the canvas are right-padded by repeating
+///   each row's own last column (the official code repeats the last pixel
+///   column, it does not smear one sampled pixel over the whole margin);
+/// * rows wider than the canvas are squeezed as a whole to 400x64 instead of
+///   being cropped, so no glyph is dropped.
+fn pad_or_scale(crop: &image::GrayImage) -> Vec<f32> {
+    let cw = crop.width().max(1);
+    let ch = crop.height().max(1);
+    let rw = natural_width(cw, ch).min(REC_W);
+    let resized = image::imageops::resize(crop, rw, REC_H, image::imageops::FilterType::CatmullRom);
+    let mut data = vec![0f32; (REC_H * REC_W) as usize];
+    for y in 0..REC_H {
+        let row = (y * REC_W) as usize;
+        for x in 0..rw {
+            data[row + x as usize] = normalize_luma(resized.get_pixel(x, y).0[0]);
+        }
+        // EasyOCR NormalizePAD: fill the right margin with this row's last column.
+        let last = data[row + (rw - 1) as usize];
+        for x in rw..REC_W {
+            data[row + x as usize] = last;
+        }
+    }
+    data
+}
+
 impl EasyOcr {
     pub fn load(dir: &std::path::Path) -> Result<Self> {
         let craft_path = dir.join("craft_mlt_25k.onnx");
@@ -99,13 +145,22 @@ impl EasyOcr {
         let linkmap = scores[hh * ww..2 * hh * ww].to_vec();
         drop(outputs);
         let boxes = group_boxes(craft_boxes(&textmap, &linkmap, hh, ww, sw, sh, scale));
+        let total = boxes.len();
+        let mut failed = 0usize;
         let mut out = Vec::new();
         for r in boxes {
-            if let Ok((text, conf)) = self.recognize_crop(width, height, rgba, &r) {
-                if !text.is_empty() {
-                    out.push(TextLine { rect: r, text, confidence: conf });
+            match self.recognize_crop(width, height, rgba, &r) {
+                Ok((text, conf)) => {
+                    if !text.is_empty() {
+                        out.push(TextLine { rect: r, text, confidence: conf });
+                    }
                 }
+                // A single bad crop must not abort the whole page.
+                Err(_) => failed += 1,
             }
+        }
+        if failed > 0 {
+            eprintln!("warning: easyocr: {failed}/{total} crops failed");
         }
         Ok(out)
     }
@@ -135,23 +190,12 @@ impl EasyOcr {
                 crop.put_pixel(x, y, image::Luma([lum]));
             }
         }
-        let rw = ((64.0 * cw as f32 / ch as f32).ceil() as u32).clamp(1, 400);
-        let resized = image::imageops::resize(&crop, rw, 64, image::imageops::FilterType::CatmullRom);
-        let mut data = vec![0f32; 64 * 400];
-        let last = resized.get_pixel(rw - 1, 32).0[0] as f32;
-        // EasyOCR NormalizePAD fills the remaining width with the last column.
-        let last_norm = (last / 255.0 - 0.5) / 0.5;
-        for val in data.iter_mut() {
-            *val = last_norm;
-        }
-        for y in 0..64 {
-            for x in 0..rw {
-                data[(y * 400 + x) as usize] =
-                    (resized.get_pixel(x, y).0[0] as f32 / 255.0 - 0.5) / 0.5;
-            }
-        }
-        let input = ort::value::Tensor::from_array(([1usize, 1, 64, 400], data))
-            .map_err(|e| anyhow!("EasyOCR rec input: {e}"))?;
+        let data = pad_or_scale(&crop);
+        let input = ort::value::Tensor::from_array((
+            [1usize, 1, REC_H as usize, REC_W as usize],
+            data,
+        ))
+        .map_err(|e| anyhow!("EasyOCR rec input: {e}"))?;
         let outputs = self
             .rec
             .run(ort::inputs![input])
@@ -314,4 +358,77 @@ fn group_boxes(mut boxes: Vec<Rect>) -> Vec<Rect> {
             .then_with(|| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal))
     });
     boxes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{natural_width, pad_or_scale, REC_H, REC_W};
+
+    /// Every source row carries its own constant luminance, so a margin that
+    /// smears one sampled pixel over all rows is detectable.
+    fn row_constant_image(width: u32, height: u32) -> image::GrayImage {
+        let mut img = image::GrayImage::new(width, height);
+        for y in 0..height {
+            let v = (y * 255 / height) as u8;
+            for x in 0..width {
+                img.put_pixel(x, y, image::Luma([v]));
+            }
+        }
+        img
+    }
+
+    #[test]
+    fn natural_width_keeps_aspect_ratio() {
+        assert_eq!(natural_width(8, 8), 64);
+        assert_eq!(natural_width(100, 64), 100);
+        assert_eq!(natural_width(2, 64), 2);
+        assert_eq!(natural_width(1000, 64), 1000);
+    }
+
+    #[test]
+    fn right_padding_repeats_each_rows_last_column() {
+        let img = row_constant_image(8, 8);
+        let data = pad_or_scale(&img);
+        assert_eq!(data.len(), (REC_H * REC_W) as usize);
+        let rw = natural_width(img.width(), img.height());
+        assert_eq!(rw, 64);
+        for y in 0..REC_H {
+            let row = (y * REC_W) as usize;
+            let last = data[row + (rw - 1) as usize];
+            // The real part of the row is flat for this input.
+            assert!((data[row] - last).abs() < 1e-3, "row {y} left edge");
+            for x in rw..REC_W {
+                assert_eq!(data[row + x as usize], last, "row {y} padded column {x}");
+            }
+        }
+        // Top margin is black (-1), bottom margin is near white: the padding
+        // must follow each row instead of one mid-row sample.
+        let top = data[(REC_W - 1) as usize];
+        let bottom = data[((REC_H - 1) * REC_W + REC_W - 1) as usize];
+        assert!(top < -0.9, "top margin {top}");
+        assert!(bottom > 0.5, "bottom margin {bottom}");
+    }
+
+    #[test]
+    fn rows_wider_than_canvas_are_scaled_not_cropped() {
+        // Natural width 1024 > 400: the whole row has to be squeezed, so the
+        // bright right half of the source must still reach the right edge.
+        let mut img = image::GrayImage::new(1024, 64);
+        for y in 0..64 {
+            for x in 0..1024 {
+                let v = if x < 512 { 0 } else { 255 };
+                img.put_pixel(x, y, image::Luma([v]));
+            }
+        }
+        assert!(natural_width(1024, 64) > REC_W);
+        let data = pad_or_scale(&img);
+        assert_eq!(data.len(), (REC_H * REC_W) as usize);
+        for y in 0..REC_H {
+            let row = (y * REC_W) as usize;
+            assert!(data[row + 4] < -0.9, "row {y} left half {}", data[row + 4]);
+            assert!(data[row + 120] < -0.5, "row {y} mid-left {}", data[row + 120]);
+            assert!(data[row + 280] > 0.5, "row {y} mid-right {}", data[row + 280]);
+            assert!(data[row + 395] > 0.9, "row {y} right half {}", data[row + 395]);
+        }
+    }
 }

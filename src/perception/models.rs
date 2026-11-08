@@ -5,6 +5,17 @@ use std::path::PathBuf;
 
 pub const OMNI_REVISION: &str = "f55d0750e5b94db2125ef0b45b0fa4a85ddc59b4";
 
+/// Assets required for the default OCR/caption pipeline.
+pub const GROUP_CORE: &str = "core";
+/// Optional EasyOCR reference assets; not needed by the default pipeline.
+pub const GROUP_REFERENCE: &str = "reference";
+/// Pseudo-group selecting every asset.
+pub const GROUP_ALL: &str = "all";
+
+pub fn known_groups() -> &'static [&'static str] {
+    &[GROUP_CORE, GROUP_REFERENCE, GROUP_ALL]
+}
+
 pub fn root() -> PathBuf {
     if let Ok(p) = std::env::var("CUA_MODEL_DIR") {
         if !p.trim().is_empty() {
@@ -54,6 +65,8 @@ pub struct Asset {
     pub sha256: &'static str,
     pub repo: &'static str,
     pub repo_path: &'static str,
+    /// Install group this asset belongs to; see `GROUP_CORE`/`GROUP_REFERENCE`.
+    pub group: &'static str,
 }
 
 pub const REPO_YOLO: &str = "cjc1887415157/yolov9e";
@@ -72,6 +85,7 @@ pub fn manifest() -> Vec<Asset> {
             sha256: "a09935ab2768045bbbc38acf262c00e46b9b44615cd0fa497f903c69e5c4d710",
             repo: REPO_YOLO,
             repo_path: "yolov9e_640.bpk",
+            group: GROUP_CORE,
         },
         Asset {
             path: omni_onnx("fl_encoder_b8.onnx"),
@@ -79,6 +93,7 @@ pub fn manifest() -> Vec<Asset> {
             sha256: "e22f21669922744fa40ea2875c95e3cb76b3a49b4b1c2a4276a9dc0003693926",
             repo: REPO_FLORENCE,
             repo_path: "onnx/fl_encoder_b8.onnx",
+            group: GROUP_CORE,
         },
         Asset {
             path: omni_onnx("fl_decoder_b8.onnx"),
@@ -86,6 +101,7 @@ pub fn manifest() -> Vec<Asset> {
             sha256: "0ef8676bad7abe61088186f1057beb990af629cbfdb00ebbc782a119ab0c69dd",
             repo: REPO_FLORENCE,
             repo_path: "onnx/fl_decoder_b8.onnx",
+            group: GROUP_CORE,
         },
         Asset {
             path: florence_tokenizer(),
@@ -93,6 +109,7 @@ pub fn manifest() -> Vec<Asset> {
             sha256: "847bbeab6174d66a88898f729d52fa8d355fafe1bea101cf960dd404581df70e",
             repo: REPO_FLORENCE,
             repo_path: "tokenizer.json",
+            group: GROUP_CORE,
         },
         Asset {
             path: ppocr("ch_PP-OCRv4_det_infer.onnx"),
@@ -100,6 +117,7 @@ pub fn manifest() -> Vec<Asset> {
             sha256: "d2a7720d45a54257208b1e13e36a8479894cb74155a5efe29462512d42f49da9",
             repo: REPO_PPOCR,
             repo_path: "ch_PP-OCRv4_det_infer.onnx",
+            group: GROUP_CORE,
         },
         Asset {
             path: ppocr("ch_ppocr_mobile_v2.0_cls_infer.onnx"),
@@ -107,6 +125,7 @@ pub fn manifest() -> Vec<Asset> {
             sha256: "e47acedf663230f8863ff1ab0e64dd2d82b838fceb5957146dab185a89d6215c",
             repo: REPO_PPOCR,
             repo_path: "ch_ppocr_mobile_v2.0_cls_infer.onnx",
+            group: GROUP_CORE,
         },
         Asset {
             path: ppocr("ch_PP-OCRv4_rec_infer.onnx"),
@@ -114,6 +133,7 @@ pub fn manifest() -> Vec<Asset> {
             sha256: "48fc40f24f6d2a207a2b1091d3437eb3cc3eb6b676dc3ef9c37384005483683b",
             repo: REPO_PPOCR,
             repo_path: "ch_PP-OCRv4_rec_infer.onnx",
+            group: GROUP_CORE,
         },
         Asset {
             path: ppocr("ppocr_keys_v1.txt"),
@@ -121,6 +141,7 @@ pub fn manifest() -> Vec<Asset> {
             sha256: "28b2362ad4ab2dc38769aa72feb535e3a9ddb3fd2a7585a05920e6393b1dc7f7",
             repo: REPO_PPOCR,
             repo_path: "ppocr_keys_v1.txt",
+            group: GROUP_CORE,
         },
         Asset {
             path: easyocr("craft_mlt_25k.onnx"),
@@ -128,6 +149,7 @@ pub fn manifest() -> Vec<Asset> {
             sha256: "652b4a91ef0bb6919c5887cae79fa867079faa1459ff8acbdfc1e2e19b7e05b1",
             repo: REPO_EASYOCR,
             repo_path: "craft_mlt_25k.onnx",
+            group: GROUP_REFERENCE,
         },
         Asset {
             path: easyocr("english_g2.onnx"),
@@ -135,6 +157,7 @@ pub fn manifest() -> Vec<Asset> {
             sha256: "aae25c0ac7123ca56dab45b520be6d88478a7111cddc25af335ef03dbe4e5ab6",
             repo: REPO_EASYOCR,
             repo_path: "english_g2.onnx",
+            group: GROUP_REFERENCE,
         },
         Asset {
             path: easyocr("characters.json"),
@@ -142,8 +165,26 @@ pub fn manifest() -> Vec<Asset> {
             sha256: "7cf668de2547325422036e18d7d4fac8aabfa2c038dc7ae6e4601756a77ba6ed",
             repo: REPO_EASYOCR,
             repo_path: "characters.json",
+            group: GROUP_REFERENCE,
         },
     ]
+}
+
+/// Select assets by install group. An empty list, or a list containing
+/// `GROUP_ALL`, returns the full manifest; unknown group names are ignored.
+pub fn manifest_for(groups: &[String]) -> Vec<Asset> {
+    let all = manifest();
+    let wanted: Vec<String> = groups
+        .iter()
+        .map(|g| g.trim().to_ascii_lowercase())
+        .filter(|g| !g.is_empty())
+        .collect();
+    if wanted.is_empty() || wanted.iter().any(|g| g == GROUP_ALL) {
+        return all;
+    }
+    all.into_iter()
+        .filter(|a| wanted.iter().any(|g| g == a.group))
+        .collect()
 }
 
 pub fn repo_url(repo: &str, path: &str) -> String {
@@ -188,4 +229,43 @@ pub fn verify_manifest(deep: bool) -> anyhow::Result<serde_json::Value> {
         "ok": ok,
         "assets": entries,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn g(name: &str) -> Vec<String> {
+        vec![name.to_string()]
+    }
+
+    #[test]
+    fn manifest_for_empty_returns_all() {
+        assert_eq!(manifest_for(&[]).len(), 11);
+        assert_eq!(manifest_for(&g(GROUP_ALL)).len(), 11);
+    }
+
+    #[test]
+    fn manifest_for_core_excludes_easyocr() {
+        let core = manifest_for(&g(GROUP_CORE));
+        assert_eq!(core.len(), 8);
+        assert!(core.iter().all(|a| a.group == GROUP_CORE));
+        assert!(!core.iter().any(|a| a.repo == REPO_EASYOCR));
+        assert!(!core.iter().any(|a| a.path.starts_with(easyocr_dir())));
+    }
+
+    #[test]
+    fn manifest_for_reference_is_easyocr_only() {
+        let reference = manifest_for(&g(GROUP_REFERENCE));
+        assert_eq!(reference.len(), 3);
+        assert!(reference.iter().all(|a| a.group == GROUP_REFERENCE));
+        assert!(reference.iter().all(|a| a.path.starts_with(easyocr_dir())));
+    }
+
+    #[test]
+    fn manifest_for_ignores_unknown_and_dedups() {
+        assert!(manifest_for(&g("nope")).is_empty());
+        let mixed = manifest_for(&[GROUP_REFERENCE.to_string(), "nope".to_string(), GROUP_REFERENCE.to_string()]);
+        assert_eq!(mixed.len(), 3);
+    }
 }

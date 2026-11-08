@@ -56,7 +56,7 @@ Check "apps: has shell/desktop window" (($r.windows | Where-Object { $_.desktop_
 # ---------- 3. launch + state ----------
 & $cua close --window "CuaTestPad" --confirm 2>$null | Out-Null
 Start-Sleep -Milliseconds 500
-$r = J (RunCua launch --exe $testpad)
+$r = J (RunCua launch --exe $testpad --foreground)
 Check "launch: ok receipt" ($r.status -eq "ok" -and $r.dispatched) "$($r.status)/$($r.detail)"
 Start-Sleep -Seconds 2
 $st = J (RunCua state --window "CuaTestPad")
@@ -194,6 +194,21 @@ $ck = J (RunCua check)
 Check "check: browser backend is ubb" ($ck.browser.backend -eq "ubb") ($ck.browser | ConvertTo-Json -Compress)
 $err = RunErr browser shot --out "$cache\e2e-browser-scope.png"
 Check "old CDP subcommand is gone" ($err -like "*failed*" -or $err -like "*not found*") ($err.Substring(0, [Math]::Min(70, $err.Length)))
+
+# ---------- 18. launch opens in the background ----------
+& $cua launch --exe $testpad --args "--title CuaFocusAnchor" --foreground | Out-Null
+& $cua wait --window "title:CuaFocusAnchor" --timeout-ms 6000 | Out-Null
+& $cua activate --window "title:CuaFocusAnchor" | Out-Null
+Start-Sleep -Milliseconds 300
+$fgBefore = (J (RunCua apps)).foreground_hwnd
+$r = J (RunCua launch --exe $testpad --args "--title CuaBgLaunch")
+$fgAfter = (J (RunCua apps)).foreground_hwnd
+$st = J (RunCua state --window "title:CuaBgLaunch" --no-shot)
+Check "launch opens in the background without stealing focus" (
+    $r.status -eq "ok" -and $fgBefore -eq $fgAfter -and $r.detail -like "*background*" -and $st.node_count -gt 3
+) "$($r.detail) fg=$fgBefore->$fgAfter nodes=$($st.node_count)"
+& $cua close --window "title:CuaBgLaunch" --confirm 2>$null | Out-Null
+& $cua close --window "title:CuaFocusAnchor" --confirm 2>$null | Out-Null
 
 # ---------- result ----------
 Write-Host ""

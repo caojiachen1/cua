@@ -36,6 +36,12 @@ enum PerceptionModelsOp {
         accept_license: bool,
         #[arg(long, help = "re-download even when a valid local file exists")]
         force: bool,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "asset groups: core (OCR+detector+caption), reference (EasyOCR), all (default)"
+        )]
+        groups: Vec<String>,
     },
 }
 
@@ -47,23 +53,26 @@ enum PerceptionOp {
         op: PerceptionModelsOp,
     },
     /// Click an element selected from an immutable observation (UIA pattern
-    /// first; visual elements use a fresh-frame + hit-test guarded real click).
+    /// first; visual elements use a fresh-frame + hit-test guarded real click,
+    /// or message-level input with --background).
     ClickElement {
         #[arg(long)]
         observation_id: String,
         #[arg(long)]
         element_id: String,
-        #[arg(long, help = "use message-level input when the element has no UIA pattern")]
+        #[arg(long, help = "message-level input: no focus change, no hit test (works on occluded windows)")]
         background: bool,
         #[arg(long)]
         right: bool,
     },
     /// Parse an image or window screenshot and write an annotated PNG plus JSON.
     Visualize {
-        #[arg(long, conflicts_with = "window", help = "input image path")]
+        #[arg(long, help = "input image path")]
         image: Option<String>,
-        #[arg(long, conflicts_with = "image", help = "capture this window first")]
+        #[arg(long, help = "capture this window first")]
         window: Option<String>,
+        #[arg(long, help = "render the elements of a stored observation instead of re-parsing")]
+        observation_id: Option<String>,
         #[arg(long, help = "output PNG (default: <input>-perception.png or data dir)")]
         out: Option<String>,
         #[arg(long, value_enum, default_value_t = perception::types::Detail::Full)]
@@ -538,6 +547,10 @@ enum Cmd {
         cwd: Option<String>,
         #[arg(long, help = "inherit this shell's environment verbatim (default: strip ELECTRON_/NODE_ vars that break app startup)")]
         no_clean_env: bool,
+        #[arg(long, help = "bring the new window to the foreground (default: open in the background without stealing focus)")]
+        foreground: bool,
+        #[arg(long, help = "start the window minimized (still never steals focus)")]
+        minimized: bool,
         #[arg(long)]
         record: Option<String>,
         #[arg(long)]
@@ -547,6 +560,8 @@ enum Cmd {
     Open {
         #[arg(long)]
         name: String,
+        #[arg(long, help = "bring the new window to the foreground (default: open in the background)")]
+        foreground: bool,
         #[arg(long)]
         record: Option<String>,
     },
@@ -1059,8 +1074,8 @@ fn dispatch(cmd: Cmd) -> i32 {
             Cmd::Apps { all } => cmd_apps(all),
             Cmd::State { window, depth, no_shot, out, diff, redact, patterns, raw, perception, detail, ocr_profile, deadline_ms, stream } => {
                 if perception.is_some() || detail.is_some() || ocr_profile.is_some() || stream || deadline_ms.is_some() {
-                    if diff || redact || patterns || raw {
-                        bail!("--diff/--redact/--patterns/--raw are not supported together with --perception yet; use the v1 state path");
+                    if diff || patterns || raw {
+                        bail!("--diff/--patterns/--raw are not supported together with --perception yet; use the v1 state path");
                     }
                     let t = resolve_target(&window)?;
                     perception::pipeline::run(perception::pipeline::Request {
@@ -1074,6 +1089,7 @@ fn dispatch(cmd: Cmd) -> i32 {
                         out,
                         stream,
                         deadline_ms,
+                        redact,
                     })
                 } else {
                     cmd_state(&window, depth, no_shot, out, diff, redact, patterns, raw)
@@ -1148,10 +1164,10 @@ fn dispatch(cmd: Cmd) -> i32 {
                 cmd_scroll_item(&window, index, align_top, record, sandbox)
             }
             Cmd::Clipboard { op } => cmd_clipboard(op),
-            Cmd::Launch { exe, args, cwd, no_clean_env, record, sandbox } => {
-                cmd_launch(&exe, args, cwd, !no_clean_env, record, sandbox)
+            Cmd::Launch { exe, args, cwd, no_clean_env, foreground, minimized, record, sandbox } => {
+                cmd_launch(&exe, args, cwd, !no_clean_env, !foreground, minimized, record, sandbox)
             }
-            Cmd::Open { name, record } => cmd_open(&name, record),
+            Cmd::Open { name, foreground, record } => cmd_open(&name, !foreground, record),
             Cmd::Activate { window, record } => cmd_window_op(&window, "activate", record, false),
             Cmd::Minimize { window, record } => cmd_window_op(&window, "minimize", record, false),
             Cmd::Maximize { window, record } => cmd_window_op(&window, "maximize", record, false),
@@ -1797,8 +1813,8 @@ fn cmd_perception(op: PerceptionOp) -> Result<i32> {
             println!("{}", serde_json::to_string_pretty(&v)?);
             Ok(if v["ok"].as_bool().unwrap_or(false) { 0 } else { 1 })
         }
-        PerceptionOp::Models { op: PerceptionModelsOp::Install { accept_license, force } } => {
-            let v = perception::download::install(accept_license, force)?;
+        PerceptionOp::Models { op: PerceptionModelsOp::Install { accept_license, force, groups } } => {
+            let v = perception::download::install(accept_license, force, &groups)?;
             println!("{}", serde_json::to_string_pretty(&v)?);
             Ok(if v["ok"].as_bool().unwrap_or(false) { 0 } else { 1 })
         }
@@ -1810,8 +1826,8 @@ fn cmd_perception(op: PerceptionOp) -> Result<i32> {
                 .and_then(|t| t.elapsed().ok())
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(u64::MAX);
-            if obs_age_ms > 2000 {
-                bail!("refusing click: observation '{}' is stale ({obs_age_ms}ms > 2000ms); re-observe the target", observation_id);
+            if obs_age_ms > 5000 {
+                bail!("refusing click: observation '{}' is stale ({obs_age_ms}ms > 5000ms); re-observe the target", observation_id);
             }
             let obs = load_observation_json(&observation_id)?;
             let elements = obs["elements"].as_array().cloned().unwrap_or_default();
@@ -1822,6 +1838,13 @@ fn cmd_perception(op: PerceptionOp) -> Result<i32> {
                 bail!("observation has no hwnd");
             }
             let h = windows::Win32::Foundation::HWND(hwnd as *mut _);
+            // A visual element is only a way to locate a click; the policy gate
+            // is the same one every other action passes.
+            let cfg = util::load_config();
+            let live = crate::win::snapshot_window(crate::win::root_window(h))
+                .ok_or_else(|| anyhow!("observation window no longer exists"))?;
+            util::check_target_allowed(&cfg, live.pid, live.hwnd)
+                .map_err(|reason| anyhow!(reason))?;
             let recorded_pid = obs["window"]["pid"].as_u64().unwrap_or(0) as u32;
             if recorded_pid != 0 {
                 let cur = crate::win::snapshot_window(crate::win::root_window(h))
@@ -1877,12 +1900,25 @@ fn cmd_perception(op: PerceptionOp) -> Result<i32> {
                 let y = rect.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
                 let w = rect.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
                 let hh = rect.get(3).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
-                let cx = (ox + x + w / 2.0).round() as i32;
-                let cy = (oy + y + hh / 2.0).round() as i32;
-                crate::win::ensure_point_hits(h, cx, cy)?;
-                input::click(cx, cy, right, false)?;
+                // DPI-unaware windows render at their own DPI inside a larger
+                // surface; frame pixels are not window pixels for them.
+                let scale = obs["frame"]["pixel_scale"].as_f64().unwrap_or(1.0) as f32;
+                let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+                let cx = (ox + (x + w / 2.0) * scale).round() as i32;
+                let cy = (oy + (y + hh / 2.0) * scale).round() as i32;
+                if background {
+                    if crate::win::snapshot_window(h).map(|w| w.minimized).unwrap_or(true) {
+                        bail!("refusing background visual click: the target window is minimized");
+                    }
+                    let root = crate::win::root_window(h);
+                    input::post_click(root, cx, cy, right, false)?;
+                    method = format!("visual click at ({cx},{cy}) via message-level input (background; no focus change); effect not verified");
+                } else {
+                    crate::win::ensure_point_hits(h, cx, cy)?;
+                    input::click(cx, cy, right, false)?;
+                    method = format!("visual click at ({cx},{cy}) after freshness/hit-test checks; effect not verified");
+                }
                 point = json!([cx, cy]);
-                method = format!("visual click at ({cx},{cy}) after freshness/hit-test checks; effect not verified");
             }
             println!("{}", serde_json::to_string_pretty(&json!({
                 "schema": "cua-perception-click-v1",
@@ -1897,7 +1933,48 @@ fn cmd_perception(op: PerceptionOp) -> Result<i32> {
             }))?);
             Ok(0)
         }
-        PerceptionOp::Visualize { image, window, out, detail, ocr_profile } => {
+        PerceptionOp::Visualize { image, window, observation_id, out, detail, ocr_profile } => {
+            if observation_id.is_some() && (image.is_some() || window.is_some()) {
+                bail!("--observation-id cannot be combined with --image/--window");
+            }
+            if let Some(id) = observation_id {
+                let obs = load_observation_json(&id)?;
+                let shot_path = obs["screenshot"]["path"].as_str()
+                    .ok_or_else(|| anyhow!("observation '{}' has no screenshot", id))?;
+                let img = image::open(shot_path)?.to_rgba8();
+                let (w, h) = img.dimensions();
+                let elements: Vec<perception::types::Element> =
+                    serde_json::from_value(obs["elements"].clone())
+                        .map_err(|e| anyhow!("observation elements: {e}"))?;
+                let out_path = out
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| perception::visualize::default_output(None));
+                let (canvas_w, canvas_h) = perception::visualize::render(
+                    w,
+                    h,
+                    img.as_raw(),
+                    &elements,
+                    &out_path,
+                )?;
+                let sidecar = out_path.with_extension("json");
+                let summary = json!({
+                    "schema": "cua-perception-visualize-v1",
+                    "source": format!("observation:{id}"),
+                    "output": out_path.to_string_lossy(),
+                    "json": sidecar.to_string_lossy(),
+                    "width": w,
+                    "height": h,
+                    "annotated_width": canvas_w,
+                    "annotated_height": canvas_h,
+                    "detail": obs["perception"]["detail"],
+                    "ocr_profile": obs["perception"]["ocr_profile"],
+                    "counts": {"total": elements.len()},
+                    "elements": elements,
+                });
+                std::fs::write(&sidecar, serde_json::to_vec_pretty(&summary)?)?;
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+                return Ok(0);
+            }
             let image_for_default = image.clone();
             let (width, height, rgba, source_label) = match (image, window) {
                 (Some(path), None) => {
@@ -1913,7 +1990,7 @@ fn cmd_perception(op: PerceptionOp) -> Result<i32> {
                     }
                     (shot.width, shot.height, shot.rgba, format!("window:{}", t.info.title))
                 }
-                _ => bail!("provide exactly one of --image or --window"),
+                _ => bail!("provide exactly one of --image, --window or --observation-id"),
             };
             let analyzed = perception::visualize::analyze(width, height, &rgba, detail, ocr_profile)?;
             let out_path = out
@@ -2007,9 +2084,15 @@ fn cmd_perception(op: PerceptionOp) -> Result<i32> {
             let origin = obs["frame"]["screen_origin"].as_array()
                 .and_then(|a| Some([a.first()?.as_i64()? as i32, a.get(1)?.as_i64()? as i32]))
                 .unwrap_or([0, 0]);
+            let px_scale = obs["frame"]["pixel_scale"].as_f64().unwrap_or(1.0) as f32;
             let matches: Vec<Value> = found.matches.iter().map(|m| json!({
                 "rect_px": m.rect.to_array(),
-                "rect_screen": [m.rect.x + origin[0] as f32, m.rect.y + origin[1] as f32, m.rect.w, m.rect.h],
+                "rect_screen": [
+                    origin[0] as f32 + m.rect.x * px_scale,
+                    origin[1] as f32 + m.rect.y * px_scale,
+                    m.rect.w * px_scale,
+                    m.rect.h * px_scale,
+                ],
                 "score": m.score,
                 "scale": m.scale,
             })).collect();
@@ -2067,13 +2150,19 @@ fn cmd_perception(op: PerceptionOp) -> Result<i32> {
                     prev = Some(r);
                     if streak >= confirm_frames.max(1) {
                         let origin = crate::win::window_rect(t.hwnd)?;
+                        let px_scale = crate::win::frame_scale(t.hwnd);
                         println!("{}", serde_json::to_string_pretty(&json!({
                             "schema": "cua-perception-watch-v1",
                             "window": target_json(&t), "matched": true, "frames": frames,
                             "streak": streak, "elapsed_ms": started.elapsed().as_millis() as u64,
                             "score": m.score,
                             "rect_px": r,
-                            "rect_screen": [r[0] + origin[0] as f32, r[1] + origin[1] as f32, r[2], r[3]],
+                            "rect_screen": [
+                                origin[0] as f32 + r[0] * px_scale,
+                                origin[1] as f32 + r[1] * px_scale,
+                                r[2] * px_scale,
+                                r[3] * px_scale,
+                            ],
                         }))?);
                         return Ok(0);
                     }
@@ -3176,6 +3265,8 @@ fn cmd_launch(
     args: Option<String>,
     cwd: Option<String>,
     clean_env: bool,
+    background: bool,
+    minimized: bool,
     record: Option<String>,
     sandbox: bool,
 ) -> Result<i32> {
@@ -3211,7 +3302,9 @@ fn cmd_launch(
         },
         |_t| {
             let stripped = if clean_env { util::stripped_env_keys() } else { Vec::new() };
-            let pid = spawn_process_opts(&exe, args.as_deref(), None, cwd2.as_deref(), clean_env)?;
+            let prev = crate::win::foreground_hwnd();
+            let before = if background { crate::win::top_level_hwnds() } else { std::collections::HashSet::new() };
+            let pid = spawn_process_opts(&exe, args.as_deref(), None, cwd2.as_deref(), clean_env, background, minimized)?;
             let mut detail = format!("launched pid {pid}");
             if let Some(c) = &cwd {
                 detail.push_str(&format!(" (cwd {c})"));
@@ -3219,13 +3312,19 @@ fn cmd_launch(
             if !stripped.is_empty() {
                 detail.push_str(&format!("; env sanitized, stripped {}", stripped.join(",")));
             }
+            if minimized {
+                detail.push_str("; started minimized");
+            }
+            if background {
+                detail.push_str(&background_outcome(pid, prev, &before));
+            }
             Ok((detail, None))
         },
     )
 }
 
 pub fn spawn_process(exe: &str, args: Option<&str>, desktop: Option<&str>) -> Result<u32> {
-    spawn_process_opts(exe, args, desktop, None, true)
+    spawn_process_opts(exe, args, desktop, None, true, false, false)
 }
 
 /// Launch a process. `clean_env` strips automation-shell variables that break other
@@ -3236,6 +3335,8 @@ pub fn spawn_process_opts(
     desktop: Option<&str>,
     cwd: Option<&str>,
     clean_env: bool,
+    background: bool,
+    minimized: bool,
 ) -> Result<u32> {
     use windows::core::PCWSTR;
     use windows::Win32::System::Threading::{
@@ -3252,6 +3353,18 @@ pub fn spawn_process_opts(
         cb: std::mem::size_of::<STARTUPINFOW>() as u32,
         ..Default::default()
     };
+    if background || minimized {
+        // SW_SHOWNOACTIVATE / SW_SHOWMINNOACTIVE: honoured by classic apps;
+        // WinUI/Electron ignore them and are handled by the watcher afterwards.
+        use windows::Win32::System::Threading::STARTF_USESHOWWINDOW;
+        use windows::Win32::UI::WindowsAndMessaging::{SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE};
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = if minimized {
+            SW_SHOWMINNOACTIVE.0 as u16
+        } else {
+            SW_SHOWNOACTIVATE.0 as u16
+        };
+    }
     let mut desktop_w: Option<Vec<u16>> = None;
     if let Some(d) = desktop {
         let mut w: Vec<u16> = d.encode_utf16().collect();
@@ -3289,7 +3402,28 @@ pub fn spawn_process_opts(
     Ok(pi.dwProcessId)
 }
 
-fn cmd_open(name: &str, record: Option<String>) -> Result<i32> {
+/// Wait out the launch and report whether the user's focus survived it.
+fn background_outcome(
+    pid: u32,
+    prev: windows::Win32::Foundation::HWND,
+    before: &std::collections::HashSet<isize>,
+) -> String {
+    let (restored, win) = crate::win::keep_launched_background(
+        pid,
+        prev,
+        before,
+        std::time::Duration::from_millis(3000),
+    );
+    let fg_now = crate::win::foreground_hwnd();
+    match (win, restored, fg_now == prev) {
+        (Some(_), true, _) => "; opened in the background (app raised itself briefly, focus restored)".to_string(),
+        (Some(_), false, true) => "; opened in the background (focus unchanged)".to_string(),
+        (Some(_), false, false) => "; window opened but the app kept the focus".to_string(),
+        (None, _, _) => "; no top-level window appeared within 3s (focus unchanged)".to_string(),
+    }
+}
+
+fn cmd_open(name: &str, background: bool, record: Option<String>) -> Result<i32> {
     let argv = record_argv(&record);
     let name = name.to_string();
     guarded_action(
@@ -3323,7 +3457,9 @@ fn cmd_open(name: &str, record: Option<String>) -> Result<i32> {
                 let cwd = std::path::Path::new(&name)
                     .parent()
                     .map(|p| p.to_string_lossy().to_string());
-                let pid = spawn_process_opts(&name, None, None, cwd.as_deref(), true)?;
+                let prev = crate::win::foreground_hwnd();
+                let before = if background { crate::win::top_level_hwnds() } else { std::collections::HashSet::new() };
+                let pid = spawn_process_opts(&name, None, None, cwd.as_deref(), true, background, false)?;
                 let mut detail = format!("opened '{name}' (pid {pid}) with a sanitized environment");
                 if !stripped.is_empty() {
                     detail.push_str(&format!("; stripped {}", stripped.join(",")));
@@ -3331,27 +3467,34 @@ fn cmd_open(name: &str, record: Option<String>) -> Result<i32> {
                 if let Some(c) = &cwd {
                     detail.push_str(&format!("; cwd {c}"));
                 }
+                if background {
+                    detail.push_str(&background_outcome(pid, prev, &before));
+                }
                 return Ok((detail, None));
             }
             let _ = t;
-            use windows::Win32::Foundation::HINSTANCE;
             use windows::core::PCWSTR;
-            use windows::Win32::UI::Shell::ShellExecuteW;
-            use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-            let mut verb_w: Vec<u16> = "open\0".encode_utf16().collect();
+            use windows::Win32::System::Threading::GetProcessId;
+            use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
+            use windows::Win32::UI::WindowsAndMessaging::{SW_SHOWNORMAL, SW_SHOWNOACTIVATE};
+            let prev = crate::win::foreground_hwnd();
+            let before = if background { crate::win::top_level_hwnds() } else { std::collections::HashSet::new() };
+            let mut verb_w: Vec<u16> = "open ".encode_utf16().collect();
             let mut file_w: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-            let r: HINSTANCE = unsafe {
-                ShellExecuteW(
-                    None,
-                    PCWSTR(verb_w.as_mut_ptr()),
-                    PCWSTR(file_w.as_mut_ptr()),
-                    PCWSTR::null(),
-                    PCWSTR::null(),
-                    SW_SHOWNORMAL,
-                )
+            let mut sei = SHELLEXECUTEINFOW {
+                cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+                fMask: if background { SEE_MASK_NOCLOSEPROCESS } else { Default::default() },
+                lpVerb: PCWSTR(verb_w.as_mut_ptr()),
+                lpFile: PCWSTR(file_w.as_mut_ptr()),
+                nShow: if background { SW_SHOWNOACTIVATE.0 } else { SW_SHOWNORMAL.0 },
+                ..Default::default()
             };
-            if (r.0 as isize) <= 32 {
-                bail!("ShellExecuteW failed (code {}) for '{name}'", r.0 as isize);
+            unsafe { ShellExecuteExW(&mut sei) }
+                .map_err(|e| anyhow!("ShellExecuteExW failed for '{name}': {e}"))?;
+            let pid = unsafe { GetProcessId(sei.hProcess) };
+            let _ = unsafe { windows::Win32::Foundation::CloseHandle(sei.hProcess) };
+            if background {
+                return Ok((format!("opened '{name}' via ShellExecute{}", background_outcome(pid, prev, &before)), None));
             }
             Ok((format!("opened '{name}' via ShellExecute"), None))
         },
