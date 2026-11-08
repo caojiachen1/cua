@@ -30,6 +30,13 @@ enum PerceptionModelsOp {
         #[arg(long, help = "read every file and verify its SHA-256 (slow)")]
         deep: bool,
     },
+    /// Download the runtime assets from the project's ModelScope repo.
+    Install {
+        #[arg(long, help = "accept the model licenses before downloading")]
+        accept_license: bool,
+        #[arg(long, help = "re-download even when a valid local file exists")]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1790,6 +1797,11 @@ fn cmd_perception(op: PerceptionOp) -> Result<i32> {
             println!("{}", serde_json::to_string_pretty(&v)?);
             Ok(if v["ok"].as_bool().unwrap_or(false) { 0 } else { 1 })
         }
+        PerceptionOp::Models { op: PerceptionModelsOp::Install { accept_license, force } } => {
+            let v = perception::download::install(accept_license, force)?;
+            println!("{}", serde_json::to_string_pretty(&v)?);
+            Ok(if v["ok"].as_bool().unwrap_or(false) { 0 } else { 1 })
+        }
         PerceptionOp::ClickElement { observation_id, element_id, background, right } => {
             let obs_path = util::ensure_data_dir().join("cache").join(format!("obs-{observation_id}.json"));
             let obs_age_ms = std::fs::metadata(&obs_path)
@@ -1930,6 +1942,7 @@ fn cmd_perception(op: PerceptionOp) -> Result<i32> {
                 "annotated_height": canvas_h,
                 "ocr_backend": analyzed.ocr_backend,
                 "detector_backend": analyzed.detector_backend,
+                "caption_backend": analyzed.caption_backend,
                 "detail": detail.as_str(),
                 "ocr_profile": ocr_profile.as_str(),
                 "elapsed_ms": analyzed.elapsed_ms,

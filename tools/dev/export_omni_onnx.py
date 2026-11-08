@@ -190,6 +190,135 @@ def export_florence() -> None:
         print(graph, "max_abs", float(np.max(np.abs(got - ref))), "shape", got.shape)
 
 
+
+
+class FlorenceEncoderBatch(torch.nn.Module):
+    def __init__(self, model, input_ids: torch.Tensor):
+        super().__init__()
+        self.model = model
+        self.register_buffer("input_ids", input_ids)
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        feats = self.model._encode_image(pixel_values)
+        emb = self.model.get_input_embeddings()(self.input_ids)
+        merged, mask = self.model._merge_input_ids_with_image_features(feats, emb)
+        out = self.model.language_model.model.encoder(inputs_embeds=merged, attention_mask=mask)
+        return out.last_hidden_state
+
+
+class FlorenceDecoderBatch(torch.nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.lm = model.language_model
+
+    def forward(self, input_ids: torch.Tensor, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.lm(
+            decoder_input_ids=input_ids,
+            encoder_outputs=(encoder_hidden_states,),
+            use_cache=False,
+            return_dict=True,
+        ).logits
+
+
+def export_florence_batch(batch_size: int = 8) -> None:
+    import onnxruntime as ort
+
+    processor = AutoProcessor.from_pretrained(
+        str(ROOT / ".models" / "florence2-caption"), trust_remote_code=True, local_files_only=True
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        str(ROOT / ".models" / "florence2-caption"),
+        trust_remote_code=True,
+        local_files_only=True,
+        torch_dtype=torch.float32,
+        low_cpu_mem_usage=True,
+    ).eval()
+
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGB", (64, 64), (244, 244, 244))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle([14, 14, 50, 50], fill=(25, 90, 210))
+    inputs = processor(
+        images=[image] * batch_size,
+        text=["<CAPTION>"] * batch_size,
+        return_tensors="pt",
+        do_resize=False,
+    )
+    pixel = inputs["pixel_values"]
+    ids = inputs["input_ids"]
+    assert pixel.shape[0] == batch_size and ids.shape[0] == batch_size
+
+    enc = FlorenceEncoderBatch(model, ids).eval()
+    with torch.no_grad():
+        hidden = enc(pixel)
+    enc_path = OUT / f"fl_encoder_b{batch_size}.onnx"
+    torch.onnx.export(
+        enc,
+        pixel,
+        str(enc_path),
+        opset_version=17,
+        input_names=["pixel_values"],
+        output_names=["hidden"],
+        dynamo=False,
+    )
+
+    dec = FlorenceDecoderBatch(model).eval()
+    dec_ids = torch.full((batch_size, 21), 1, dtype=torch.long)
+    dec_ids[:, 0] = 2
+    with torch.no_grad():
+        logits = dec(dec_ids, hidden)
+    dec_path = OUT / f"fl_decoder_b{batch_size}.onnx"
+    torch.onnx.export(
+        dec,
+        (dec_ids, hidden),
+        str(dec_path),
+        opset_version=17,
+        input_names=["input_ids", "encoder_hidden_states"],
+        output_names=["logits"],
+        dynamo=False,
+    )
+
+    hidden.numpy().astype("<f4").tofile(OUT / f"golden_fl_encoder_b{batch_size}.bin")
+    logits.numpy().astype("<f4").tofile(OUT / f"golden_fl_logits_b{batch_size}.bin")
+    pixel.numpy().astype("<f4").tofile(OUT / f"golden_fl_pixel_b{batch_size}.bin")
+    dec_ids.numpy().astype("<i8").tofile(OUT / f"golden_fl_ids_b{batch_size}.bin")
+
+    def ort_out(graph, feeds):
+        sess = ort.InferenceSession(str(OUT / graph), providers=["CPUExecutionProvider"])
+        return sess.run(None, feeds)[0]
+
+    b_hidden = ort_out(f"fl_encoder_b{batch_size}.onnx", {"pixel_values": pixel.numpy().astype(np.float32)})
+    b_logits = ort_out(
+        f"fl_decoder_b{batch_size}.onnx",
+        {
+            "input_ids": dec_ids.numpy().astype(np.int64),
+            "encoder_hidden_states": hidden.numpy().astype(np.float32),
+        },
+    )
+    print(
+        "batch", batch_size,
+        "encoder max_abs", float(np.max(np.abs(b_hidden - hidden.numpy()))),
+        "decoder max_abs", float(np.max(np.abs(b_logits - logits.numpy()))),
+        "shapes", b_hidden.shape, b_logits.shape,
+    )
+    if (OUT / "fl_encoder.onnx").is_file() and (OUT / "fl_decoder.onnx").is_file():
+        single_pixel = pixel[:1].numpy().astype(np.float32)
+        single_hidden = ort_out("fl_encoder.onnx", {"pixel_values": single_pixel})
+        single_logits = ort_out(
+            "fl_decoder.onnx",
+            {
+                "input_ids": dec_ids[:1].numpy().astype(np.int64),
+                "encoder_hidden_states": single_hidden.astype(np.float32),
+            },
+        )
+        print(
+            "batch row0 vs single: encoder max_abs",
+            float(np.max(np.abs(b_hidden[0] - single_hidden[0]))),
+            "decoder max_abs",
+            float(np.max(np.abs(b_logits[0] - single_logits[0]))),
+        )
+
 if __name__ == "__main__":
     import sys
 
@@ -198,3 +327,5 @@ if __name__ == "__main__":
         export_yolo()
     if "florence" in which:
         export_florence()
+    if "batch" in which:
+        export_florence_batch()

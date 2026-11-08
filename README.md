@@ -88,6 +88,8 @@ cua state --window App --perception uia --no-shot            # no capture, no in
 cua state --window App --perception auto --stream            # partial fast snapshot + final revision
 cua perception visualize --image shot.png --detail full      # annotated PNG + JSON sidecar
 cua perception visualize --window App --out parsed.png       # capture, parse, annotate
+cua perception models install --accept-license                # ~1.5GB from ModelScope
+cua perception models verify --deep
 cua perception match-text --observation-id <id> --contains "Save"
 cua perception match-template --observation-id <id> --template .\icon.png
 cua perception watch-template --window App --template .\icon.png --confirm-frames 2
@@ -100,11 +102,21 @@ UIA tree. Visual elements carry `rect_px`, provenance and separate confidences; 
 `target.channels` means unknown, not permission. Visual clicks require a screenshot younger
 than 5 s, unchanged window geometry and a hit test, and still report `verified: false`.
 
-The pinned official assets, including the original PP-OCRv4 ONNX files required by
-PaddleOCR, are installed with `tools\install-models.ps1` (copy into
-`%LOCALAPPDATA%\cua\models`) and checked by `cua perception models verify --deep`. The
-offline exporter `tools/dev/export_omni_onnx.py` is a development tool only; it produces
-the fixed ONNX/Burn assets from the official TorchScript/Florence weights.
+The runtime assets are downloaded from four public ModelScope repos:
+`cjc1887415157/yolov9e`, `cjc1887415157/florence2-caption`,
+`cjc1887415157/ppocr-v4`, and `cjc1887415157/easyocr-en-reference`, with
+`cua perception models install --accept-license` (about 1.6GB), and checked by
+`cua perception models verify --deep`. `tools\install-models.ps1`
+can instead copy a locally prepared model directory. The offline exporter
+`tools/dev/export_omni_onnx.py` is a development tool only; it produces the fixed
+ONNX/Burn assets from the official TorchScript/Florence weights. Florence uses a fixed B=8 graph for dense icon sets; set
+`CUA_FLORENCE_BATCH=0` to prefer the single-image graph on CPU. Florence prefers
+the DirectML GPU session; ONNX Runtime CPU and tract are fallbacks.
+
+OCR profiles: `paddleocr` is the default and was better on the mixed
+Chinese/English OCR benchmark; `easyocr-en-reference` is the official
+OmniParser EasyOCR English path (CRAFT + english_g2, English-only); and
+`ppocr-zh-desktop` is the earlier tract port.
 
 Never automated: terminals, task manager, registry, `mmc`, Control Panel, password managers,
 Windows Settings (including `ms-settings:` URIs), and the Win key.

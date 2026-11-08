@@ -57,6 +57,10 @@ Start-Sleep -Milliseconds 700
 $modelsOut = J (RunCua perception models verify)
 Check "P1 model manifest is complete" ($modelsOut.ok -eq $true) "ok=$($modelsOut.ok)"
 Check "P2 pinned OmniParser revision" ($modelsOut.revision -eq "f55d0750e5b94db2125ef0b45b0fa4a85ddc59b4") "$($modelsOut.revision)"
+$install = J (RunCua perception models install --accept-license)
+Check "P2b install is idempotent for local assets" (
+    $install.ok -eq $true -and @($install.skipped).Count -ge 1 -and @($install.failed).Count -eq 0
+) "installed=$(@($install.installed).Count) skipped=$(@($install.skipped).Count) failed=$(@($install.failed).Count)"
 
 $W = "title:CuaPercE2E"
 & $cua launch --exe $testpad --args "--title CuaPercE2E" | Out-Null
@@ -196,6 +200,20 @@ Check "P21 full detail runs the caption stage" (
 Check "P22 full snapshot remains immutable and complete/partial" (
     $full.terminal -eq $true -and $full.status -in @("complete", "partial")
 ) "status=$($full.status) terminal=$($full.terminal)"
+
+$env:CUA_FLORENCE_BATCH = "1"
+$batched = J (RunCua state --window $W --perception hybrid --detail full --deadline-ms 30000)
+Remove-Item Env:\CUA_FLORENCE_BATCH -ErrorAction SilentlyContinue
+$batchCaps = @($batched.elements | Where-Object { $_.caption })
+Check "P26 forced Florence batch path runs" (
+    $batched.stages.caption.status -in @("complete", "skipped") -and
+    ($batched.stages.caption.status -eq "skipped" -or $batchCaps.Count -ge 1)
+) "caption=$($batched.stages.caption.status) captions=$($batchCaps.Count)"
+
+$easy = J (RunCua state --window $W --perception hybrid --detail fast --ocr-profile easyocr-en-reference --deadline-ms 20000)
+Check "P27 EasyOCR reference backend runs" (
+    $easy.stages.ocr.status -eq "complete" -and $easy.perception.backend.ocr -match "easyocr"
+) "ocr=$($easy.stages.ocr.status) backend=$($easy.perception.backend.ocr)"
 
 taskkill /IM testpad.exe /F 2>$null | Out-Null
 if ($ownData -and $env:CUA_E2E_CLEAN -eq "1") { Remove-Item -Recurse -Force $env:CUA_DATA_DIR -ErrorAction SilentlyContinue }

@@ -19,6 +19,7 @@ pub struct AnalyzeOutput {
     pub elements: Vec<Element>,
     pub ocr_backend: String,
     pub detector_backend: String,
+    pub caption_backend: String,
     pub warnings: Vec<String>,
     pub elapsed_ms: u64,
 }
@@ -50,8 +51,9 @@ pub fn analyze(
     let mut det_items: Vec<DetItem> = Vec::new();
     let mut ocr_backend = String::new();
     let mut detector_backend = String::new();
+    let mut caption_backend = String::new();
 
-    match AnyOcr::load(profile, &super::models::ppocr_dir()) {
+    match AnyOcr::load(profile) {
         Ok(mut ocr) => {
             ocr_backend = ocr.backend().to_string();
             match ocr.recognize(width, height, rgba) {
@@ -86,25 +88,51 @@ pub fn analyze(
     if detail.captions() {
         let unlabeled = build.icons.iter().filter(|i| i.text.is_none()).count();
         if unlabeled > 0 {
-            match Captioner::load() {
-                Ok(cap) => {
-                    for icon in build.icons.iter_mut() {
+            let unlabeled = build.icons.iter().filter(|i| i.text.is_none()).count();
+            let batch_pref = std::env::var("CUA_FLORENCE_BATCH")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+            match Captioner::load_for(batch_pref && unlabeled >= 8) {
+                Ok(mut cap) => {
+                    caption_backend = cap.backend_name().to_string();
+                    let mut crops = Vec::new();
+                    let mut valid = Vec::new();
+                    for (idx, icon) in build.icons.iter_mut().enumerate() {
                         if icon.text.is_some() || icon.caption.is_some() {
                             continue;
                         }
-                        let r = icon.rect.clamp_to(&super::coordinates::Rect::new(0.0, 0.0, width as f32, height as f32));
+                        let r = icon.rect.clamp_to(&super::coordinates::Rect::new(
+                            0.0,
+                            0.0,
+                            width as f32,
+                            height as f32,
+                        ));
                         if r.w < 2.0 || r.h < 2.0 {
                             icon.caption_status = "failed_crop".into();
                             continue;
                         }
                         let (crop, cw, ch) = crop_rgba(rgba, width, height, &r);
-                        match cap.caption(cw, ch, &crop) {
-                            Ok(text) if !text.is_empty() => {
-                                icon.caption = Some(text);
-                                icon.caption_status = "complete".into();
+                        crops.push((cw, ch, crop));
+                        valid.push(idx);
+                    }
+                    if !crops.is_empty() {
+                        match cap.caption_batch(&crops) {
+                            Ok(texts) => {
+                                for (slot, text) in texts.into_iter().enumerate() {
+                                    let idx = valid[slot];
+                                    if text.is_empty() {
+                                        build.icons[idx].caption_status = "empty".into();
+                                    } else {
+                                        build.icons[idx].caption = Some(text);
+                                        build.icons[idx].caption_status = "complete".into();
+                                    }
+                                }
                             }
-                            Ok(_) => icon.caption_status = "empty".into(),
-                            Err(e) => icon.caption_status = format!("failed: {e}"),
+                            Err(e) => {
+                                for idx in valid {
+                                    build.icons[idx].caption_status = format!("failed: {e}");
+                                }
+                            }
                         }
                     }
                 }
@@ -124,6 +152,11 @@ pub fn analyze(
         elements,
         ocr_backend,
         detector_backend,
+        caption_backend: if caption_backend.is_empty() {
+            if detail.captions() { "not_loaded".into() } else { "skipped_fast".into() }
+        } else {
+            caption_backend
+        },
         warnings,
         elapsed_ms: started.elapsed().as_millis() as u64,
     })

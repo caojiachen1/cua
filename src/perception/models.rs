@@ -34,6 +34,14 @@ pub fn florence_tokenizer() -> PathBuf {
     root().join("florence2-caption").join("tokenizer.json")
 }
 
+pub fn easyocr_dir() -> PathBuf {
+    root().join("easyocr-en")
+}
+
+pub fn easyocr(name: &str) -> PathBuf {
+    easyocr_dir().join(name)
+}
+
 pub fn yolo_bpk() -> PathBuf {
     root().join("models").join("yolov9e_640.bpk")
 }
@@ -44,77 +52,104 @@ pub struct Asset {
     pub path: PathBuf,
     pub bytes: u64,
     pub sha256: &'static str,
+    pub repo: &'static str,
+    pub repo_path: &'static str,
 }
 
+pub const REPO_YOLO: &str = "cjc1887415157/yolov9e";
+pub const REPO_FLORENCE: &str = "cjc1887415157/florence2-caption";
+pub const REPO_PPOCR: &str = "cjc1887415157/ppocr-v4";
+pub const REPO_EASYOCR: &str = "cjc1887415157/easyocr-en-reference";
+
+/// Runtime assets only. Raw TorchScript/Florence checkpoints and the
+/// single-image Florence graphs are development inputs and are not downloaded
+/// by the CLI.
 pub fn manifest() -> Vec<Asset> {
     vec![
-        Asset {
-            path: omni_dir().join("icon_detect_v3-model.pt"),
-            bytes: 281_182_680,
-            sha256: "11c6cbb77f22569fab22d86c76407a83ec81ab89dbfe28279854822d6e3fb00c",
-        },
-        Asset {
-            path: omni_dir().join("icon_caption-model.safetensors"),
-            bytes: 1_083_916_964,
-            sha256: "01b934b0fe2d07b181e2d07752f16ae27c9d0ea88ddffe13a9a003aa9680f233",
-        },
-        Asset {
-            path: ppocr("ch_PP-OCRv4_det_infer.onnx"),
-            bytes: 4_745_517,
-            sha256: "d2a7720d45a54257208b1e13e36a8479894cb74155a5efe29462512d42f49da9",
-        },
-        Asset {
-            path: ppocr("ch_ppocr_mobile_v2.0_cls_infer.onnx"),
-            bytes: 585_532,
-            sha256: "e47acedf663230f8863ff1ab0e64dd2d82b838fceb5957146dab185a89d6215c",
-        },
-        Asset {
-            path: ppocr("ch_PP-OCRv4_rec_infer.onnx"),
-            bytes: 10_857_958,
-            sha256: "48fc40f24f6d2a207a2b1091d3437eb3cc3eb6b676dc3ef9c37384005483683b",
-        },
-        Asset {
-            path: ppocr("ppocr_keys_v1.txt"),
-            bytes: 26_249,
-            sha256: "28b2362ad4ab2dc38769aa72feb535e3a9ddb3fd2a7585a05920e6393b1dc7f7",
-        },
-        Asset {
-            path: ppocr("det640.onnx"),
-            bytes: 4_745_381,
-            sha256: "7e291ee86bf31c1628fd9e17b28e231fd1ebe54f4ef01c732a30ad5edc021827",
-        },
-        Asset {
-            path: ppocr("rec320.onnx"),
-            bytes: 10_857_866,
-            sha256: "5630301f9f66828f01ea3641bf155bf0b8e6ad6b326f0535b722ed50da11fd76",
-        },
-        Asset {
-            path: ppocr("cls192.onnx"),
-            bytes: 585_522,
-            sha256: "eba51c07102d74a05c6903f8750cb8bdc6dcc72324fef7e834feb848609a2f55",
-        },
         Asset {
             path: yolo_bpk(),
             bytes: 232_074_304,
             sha256: "a09935ab2768045bbbc38acf262c00e46b9b44615cd0fa497f903c69e5c4d710",
+            repo: REPO_YOLO,
+            repo_path: "yolov9e_640.bpk",
         },
         Asset {
-            path: omni_onnx("fl_encoder.onnx"),
-            bytes: 697_201_749,
-            sha256: "e30604d351ade239382253ce55946394c23f36ed52047b47734112c81c8fec15",
+            path: omni_onnx("fl_encoder_b8.onnx"),
+            bytes: 697_202_566,
+            sha256: "e22f21669922744fa40ea2875c95e3cb76b3a49b4b1c2a4276a9dc0003693926",
+            repo: REPO_FLORENCE,
+            repo_path: "onnx/fl_encoder_b8.onnx",
         },
         Asset {
-            path: omni_onnx("fl_decoder.onnx"),
+            path: omni_onnx("fl_decoder_b8.onnx"),
             bytes: 545_456_547,
-            sha256: "3c7a3d9530e98c30876a34cc3580f9d1ad1bbd6b2f245ed13f1c272658f97a48",
+            sha256: "0ef8676bad7abe61088186f1057beb990af629cbfdb00ebbc782a119ab0c69dd",
+            repo: REPO_FLORENCE,
+            repo_path: "onnx/fl_decoder_b8.onnx",
         },
         Asset {
             path: florence_tokenizer(),
             bytes: 1_355_863,
             sha256: "847bbeab6174d66a88898f729d52fa8d355fafe1bea101cf960dd404581df70e",
+            repo: REPO_FLORENCE,
+            repo_path: "tokenizer.json",
+        },
+        Asset {
+            path: ppocr("ch_PP-OCRv4_det_infer.onnx"),
+            bytes: 4_745_517,
+            sha256: "d2a7720d45a54257208b1e13e36a8479894cb74155a5efe29462512d42f49da9",
+            repo: REPO_PPOCR,
+            repo_path: "ch_PP-OCRv4_det_infer.onnx",
+        },
+        Asset {
+            path: ppocr("ch_ppocr_mobile_v2.0_cls_infer.onnx"),
+            bytes: 585_532,
+            sha256: "e47acedf663230f8863ff1ab0e64dd2d82b838fceb5957146dab185a89d6215c",
+            repo: REPO_PPOCR,
+            repo_path: "ch_ppocr_mobile_v2.0_cls_infer.onnx",
+        },
+        Asset {
+            path: ppocr("ch_PP-OCRv4_rec_infer.onnx"),
+            bytes: 10_857_958,
+            sha256: "48fc40f24f6d2a207a2b1091d3437eb3cc3eb6b676dc3ef9c37384005483683b",
+            repo: REPO_PPOCR,
+            repo_path: "ch_PP-OCRv4_rec_infer.onnx",
+        },
+        Asset {
+            path: ppocr("ppocr_keys_v1.txt"),
+            bytes: 26_249,
+            sha256: "28b2362ad4ab2dc38769aa72feb535e3a9ddb3fd2a7585a05920e6393b1dc7f7",
+            repo: REPO_PPOCR,
+            repo_path: "ppocr_keys_v1.txt",
+        },
+        Asset {
+            path: easyocr("craft_mlt_25k.onnx"),
+            bytes: 83_059_843,
+            sha256: "652b4a91ef0bb6919c5887cae79fa867079faa1459ff8acbdfc1e2e19b7e05b1",
+            repo: REPO_EASYOCR,
+            repo_path: "craft_mlt_25k.onnx",
+        },
+        Asset {
+            path: easyocr("english_g2.onnx"),
+            bytes: 15_144_535,
+            sha256: "aae25c0ac7123ca56dab45b520be6d88478a7111cddc25af335ef03dbe4e5ab6",
+            repo: REPO_EASYOCR,
+            repo_path: "english_g2.onnx",
+        },
+        Asset {
+            path: easyocr("characters.json"),
+            bytes: 495,
+            sha256: "7cf668de2547325422036e18d7d4fac8aabfa2c038dc7ae6e4601756a77ba6ed",
+            repo: REPO_EASYOCR,
+            repo_path: "characters.json",
         },
     ]
 }
+
+pub fn repo_url(repo: &str, path: &str) -> String {
+    format!("https://modelscope.cn/models/{repo}/resolve/master/{path}")
+}
+
 
 pub fn verify_manifest(deep: bool) -> anyhow::Result<serde_json::Value> {
     use sha2::Digest;
@@ -140,6 +175,8 @@ pub fn verify_manifest(deep: bool) -> anyhow::Result<serde_json::Value> {
             "size_ok": size_ok,
             "sha256_expected": a.sha256,
             "sha256_ok": hash_ok,
+            "repo": a.repo,
+            "repo_path": a.repo_path,
             "ok": entry_ok,
         }));
     }

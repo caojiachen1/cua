@@ -232,16 +232,17 @@ pub fn run(req: Request) -> Result<i32> {
     let mut det_items: Vec<DetItem> = Vec::new();
     let mut ocr_backend = String::new();
     let mut det_backend = String::new();
+    let mut caption_backend = String::new();
 
     if decision.run_vision {
         let shot = cap.as_ref().ok_or_else(|| anyhow!("vision requested without a frame"))?;
-        let want_ocr = !matches!(req.ocr_profile, OcrProfile::EasyocrEnReference);
+        let want_ocr = true;
         let t_load = Instant::now();
         // OCR and the detector are independent; load both before running so
         // GPU shader compilation and tract optimization overlap.
         let (ocr_loaded, det_loaded) = std::thread::scope(|s| {
             let ocr = if want_ocr {
-                Some(s.spawn(|| AnyOcr::load(req.ocr_profile, &models::ppocr_dir())))
+                Some(s.spawn(|| AnyOcr::load(req.ocr_profile)))
             } else {
                 None
             };
@@ -387,8 +388,13 @@ pub fn run(req: Request) -> Result<i32> {
         } else if Instant::now() >= deadline {
             stages.caption = Stage::skipped("deadline_before_caption");
         } else {
-            match Captioner::load() {
+            let unlabeled = build.icons.iter().filter(|i| i.text.is_none()).count();
+            let batch_pref = std::env::var("CUA_FLORENCE_BATCH")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+            match Captioner::load_for(batch_pref && unlabeled >= 8) {
                 Ok(c) => {
+                    caption_backend = c.backend_name().to_string();
                     captioner = Some(c);
                     stages.caption = Stage::complete(0);
                 }
@@ -427,6 +433,7 @@ pub fn run(req: Request) -> Result<i32> {
             &warnings,
             &ocr_backend,
             &det_backend,
+            &caption_backend,
         );
         save_snapshot(&current_id, req.hwnd, &cache_nodes, &partial)?;
         println!("{}", serde_json::to_string(&partial)?);
@@ -438,34 +445,66 @@ pub fn run(req: Request) -> Result<i32> {
     }
 
     // ---- captions ----
-    if let Some(cap_engine) = captioner.as_ref() {
+    if let Some(cap_engine) = captioner.as_mut() {
         let shot = cap.as_ref().ok_or_else(|| anyhow!("caption without frame"))?;
+        let batch = cap_engine.batch_size().max(1);
+        let pending: Vec<usize> = build
+            .icons
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| i.text.is_none() && i.caption.is_none())
+            .map(|(idx, _)| idx)
+            .collect();
         let mut done = 0usize;
-        for icon in build.icons.iter_mut() {
-            if icon.text.is_some() || icon.caption.is_some() {
-                continue;
-            }
+        let mut pos = 0usize;
+        while pos < pending.len() {
             if Instant::now() >= deadline {
-                icon.caption_status = "pending_deadline".into();
-                continue;
-            }
-            let r = clip_rect(icon.rect, shot.shot.width, shot.shot.height);
-            if r.w < 2.0 || r.h < 2.0 {
-                icon.caption_status = "failed_crop".into();
-                continue;
-            }
-            let (crop, cw, ch) = crop_rgba(shot.shot.rgba.as_slice(), shot.shot.width, shot.shot.height, &r);
-            match cap_engine.caption(cw, ch, &crop) {
-                Ok(text) if !text.is_empty() => {
-                    icon.caption = Some(text);
-                    icon.caption_status = "complete".into();
-                    done += 1;
+                for idx in &pending[pos..] {
+                    build.icons[*idx].caption_status = "pending_deadline".into();
                 }
-                Ok(_) => icon.caption_status = "empty".into(),
-                Err(e) => {
-                    icon.caption_status = format!("failed: {e}");
+                break;
+            }
+            let end = (pos + batch).min(pending.len());
+            let mut crops: Vec<(u32, u32, Vec<u8>)> = Vec::new();
+            let mut valid: Vec<usize> = Vec::new();
+            for idx in &pending[pos..end] {
+                let icon = &build.icons[*idx];
+                let r = clip_rect(icon.rect, shot.shot.width, shot.shot.height);
+                if r.w < 2.0 || r.h < 2.0 {
+                    build.icons[*idx].caption_status = "failed_crop".into();
+                    continue;
+                }
+                let (crop, cw, ch) = crop_rgba(
+                    shot.shot.rgba.as_slice(),
+                    shot.shot.width,
+                    shot.shot.height,
+                    &r,
+                );
+                crops.push((cw, ch, crop));
+                valid.push(*idx);
+            }
+            if !crops.is_empty() {
+                match cap_engine.caption_batch(&crops) {
+                    Ok(texts) => {
+                        for (slot, text) in texts.into_iter().enumerate() {
+                            let icon = &mut build.icons[valid[slot]];
+                            if text.is_empty() {
+                                icon.caption_status = "empty".into();
+                            } else {
+                                icon.caption = Some(text);
+                                icon.caption_status = "complete".into();
+                                done += 1;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        for idx in valid {
+                            build.icons[idx].caption_status = format!("failed: {e}");
+                        }
+                    }
                 }
             }
+            pos = end;
         }
         // "empty" means Florence ran and produced no useful caption; that is a
         // completed attempt, not a pending stage. Only deadline/crop failures
@@ -509,6 +548,7 @@ pub fn run(req: Request) -> Result<i32> {
         &warnings,
         &ocr_backend,
         &det_backend,
+        &caption_backend,
     );
     save_snapshot(&current_id, req.hwnd, &cache_nodes, &final_snapshot)?;
     if let Some(partial) = emitted {
@@ -570,6 +610,7 @@ fn assemble(
     warnings: &[String],
     ocr_backend: &str,
     det_backend: &str,
+    caption_backend: &str,
 ) -> Value {
     let mut stages = stages.clone();
     if partial {
@@ -628,7 +669,7 @@ fn assemble(
             "backend": {
                 "ocr": ocr_backend,
                 "detector": det_backend,
-                "caption": if stages.caption.status == StageStatus::Complete || stages.caption.status == StageStatus::Skipped { "tract-cpu" } else { "not_loaded" },
+                "caption": if caption_backend.is_empty() { "not_loaded" } else { caption_backend },
             },
             "model_revision": models::OMNI_REVISION,
             "route": {

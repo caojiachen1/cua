@@ -2,6 +2,8 @@
 // (ONNX Runtime), detection is Burn/WGPU and captions are tract; no Python,
 // OpenCV or LibTorch is loaded by the CLI.
 pub mod coordinates;
+pub mod download;
+pub mod easyocr;
 pub mod fusion;
 pub mod models;
 pub mod ocr;

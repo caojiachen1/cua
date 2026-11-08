@@ -19,6 +19,27 @@ PATH as `cua`. Every action prints a JSON receipt
 (`cua-action-receipt-v1`); exit code 0=ok, 2=refused-by-safety, 1=failed.
 All observation commands print JSON.
 
+## Installing with perception (ask the user first)
+
+After building cua, **ask the user once** before enabling the perception models:
+
+> cua 的感知栈需要约 1.5GB 模型（PaddleOCR、YOLOv9-E、Florence-2）。是否现在从 ModelScope
+> 下载并启用？不下载也可以继续使用纯 UIA 功能。
+
+If the user agrees, run:
+
+```powershell
+cua perception models install --accept-license
+cua perception models verify --deep
+```
+
+If the user declines, do not download anything and continue with UIA-only. Do not
+silently enable the models later without asking again. The model root is
+`CUA_MODEL_DIR` or `%LOCALAPPDATA%\cua\models`; model repos are
+`cjc1887415157/yolov9e`, `cjc1887415157/florence2-caption`,
+`cjc1887415157/ppocr-v4`, and `cjc1887415157/easyocr-en-reference`. `CUA_FLORENCE_BATCH=0` uses the single-image
+Florence graph on CPU when both graph variants are installed.
+
 ## Golden loop (Qoder observe → act → refresh)
 
 ```bash
