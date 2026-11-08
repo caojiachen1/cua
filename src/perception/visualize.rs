@@ -64,7 +64,12 @@ pub fn analyze(
         let det = scope.spawn(|| {
             let detector = Detector::load()?;
             let backend = detector.backend().to_string();
-            let items = detector.detect(width, height, rgba)?;
+            let items = detector.detect_tiled(
+                width,
+                height,
+                rgba,
+                super::vision::det_tile_budget(detail),
+            )?;
             Ok::<_, anyhow::Error>((backend, items))
         });
         (

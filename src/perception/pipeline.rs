@@ -1,6 +1,7 @@
 // perception/pipeline.rs — one bounded observation: UIA first, then the
 // minimum visual evidence the router asks for. Every emitted file/snapshot is
 // immutable and has its own id.
+use std::collections::HashMap;
 use std::time::Instant;
 
 use anyhow::{anyhow, Result};
@@ -60,14 +61,39 @@ fn element_list(
     origin: [i32; 2],
     scale: f32,
 ) -> Vec<Element> {
+    let names: HashMap<usize, String> = nodes
+        .iter()
+        .filter(|n| !n.name.trim().is_empty())
+        .map(|n| (n.i, n.name.trim().to_string()))
+        .collect();
+    let parents: HashMap<usize, Option<usize>> = nodes.iter().map(|n| (n.i, n.pa)).collect();
     let mut uia_elems = Vec::new();
     for n in nodes {
-        if let Some(e) = fusion::uia_element(n, frame_id, origin, scale) {
+        if let Some(mut e) = fusion::uia_element(n, frame_id, origin, scale) {
+            e.container = nearest_container(n, &names, &parents);
             uia_elems.push(e);
         }
     }
     let visual = fusion::visual_elements(frame_id, build);
     fusion::combine(uia_elems, visual)
+}
+
+/// Nearest named ancestor within six levels; the window itself is a valid
+/// container, unnamed grouping panes are skipped.
+fn nearest_container(
+    n: &uia::Node,
+    names: &HashMap<usize, String>,
+    parents: &HashMap<usize, Option<usize>>,
+) -> Option<String> {
+    let mut cur = n.pa;
+    for _ in 0..6 {
+        let idx = cur?;
+        if let Some(name) = names.get(&idx) {
+            return Some(name.clone());
+        }
+        cur = *parents.get(&idx)?;
+    }
+    None
 }
 
 fn capture_window(hwnd: isize, id: &str) -> Result<Captured> {
@@ -272,6 +298,7 @@ pub fn run(req: Request) -> Result<i32> {
         let shot = cap.as_ref().ok_or_else(|| anyhow!("vision requested without a frame"))?;
         let hash = frame_hash(shot.shot.width, shot.shot.height, &shot.shot.rgba);
         let shot_thumb = frame_thumb(shot.shot.width, shot.shot.height, &shot.shot.rgba);
+        let det_budget = super::vision::det_tile_budget(req.detail);
         if let Some(cached) = load_frame_cache(
             req.hwnd,
             &tree.sig,
@@ -281,6 +308,7 @@ pub fn run(req: Request) -> Result<i32> {
             shot.shot.height,
             frame_scale,
             req.ocr_profile.as_str(),
+            det_budget,
         ) {
             ocr_backend = cached.0.clone();
             det_backend = cached.1.clone();
@@ -316,7 +344,12 @@ pub fn run(req: Request) -> Result<i32> {
                         });
                         let h2 = s.spawn(|| {
                             let t = Instant::now();
-                            let r = det.detect(shot.shot.width, shot.shot.height, &shot.shot.rgba);
+                            let r = det.detect_tiled(
+                                shot.shot.width,
+                                shot.shot.height,
+                                &shot.shot.rgba,
+                                det_budget,
+                            );
                             (r, t.elapsed().as_millis() as u64)
                         });
                         (
@@ -356,7 +389,12 @@ pub fn run(req: Request) -> Result<i32> {
                     stages.ocr = Stage::failed(format!("{e:#}"));
                     det_backend = det.backend().to_string();
                     let t = Instant::now();
-                    match det.detect(shot.shot.width, shot.shot.height, &shot.shot.rgba) {
+                    match det.detect_tiled(
+                        shot.shot.width,
+                        shot.shot.height,
+                        &shot.shot.rgba,
+                        det_budget,
+                    ) {
                         Ok(items) => {
                             det_items = items;
                             stages.detector = Stage::complete_loaded(t.elapsed().as_millis() as u64, load_ms);
@@ -650,6 +688,7 @@ pub fn run(req: Request) -> Result<i32> {
                 c.shot.height,
                 frame_scale,
                 req.ocr_profile.as_str(),
+                super::vision::det_tile_budget(req.detail),
                 &ocr_backend,
                 &det_backend,
                 &caption_backend,
@@ -961,6 +1000,8 @@ struct FrameCacheFile {
     #[serde(default)]
     ocr_profile: String,
     #[serde(default)]
+    det_budget: usize,
+    #[serde(default)]
     ocr_backend: String,
     #[serde(default)]
     det_backend: String,
@@ -979,6 +1020,7 @@ fn load_frame_cache(
     h: u32,
     scale: f32,
     ocr_profile: &str,
+    det_budget: usize,
 ) -> Option<(String, String, String, fusion::VisualBuild)> {
     if !cache_enabled() {
         return None;
@@ -991,6 +1033,7 @@ fn load_frame_cache(
         || cached.height != h
         || (cached.scale - scale).abs() > 0.001
         || cached.ocr_profile != ocr_profile
+        || cached.det_budget != det_budget
     {
         return None;
     }
@@ -1041,6 +1084,7 @@ fn save_frame_cache(
     h: u32,
     scale: f32,
     ocr_profile: &str,
+    det_budget: usize,
     ocr_backend: &str,
     det_backend: &str,
     caption_backend: &str,
@@ -1057,6 +1101,7 @@ fn save_frame_cache(
         scale,
         thumb: thumb.to_vec(),
         ocr_profile: ocr_profile.to_string(),
+        det_budget,
         ocr_backend: ocr_backend.to_string(),
         det_backend: det_backend.to_string(),
         caption_backend: caption_backend.to_string(),

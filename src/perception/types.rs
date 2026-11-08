@@ -216,6 +216,10 @@ pub struct Element {
     pub uia_rid: Option<Vec<i32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uia_type: Option<String>,
+    /// Nearest named UIA ancestor (panel/toolbar/list), for disambiguating
+    /// repeated labels such as "Save" in different regions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub caption_status: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

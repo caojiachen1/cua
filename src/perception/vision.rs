@@ -25,6 +25,25 @@ pub const DET_SIZE: u32 = 640;
 pub const DET_THRESHOLD: f32 = 0.05;
 pub const DET_NMS_IOU: f32 = 0.1;
 pub const DET_MAX: usize = 300;
+/// Cross-pass dedupe: same icon seen by two overlapping tiles.
+const TILE_MERGE_IOU: f32 = 0.55;
+
+/// How many extra 640px passes each detail level may spend. `CUA_DET_TILES`
+/// overrides it (0 disables tiling, N caps it).
+pub fn det_tile_budget(detail: super::types::Detail) -> usize {
+    if let Ok(v) = std::env::var("CUA_DET_TILES") {
+        if let Ok(n) = v.trim().parse::<usize>() {
+            return n;
+        }
+    }
+    match detail {
+        // fast stays single-pass; balanced covers a large window at ~0.5x with
+        // the minimum tile cover; full runs native-resolution tiles.
+        super::types::Detail::Fast => 0,
+        super::types::Detail::Balanced => 4,
+        super::types::Detail::Full => 24,
+    }
+}
 pub const CAPTION_SIZE: u32 = 64;
 pub const CAPTION_MAX_TOKENS: usize = 20;
 pub const CAPTION_EOS: usize = 2;
@@ -91,16 +110,50 @@ impl Detector {
             .collect()
     }
 
+    /// Full-frame pass. Large frames are letterboxed down to 640, which is why
+    /// small toolbar icons can vanish; `detect_tiled` adds 1:1 passes.
     pub fn detect(&self, width: u32, height: u32, rgba: &[u8]) -> Result<Vec<DetItem>> {
+        self.detect_tiled(width, height, rgba, 0)
+    }
+
+    /// `tile_budget` is the maximum number of extra 640x640 passes (0 disables).
+    /// Each tile is cut at native resolution, so a 16px icon in a 2560px window
+    /// is seen at 16px instead of 4px.
+    pub fn detect_tiled(
+        &self,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+        tile_budget: usize,
+    ) -> Result<Vec<DetItem>> {
         if width == 0 || height == 0 || rgba.len() < (width * height * 4) as usize {
             bail!("invalid frame for detector");
         }
+        let img = image::RgbaImage::from_raw(width, height, rgba.to_vec())
+            .ok_or_else(|| anyhow!("rgba buffer size mismatch"))?;
+        let (raw, lb) = self.forward_letterboxed(&img)?;
+        let items = decode_raw(&raw, &lb, width, height)?;
+        let mut items = Self::drop_uniform_large(items, width, height, rgba);
+        if tile_budget == 0 || width.max(height) <= DET_SIZE + DET_SIZE / 4 {
+            return Ok(items);
+        }
+        // A CPU fallback would pay 15x the forward cost; keep that bounded.
+        let budget = if self.backend == "flex-cpu" { tile_budget.min(4) } else { tile_budget };
+        let mut extra = self.detect_tiles(width, height, rgba, budget)?;
+        if extra.is_empty() {
+            return Ok(items);
+        }
+        items.append(&mut extra);
+        let merged = nms(items, TILE_MERGE_IOU, DET_MAX * 2);
+        Ok(Self::drop_uniform_large(merged, width, height, rgba))
+    }
+
+    fn forward_letterboxed(&self, img: &image::RgbaImage) -> Result<(Vec<f32>, Letterbox)> {
+        let (width, height) = img.dimensions();
         let lb = Letterbox::fit(width, height, DET_SIZE, DET_SIZE);
         let rw = (width as f32 * lb.scale).round().max(1.0) as u32;
         let rh = (height as f32 * lb.scale).round().max(1.0) as u32;
-        let img = image::RgbaImage::from_raw(width, height, rgba.to_vec())
-            .ok_or_else(|| anyhow!("rgba buffer size mismatch"))?;
-        let resized = image::imageops::resize(&img, rw, rh, image::imageops::FilterType::Triangle);
+        let resized = image::imageops::resize(img, rw, rh, image::imageops::FilterType::Triangle);
         let mut data = vec![0f32; 3 * (DET_SIZE * DET_SIZE) as usize];
         let n = (DET_SIZE * DET_SIZE) as usize;
         let pad_x = lb.pad_x as usize;
@@ -125,9 +178,100 @@ impl Detector {
         let raw: Vec<f32> = out
             .try_to_vec::<f32>()
             .map_err(|e| anyhow!("detector output: {e:?}"))?;
-        let items = decode_raw(&raw, &lb, width, height)?;
-        Ok(Self::drop_uniform_large(items, width, height, rgba))
+        Ok((raw, lb))
     }
+
+    fn detect_tiles(
+        &self,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+        budget: usize,
+    ) -> Result<Vec<DetItem>> {
+        if budget == 0 {
+            return Ok(Vec::new());
+        }
+        // Smallest native tile that still fits the budget.
+        let mut tile_src = DET_SIZE;
+        let mut grid = tile_grid(width, height, tile_src);
+        while grid.0 * grid.1 > budget as u32 && tile_src < DET_SIZE * 2 {
+            tile_src += 128;
+            grid = tile_grid(width, height, tile_src);
+        }
+        let stride = ((tile_src as f32 * 0.8).round() as i32).max(1);
+        let mut items = Vec::new();
+        for row in 0..grid.1 as i32 {
+            for col in 0..grid.0 as i32 {
+                let x = (col * stride).min(width as i32 - tile_src as i32).max(0) as u32;
+                let y = (row * stride).min(height as i32 - tile_src as i32).max(0) as u32;
+                let tw = tile_src.min(width - x);
+                let th = tile_src.min(height - y);
+                if tw < 32 || th < 32 {
+                    continue;
+                }
+                // A flat background tile cannot contain an icon; skipping it
+                // keeps the extra passes focused on real UI.
+                if tile_is_uniform(rgba, width, x, y, tw, th) {
+                    continue;
+                }
+                let crop = crop_rgba(rgba, width, x, y, tw, th);
+                let img = image::RgbaImage::from_raw(tw, th, crop)
+                    .ok_or_else(|| anyhow!("tile buffer size mismatch"))?;
+                let (raw, lb) = self.forward_letterboxed(&img)?;
+                let mut local = decode_raw(&raw, &lb, tw, th)?;
+                for it in &mut local {
+                    it.rect.x += x as f32;
+                    it.rect.y += y as f32;
+                }
+                items.extend(local);
+            }
+        }
+        Ok(items)
+    }
+}
+
+/// Tiles overlap by 20% so a control on a seam is still whole in one pass.
+fn tile_grid(width: u32, height: u32, tile: u32) -> (u32, u32) {
+    let stride = ((tile as f32 * 0.8).round() as u32).max(1);
+    let axis = |total: u32| -> u32 {
+        if total <= tile {
+            1
+        } else {
+            (total - tile + stride - 1) / stride + 1
+        }
+    };
+    (axis(width), axis(height))
+}
+
+fn tile_is_uniform(rgba: &[u8], width: u32, x: u32, y: u32, cw: u32, ch: u32) -> bool {
+    let step_x = (cw / 16).max(1);
+    let step_y = (ch / 16).max(1);
+    let mut min = 255u8;
+    let mut max = 0u8;
+    let mut yy = y;
+    while yy < y + ch {
+        let mut xx = x;
+        while xx < x + cw {
+            let i = ((yy * width + xx) * 4) as usize;
+            if i + 2 < rgba.len() {
+                let lum = ((rgba[i] as u32 * 299 + rgba[i + 1] as u32 * 587 + rgba[i + 2] as u32 * 114) / 1000) as u8;
+                min = min.min(lum);
+                max = max.max(lum);
+            }
+            xx += step_x;
+        }
+        yy += step_y;
+    }
+    max.saturating_sub(min) < 6
+}
+
+fn crop_rgba(rgba: &[u8], width: u32, x: u32, y: u32, cw: u32, ch: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity((cw * ch * 4) as usize);
+    for row in 0..ch {
+        let start = (((y + row) * width + x) * 4) as usize;
+        out.extend_from_slice(&rgba[start..start + (cw * 4) as usize]);
+    }
+    out
 }
 
 /// Decode the flat [1,42000] output. The concatenation order is the official

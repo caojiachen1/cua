@@ -256,6 +256,10 @@ for ($k = 0; $k -lt 3; $k++) {
     $cached = J (RunCua state --window $W --perception hybrid --detail fast --deadline-ms 10000)
     if ($cached.stages.ocr.cache_hit -eq $true) { break }
 }
+Check "P35 elements expose their nearest named container" (
+    @($fast.elements | Where-Object { $_.container }).Count -ge 1
+) "container=$((@($fast.elements | Where-Object { $_.container }) | Select-Object -First 1).container)"
+
 Check "P30 unchanged frame reuses the visual build" (
     $cached.stages.ocr.cache_hit -eq $true -and $cached.stages.detector.cache_hit -eq $true -and
     @($cached.elements).Count -ge 3 -and $cached.perception.backend.ocr -match "paddle"
@@ -279,6 +283,20 @@ $coreEntries = @($core.installed).Count + @($core.skipped).Count
 Check "P33 install --groups core excludes the EasyOCR reference" (
     $core.ok -eq $true -and (@($core.groups) -contains "core") -and $coreEntries -eq 8
 ) "groups=$(@($core.groups) -join ',') entries=$coreEntries"
+
+# ---------- native-resolution tiles recover small controls on a large window ----------
+& $cua resize --window $W --width 1600 --height 1000 | Out-Null
+Start-Sleep -Milliseconds 500
+$bigShot = Join-Path $env:CUA_DATA_DIR "large-frame.png"
+& $cua shot --window $W --out $bigShot | Out-Null
+$env:CUA_DET_TILES = "0"
+$singlePass = J (RunCua perception visualize --image $bigShot --detail fast --out (Join-Path $env:CUA_DATA_DIR "det-single.png"))
+$env:CUA_DET_TILES = "16"
+$tiledPass = J (RunCua perception visualize --image $bigShot --detail fast --out (Join-Path $env:CUA_DATA_DIR "det-tiled.png"))
+Remove-Item Env:\CUA_DET_TILES -ErrorAction SilentlyContinue
+Check "P34 native tiles recover small controls on a large frame" (
+    $tiledPass.counts.icons -gt $singlePass.counts.icons -and $tiledPass.counts.total -gt $singlePass.counts.total
+) "single=$($singlePass.counts.icons)/$($singlePass.counts.total) tiled=$($tiledPass.counts.icons)/$($tiledPass.counts.total)"
 
 # ---------- background (occluded) perception and message-level visual click ----------
 $cover = "title:CuaPercCover"

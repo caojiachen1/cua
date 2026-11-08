@@ -103,6 +103,12 @@ cua perception click-element --observation-id <id> --element-id "vision:..."
 cua perception click-element --observation-id <id> --element-id "vision:..." --background
 ```
 
+Icon detection normally letterboxes the whole window into 640x640, which loses small
+toolbar controls on a large screen. `balanced` now adds a coarse tiled pass and `full` runs
+native-resolution 640px tiles (20% overlap, flat tiles skipped, cross-pass NMS); `CUA_DET_TILES=N`
+overrides the pass budget (0 disables). Measured on a 2560x1368 Blender window: 44 icons in
+0.95s single-pass, 202 in 2.9s at the balanced cover, 271 in 5.8s at native tiles.
+
 `state --perception ... --redact` masks every recognised string with `***`, mosaics the text
 regions in the saved PNG and skips captions, so an observation can be kept or shared without
 the screen's content. Stage timings report `load_ms` apart from `elapsed_ms`, and an unchanged
@@ -114,7 +120,8 @@ passes the same policy gate as every other action.
 
 `auto` evaluates reading/locating/actionability/coverage/capture per region. A permission
 denial stays terminal (vision never bypasses it); a bad capture does not invalidate a usable
-UIA tree. Visual elements carry `rect_px`, provenance and separate confidences; an empty
+UIA tree. UIA elements also carry `container` (their nearest named ancestor) so repeated labels can be
+told apart by panel; visual elements carry `rect_px`, provenance and separate confidences; an empty
 `target.channels` means unknown, not permission. Visual clicks require a screenshot younger
 than 5 s and unchanged window geometry; a foreground click also needs a hit test, while
 `--background` posts WM_* mouse messages to the target (no focus change, works while the

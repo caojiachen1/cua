@@ -201,7 +201,10 @@ name+type in a fresh walk and act on its current rectangle — the receipt says
 `no runtime id; re-located '<name>'`, or `cached rect (unnamed element)` — and refuse the
 action rather than clicking a stale position when the element is gone. Pattern actions
 (`set-value`, `toggle`, `get-value`) cannot target such nodes; the error says so.
-Observations cache the visual build for an unchanged frame (`stages.*.cache_hit`); set
+UIA elements include `container` (nearest named ancestor). YOLO runs at 640, so large windows
+lose small icons: `--detail balanced` adds a coarse
+tiled pass and `--detail full` runs native 640px tiles (`CUA_DET_TILES=N` overrides, 0 off;
+expect 3-6s on a 2560px screen for full). Observations cache the visual build for an unchanged frame (`stages.*.cache_hit`); set
 `CUA_PERCEPTION_CACHE=0` to force a fresh run. Stage `load_ms` is model load, `elapsed_ms`
 is inference. `perception click-element` goes through the same policy gate as `click`.
 Message-level `click --background` does reach these apps, so prefer it when the window
