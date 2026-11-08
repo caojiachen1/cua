@@ -16,6 +16,7 @@ use super::fusion::{self, DetItem, OcrItem};
 use super::models;
 use super::ocr;
 use super::ocr_backend::AnyOcr;
+use super::serve;
 use super::quality::{self, CaptureFacts};
 use super::router::{self, RouteInput, RouteState};
 use super::types::*;
@@ -293,6 +294,8 @@ pub fn run(req: Request) -> Result<i32> {
     let mut caption_backend = String::new();
     let mut build = fusion::VisualBuild::default();
     let mut cache_hit = false;
+    let mut serve_state: Option<serve::ServeState> = None;
+    let mut served = false;
 
     if decision.run_vision {
         let shot = cap.as_ref().ok_or_else(|| anyhow!("vision requested without a frame"))?;
@@ -318,6 +321,15 @@ pub fn run(req: Request) -> Result<i32> {
             stages.ocr = Stage::cached("frame_unchanged");
             stages.detector = Stage::cached("frame_unchanged");
             stages.fusion = Stage::cached("frame_unchanged");
+        } else if let Some((st, reply)) = try_serve(&req, &shot.shot, det_budget) {
+            ocr_lines = reply.ocr;
+            det_items = reply.det;
+            ocr_backend = reply.ocr_backend;
+            det_backend = reply.det_backend;
+            stages.ocr = Stage::complete_loaded(reply.ocr_ms, 0);
+            stages.detector = Stage::complete_loaded(reply.det_ms, 0);
+            serve_state = Some(st);
+            served = true;
         } else {
             let t_load = Instant::now();
             // OCR and the detector are independent; load both before running so
@@ -557,6 +569,7 @@ pub fn run(req: Request) -> Result<i32> {
             &ocr_backend,
             &det_backend,
             &caption_backend,
+            served,
         );
         save_snapshot(&current_id, req.hwnd, &cache_nodes, &partial)?;
         println!("{}", serde_json::to_string(&partial)?);
@@ -568,24 +581,17 @@ pub fn run(req: Request) -> Result<i32> {
     }
 
     // ---- captions ----
+    let batch_pref = std::env::var("CUA_FLORENCE_BATCH")
+        .map(|v| v != "0")
+        .unwrap_or(true);
     if caption_planned {
-        let batch_pref = std::env::var("CUA_FLORENCE_BATCH")
-            .map(|v| v != "0")
-            .unwrap_or(true);
-        let t_caption_load = Instant::now();
-        match Captioner::load_for(batch_pref && unlabeled >= 8) {
-            Ok(c) => {
-                caption_backend = c.backend_name().to_string();
-                captioner = Some(c);
-                stages.caption.load_ms = Some(t_caption_load.elapsed().as_millis() as u64);
-            }
-            Err(e) => stages.caption = Stage::failed(format!("{e:#}")),
-        }
-    }
-    if let Some(cap_engine) = captioner.as_mut() {
         let shot = cap.as_ref().ok_or_else(|| anyhow!("caption without frame"))?;
         let started_caption = Instant::now();
-        let batch = cap_engine.batch_size().max(1);
+        let batch = captioner
+            .as_ref()
+            .map(|c| c.batch_size())
+            .unwrap_or(CAPTION_BATCH_HINT)
+            .max(1);
         let mut pending: Vec<usize> = build
             .icons
             .iter()
@@ -628,9 +634,13 @@ pub fn run(req: Request) -> Result<i32> {
                 valid.push(*idx);
             }
             if !crops.is_empty() {
-                match cap_engine.caption_batch(&crops) {
-                    Ok(texts) => {
-                        for (slot, text) in texts.into_iter().enumerate() {
+                match caption_any(serve_state.as_ref(), &mut captioner, &crops, batch_pref) {
+                    Ok(outcome) => {
+                        if stages.caption.load_ms.is_none() {
+                            stages.caption.load_ms = outcome.load_ms;
+                        }
+                        caption_backend = outcome.backend;
+                        for (slot, text) in outcome.texts.into_iter().enumerate() {
                             let icon = &mut build.icons[valid[slot]];
                             if text.is_empty() {
                                 icon.caption_status = "empty".into();
@@ -720,6 +730,7 @@ pub fn run(req: Request) -> Result<i32> {
         &ocr_backend,
         &det_backend,
         &caption_backend,
+        served,
     );
     save_snapshot(&current_id, req.hwnd, &cache_nodes, &final_snapshot)?;
     if let Some(partial) = emitted {
@@ -782,18 +793,20 @@ fn assemble(
     ocr_backend: &str,
     det_backend: &str,
     caption_backend: &str,
+    served: bool,
 ) -> Value {
     let mut stages = stages.clone();
     if partial {
         stages.caption = Stage::pending("caption_pending");
     }
-    let elements = element_list(
+    let mut elements = element_list(
         &tree.nodes,
         build,
         frame_id,
         origin,
         cap.map(|c| c.scale).unwrap_or(1.0),
     );
+    finalize_elements(&mut elements, &tree.nodes);
     let mut q = quality.clone();
     q.state = decision.state.as_str().to_string();
     let mut qs = vec![q];
@@ -847,6 +860,7 @@ fn assemble(
                 "ocr": ocr_backend,
                 "detector": det_backend,
                 "caption": if caption_backend.is_empty() { "not_loaded" } else { caption_backend },
+                "serve": if served { "pipe" } else { "local" },
             },
             "model_revision": models::OMNI_REVISION,
             "route": {
@@ -1302,5 +1316,154 @@ mod tests {
             let min = *values.iter().min().unwrap();
             assert!(max - min <= 1, "block not flattened: {values:?}");
         }
+    }
+}
+
+const CAPTION_BATCH_HINT: usize = 8;
+
+/// Ask the resident service for the visual stages. Any failure returns None and
+/// the caller falls back to loading the models in-process.
+fn try_serve(
+    req: &Request,
+    shot: &capture::Shot,
+    tiles: usize,
+) -> Option<(serve::ServeState, serve::AnalyzeReply)> {
+    if !serve::enabled() {
+        return None;
+    }
+    let state = serve::ensure().ok()?;
+    let dir = util::ensure_data_dir().join("cache");
+    let path = serve::write_frame(&dir, &util::new_state_id(), &shot.rgba).ok()?;
+    let reply = serve::analyze(
+        &state,
+        &path,
+        shot.width,
+        shot.height,
+        req.ocr_profile,
+        tiles,
+        std::time::Duration::from_secs(180),
+    );
+    let _ = std::fs::remove_file(&path);
+    match reply {
+        Ok(r) => Some((state, r)),
+        Err(e) => {
+            eprintln!("warning: perception serve analyze failed ({e:#}); using in-process models");
+            None
+        }
+    }
+}
+
+struct CaptionOutcome {
+    texts: Vec<String>,
+    backend: String,
+    load_ms: Option<u64>,
+}
+
+/// Prefer the resident service; on any failure load the local captioner and
+/// keep the observation usable.
+fn caption_any(
+    state: Option<&serve::ServeState>,
+    captioner: &mut Option<Captioner>,
+    crops: &[(u32, u32, Vec<u8>)],
+    want_batch: bool,
+) -> Result<CaptionOutcome> {
+    if let Some(st) = state {
+        if let Ok(reply) = serve::caption(st, crops, std::time::Duration::from_secs(180)) {
+            return Ok(CaptionOutcome {
+                texts: reply.texts,
+                backend: reply.backend,
+                load_ms: Some(0),
+            });
+        }
+    }
+    if captioner.is_none() {
+        let t = Instant::now();
+        let c = Captioner::load_for(want_batch)?;
+        *captioner = Some(c);
+        let _load = t.elapsed().as_millis() as u64;
+    }
+    let cap = captioner.as_mut().unwrap();
+    let texts = cap.caption_batch(crops)?;
+    Ok(CaptionOutcome {
+        texts,
+        backend: cap.backend_name().to_string(),
+        load_ms: None,
+    })
+}
+
+/// Second pass over the emitted elements: parent relations for UIA nodes,
+/// a containing named control for visual elements, and a stable fingerprint so
+/// the same control can be recognised across observations.
+fn finalize_elements(elements: &mut [Element], nodes: &[uia::Node]) {
+    let by_index: HashMap<usize, usize> = elements
+        .iter()
+        .enumerate()
+        .filter_map(|(pos, e)| e.uia_index.map(|i| (i, pos)))
+        .collect();
+    let parents: HashMap<usize, Option<usize>> = nodes.iter().map(|n| (n.i, n.pa)).collect();
+
+    let mut uia_rects: Vec<(usize, Rect)> = Vec::new();
+    for pos in 0..elements.len() {
+        let Some(ri) = elements[pos].uia_index else { continue };
+        let mut cur = parents.get(&ri).copied().flatten();
+        for _ in 0..6 {
+            let Some(p) = cur else { break };
+            if let Some(&ppos) = by_index.get(&p) {
+                let id = elements[ppos].element_id.clone();
+                elements[pos].relations.push(Relation {
+                    kind: "parent".into(),
+                    element_id: id,
+                });
+                break;
+            }
+            cur = parents.get(&p).copied().flatten();
+        }
+        let r = &elements[pos].rect_px;
+        uia_rects.push((pos, Rect::new(r[0], r[1], r[2], r[3])));
+    }
+
+    // A visual element inside a named control inherits that control's label as
+    // its container; the smallest enclosing one wins.
+    for pos in 0..elements.len() {
+        if elements[pos].uia_index.is_some() {
+            continue;
+        }
+        let cx = elements[pos].rect_px[0] + elements[pos].rect_px[2] / 2.0;
+        let cy = elements[pos].rect_px[1] + elements[pos].rect_px[3] / 2.0;
+        let mut best: Option<(usize, f32)> = None;
+        for (p, r) in &uia_rects {
+            let inside = cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h;
+            if !inside || elements[*p].text.is_none() && elements[*p].caption.is_none() {
+                continue;
+            }
+            let area = r.w * r.h;
+            if best.map(|(_, a)| area < a).unwrap_or(true) {
+                best = Some((*p, area));
+            }
+        }
+        if let Some((p, _)) = best {
+            elements[pos].container = elements[p]
+                .text
+                .clone()
+                .or_else(|| elements[p].caption.clone());
+        }
+    }
+
+    for e in elements.iter_mut() {
+        let cx = (e.rect_px[0] + e.rect_px[2] / 2.0).round() as i32;
+        let cy = (e.rect_px[1] + e.rect_px[3] / 2.0).round() as i32;
+        let mut acc: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut mix = |text: &str| {
+            for b in text.as_bytes() {
+                acc ^= *b as u64;
+                acc = acc.wrapping_mul(0x100_0000_01b3);
+            }
+        };
+        mix(&e.kind);
+        mix(e.text.as_deref().unwrap_or(""));
+        mix(e.caption.as_deref().unwrap_or(""));
+        mix(e.container.as_deref().unwrap_or(""));
+        mix(&format!("{}:{}", cx / 8, cy / 8));
+        e.fingerprint = Some(format!("{acc:016x}"));
     }
 }

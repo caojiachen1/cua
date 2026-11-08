@@ -69,6 +69,7 @@ Write-Host ("== models: {0}" -f $env:CUA_MODEL_DIR) -ForegroundColor DarkGray
 
 & $cua sandbox stop 2>$null | Out-Null
 & $cua rec stop 2>$null | Out-Null
+& $cua perception serve --stop 2>$null | Out-Null
 taskkill /IM testpad.exe /F 2>$null | Out-Null
 Start-Sleep -Milliseconds 700
 
@@ -256,6 +257,28 @@ for ($k = 0; $k -lt 3; $k++) {
     $cached = J (RunCua state --window $W --perception hybrid --detail fast --deadline-ms 10000)
     if ($cached.stages.ocr.cache_hit -eq $true) { break }
 }
+$env:CUA_PERCEPTION_CACHE = "0"
+$env:CUA_PERCEPTION_SERVE = "1"
+$sv1 = J (RunCua state --window $W --perception hybrid --detail fast --deadline-ms 40000)
+$sv2 = J (RunCua state --window $W --perception hybrid --detail fast --deadline-ms 40000)
+Remove-Item Env:\CUA_PERCEPTION_CACHE -ErrorAction SilentlyContinue
+Remove-Item Env:\CUA_PERCEPTION_SERVE -ErrorAction SilentlyContinue
+Check "P36 resident perception service answers observations" (
+    $sv1.perception.backend.serve -eq "pipe" -and $sv2.perception.backend.serve -eq "pipe" -and
+    $sv2.stages.ocr.load_ms -eq 0 -and $sv2.stages.detector.load_ms -eq 0
+) "serve=$($sv1.perception.backend.serve)/$($sv2.perception.backend.serve) load=$($sv2.stages.ocr.load_ms)/$($sv2.stages.detector.load_ms)"
+& $cua perception serve --stop 2>$null | Out-Null
+$fpBefore = @{}
+foreach ($e in $sv1.elements) { if ($null -ne $e.uia_index -and $e.fingerprint) { $fpBefore[[int]$e.uia_index] = $e.fingerprint } }
+$stableFp = @($sv2.elements | Where-Object {
+    $null -ne $_.uia_index -and $fpBefore.ContainsKey([int]$_.uia_index) -and
+    $fpBefore[[int]$_.uia_index] -eq $_.fingerprint
+}).Count
+$parentRel = @($sv1.elements | Where-Object { @($_.relations | Where-Object { $_.kind -eq "parent" }).Count -ge 1 }).Count
+Check "P37 fingerprints stay stable and parent relations are published" (
+    $stableFp -ge 5 -and $parentRel -ge 1
+) "stable=$stableFp parents=$parentRel"
+
 Check "P35 elements expose their nearest named container" (
     @($fast.elements | Where-Object { $_.container }).Count -ge 1
 ) "container=$((@($fast.elements | Where-Object { $_.container }) | Select-Object -First 1).container)"
@@ -338,6 +361,7 @@ if ($bgSwatch) {
     Skip "P29 background visual click lands without focus change" "no visual element inside a list row"
 }
 
+& $cua perception serve --stop 2>$null | Out-Null
 taskkill /IM testpad.exe /F 2>$null | Out-Null
 if ($ownData -and $env:CUA_E2E_CLEAN -eq "1") { Remove-Item -Recurse -Force $env:CUA_DATA_DIR -ErrorAction SilentlyContinue }
 Write-Host ""

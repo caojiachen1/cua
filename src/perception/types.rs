@@ -220,6 +220,10 @@ pub struct Element {
     /// repeated labels such as "Save" in different regions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container: Option<String>,
+    /// Stable identity across observations of an unchanged layout:
+    /// kind + text + container + coarse frame position.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub caption_status: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

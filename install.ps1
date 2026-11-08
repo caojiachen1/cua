@@ -5,6 +5,8 @@ $root = $PSScriptRoot
 if (-not $root) { $root = Split-Path -Parent $MyInvocation.MyCommand.Path }
 
 Write-Host "== [1/4] cargo build --release" -ForegroundColor Cyan
+# A resident perception service locks the old binary on Windows; stop it first.
+if (Test-Path "$root\bin\cua.exe") { & "$root\bin\cua.exe" perception serve --stop 2>$null | Out-Null }
 Push-Location $root
 cargo build --release --bin cua --bin testpad
 if ($LASTEXITCODE -ne 0) { Pop-Location; throw "cargo build failed" }

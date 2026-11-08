@@ -32,6 +32,7 @@ If the user agrees, run:
 cua perception models install --accept-license              # core + optional reference
 cua perception models install --accept-license --groups core # OCR/detector/caption only
 cua perception models verify --deep
+cua perception serve --idle-minutes 30 | --stop     # resident models; CUA_PERCEPTION_SERVE=0 disables
 ```
 
 If the user declines, do not download anything and continue with UIA-only. Do not
@@ -78,6 +79,7 @@ cua perception click-element --observation-id <id> --element-id "vision:..." --b
 cua perception visualize --image shot.png --detail full --out annotated.png
 cua perception visualize --observation-id <id> --out obs.png  # exact elements the agent saw
 toolsench-perception.ps1 [-Manifest set.json]               # OCR recall + latency, repeatable
+tools\gen-ui-dataset.ps1 -OutDir <dir>                        # synthetic light/dark en/zh set
 cua state --window <sel> --perception hybrid --redact        # mask text + blur pixels
 
 # state_id is an immutable obs-<id>.json; shot only refreshes the coordinate guard,
@@ -201,7 +203,8 @@ name+type in a fresh walk and act on its current rectangle — the receipt says
 `no runtime id; re-located '<name>'`, or `cached rect (unnamed element)` — and refuse the
 action rather than clicking a stale position when the element is gone. Pattern actions
 (`set-value`, `toggle`, `get-value`) cannot target such nodes; the error says so.
-UIA elements include `container` (nearest named ancestor). YOLO runs at 640, so large windows
+UIA elements include `container` (nearest named ancestor), `relations` (parent/contains_text)
+and a stable `fingerprint`; the resident service keeps models loaded between CLI calls. YOLO runs at 640, so large windows
 lose small icons: `--detail balanced` adds a coarse
 tiled pass and `--detail full` runs native 640px tiles (`CUA_DET_TILES=N` overrides, 0 off;
 expect 3-6s on a 2560px screen for full). Observations cache the visual build for an unchanged frame (`stages.*.cache_hit`); set

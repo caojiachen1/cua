@@ -52,6 +52,15 @@ enum PerceptionOp {
         #[command(subcommand)]
         op: PerceptionModelsOp,
     },
+    /// Resident inference service: keep OCR/detector/caption loaded between calls.
+    Serve {
+        #[arg(long, help = "ask the running service to exit")]
+        stop: bool,
+        #[arg(long, default_value_t = 30, help = "exit after N idle minutes")]
+        idle_minutes: u64,
+        #[arg(long, help = "no startup banner (used when auto-spawned)")]
+        quiet: bool,
+    },
     /// Click an element selected from an immutable observation (UIA pattern
     /// first; visual elements use a fresh-frame + hit-test guarded real click,
     /// or message-level input with --background).
@@ -1808,6 +1817,17 @@ fn load_observation_json(id: &str) -> Result<Value> {
 
 fn cmd_perception(op: PerceptionOp) -> Result<i32> {
     match op {
+        PerceptionOp::Serve { stop, idle_minutes, quiet } => {
+            if stop {
+                let stopped = perception::serve::stop()?;
+                println!("{}", serde_json::to_string_pretty(&json!({
+                    "schema": "cua-perception-serve-v1",
+                    "stopped": stopped,
+                }))?);
+                return Ok(0);
+            }
+            perception::serve::serve(std::time::Duration::from_secs(idle_minutes.max(1) * 60), quiet)
+        }
         PerceptionOp::Models { op: PerceptionModelsOp::Verify { deep } } => {
             let v = perception::models::verify_manifest(deep)?;
             println!("{}", serde_json::to_string_pretty(&v)?);

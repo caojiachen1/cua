@@ -32,7 +32,9 @@ $cases = @()
 
 if ($Manifest) {
     if (-not (Test-Path $Manifest)) { throw "manifest not found: $Manifest" }
-    $cases = @(Get-Content $Manifest -Raw | ConvertFrom-Json)
+    $parsed = Get-Content $Manifest -Raw | ConvertFrom-Json
+    # PS 5.1 hands a JSON array back as one object; unwrap it explicitly.
+    $cases = if ($parsed -is [System.Array]) { $parsed } else { @($parsed) }
 } else {
     $testpad = $env:CUA_TEST_TESTPAD
     if (-not $testpad -or -not (Test-Path $testpad)) { $testpad = "$root\target\release\testpad.exe" }

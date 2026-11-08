@@ -96,12 +96,19 @@ cua perception visualize --window App --out parsed.png       # capture, parse, a
 cua perception models install --accept-license                # core + reference assets
 cua perception models install --accept-license --groups core  # OCR + detector + caption only
 cua perception models verify --deep
+cua perception serve [--idle-minutes 30] [--stop]          # resident OCR/detector/caption
 cua perception match-text --observation-id <id> --contains "Save"
 cua perception match-template --observation-id <id> --template .\icon.png
 cua perception watch-template --window App --template .\icon.png --confirm-frames 2
 cua perception click-element --observation-id <id> --element-id "vision:..."
 cua perception click-element --observation-id <id> --element-id "vision:..." --background
 ```
+
+A resident service (`cua perception serve`, spawned on first use; disable with
+`CUA_PERCEPTION_SERVE=0`, stop with `perception serve --stop`) keeps the OCR, detector and
+caption sessions loaded between CLI calls: on the fixture a warm observation drops from
+~1.47s to ~0.96s because the ~450ms reload disappears. Frames reach the service as a raw RGBA
+file path, never over the socket; any failure falls back to the in-process path.
 
 Icon detection normally letterboxes the whole window into 640x640, which loses small
 toolbar controls on a large screen. `balanced` now adds a coarse tiled pass and `full` runs
@@ -120,8 +127,9 @@ passes the same policy gate as every other action.
 
 `auto` evaluates reading/locating/actionability/coverage/capture per region. A permission
 denial stays terminal (vision never bypasses it); a bad capture does not invalidate a usable
-UIA tree. UIA elements also carry `container` (their nearest named ancestor) so repeated labels can be
-told apart by panel; visual elements carry `rect_px`, provenance and separate confidences; an empty
+UIA tree. UIA elements also carry `container` (their nearest named ancestor) and `relations` (parent /
+contains_text), and every element carries a `fingerprint` that stays stable across observations
+of the same layout, so a control can be recognised without relying on frame-scoped ids; visual elements carry `rect_px`, provenance and separate confidences; an empty
 `target.channels` means unknown, not permission. Visual clicks require a screenshot younger
 than 5 s and unchanged window geometry; a foreground click also needs a hit test, while
 `--background` posts WM_* mouse messages to the target (no focus change, works while the
@@ -137,9 +145,12 @@ The runtime assets are downloaded from four public ModelScope repos:
 `cjc1887415157/yolov9e`, `cjc1887415157/florence2-caption`,
 `cjc1887415157/ppocr-v4`, and `cjc1887415157/easyocr-en-reference`, with
 `cua perception models install --accept-license` (about 1.6GB), and checked by
-`cua perception models verify --deep`. `toolsench-perception.ps1` scores OCR recall and
+`cua perception models verify --deep
+cua perception serve [--idle-minutes 30] [--stop]          # resident OCR/detector/caption`. `toolsench-perception.ps1` scores OCR recall and
 latency on the built-in fixture (or a `-Manifest` of images + expected strings), so accuracy
-claims can be re-run instead of eyeballed. `tools\install-models.ps1`
+claims can be re-run instead of eyeballed. `tools/gen-ui-dataset.ps1` renders a six-case
+light/dark, English/Chinese, small/large dataset with known labels and a manifest; no real
+screen content is captured. `tools\install-models.ps1`
 can instead copy a locally prepared model directory. The offline exporter
 `tools/dev/export_omni_onnx.py` is a development tool only; it produces the fixed
 ONNX/Burn assets from the official TorchScript/Florence weights. Florence uses a fixed B=8 graph for dense icon sets; set

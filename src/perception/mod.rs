@@ -12,6 +12,7 @@ pub mod paddle_ocr;
 pub mod pipeline;
 pub mod quality;
 pub mod router;
+pub mod serve;
 pub mod template;
 pub mod text;
 pub mod types;
