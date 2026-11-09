@@ -1,6 +1,8 @@
 // perception/mod.rs — Rust screen perception. OCR defaults to paddle-ocr-rs
 // (ONNX Runtime), detection is Burn/WGPU and captions are tract; no Python,
 // OpenCV or LibTorch is loaded by the CLI.
+#[cfg(feature = "candle")]
+pub mod candle_florence;
 pub mod coordinates;
 pub mod download;
 pub mod easyocr;

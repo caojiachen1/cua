@@ -104,6 +104,15 @@ cua perception click-element --observation-id <id> --element-id "vision:..."
 cua perception click-element --observation-id <id> --element-id "vision:..." --background
 ```
 
+**Backend comparison (optional).** Neither candle nor ggml can load the ONNX graphs, and
+neither implements Florence-2/PP-OCR/YOLOv9, so a drop-in swap is not possible. The BART
+decoder was re-implemented on candle as a reference (`--features candle`,
+`cargo run --release --features candle --bin florence_bench`), validated against the exported
+graph's golden logits: candle max |Δlogit| 2.8e-5, ONNX Runtime 1.7e-5, argmax identical.
+CPU p50 on the 21-token decoder: ORT 7.9 ms, candle 18.5 ms, candle with KV cache 5.9 ms/step
+(1.35x faster than today's full-sequence per-step path). ggml has no matching GGUF
+architecture, so no GGUF number exists to report.
+
 A resident service (`cua perception serve`, spawned on first use; disable with
 `CUA_PERCEPTION_SERVE=0`, stop with `perception serve --stop`) keeps the OCR, detector and
 caption sessions loaded between CLI calls: on the fixture a warm observation drops from
