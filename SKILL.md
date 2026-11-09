@@ -19,6 +19,33 @@ PATH as `cua`. Every action prints a JSON receipt
 (`cua-action-receipt-v1`); exit code 0=ok, 2=refused-by-safety, 1=failed.
 All observation commands print JSON.
 
+## Installing with GPU acceleration (ask the user first)
+
+`install.ps1` enables nothing by default: the YOLO detector runs on WGPU (~400 ms
+per 640 pass). If an NVIDIA GPU and CUDA toolkit are present, ask once before
+running it:
+
+> 检测器加速有三个选项：
+> 1. CUDA：这台机器有 NVIDIA GPU，是否启用？
+> 2. autotune：启用后 640 一遍约 40 ms，但常驻感知服务每次启动要先花约 40 s
+>    编译/调优 kernel；只开 CUDA 不开 autotune 则启动约 1.5 s，但一遍仍约
+>    370 ms，和 WGPU 差不多。是否同时启用？
+> 3. TensorRT：目前只有基准结果（约 5.4 ms/遍），还没接入 CLI，暂时不能启用。
+
+Then run the matching command:
+
+```powershell
+install.ps1 -Cuda -Autotune   # CUDA + autotune: ~40 ms/pass, ~40 s first service start
+install.ps1 -Cuda             # CUDA only: ~1.5 s start, ~370 ms/pass (about WGPU speed)
+install.ps1 -Autotune         # WGPU + autotune: ~185 ms/pass, ~20 s first call
+install.ps1                   # WGPU only (default, ~400 ms/pass)
+```
+
+If the user asks for TensorRT, say it is benchmark-only today (it needs a
+separate ORT/TensorRT worker and a 124 MB engine), and do not claim it is
+enabled. A CUDA build makes the resident service use the GPU by default;
+`CUA_DET_BACKEND=cuda|wgpu|flex` overrides that per process.
+
 ## Installing with perception (ask the user first)
 
 After building cua, **ask the user once** before enabling the perception models:
@@ -208,7 +235,11 @@ Captions default to the pure-Rust candle KV decoder (ORT encoder + candle decode
 and a stable `fingerprint`; the resident service keeps models loaded between CLI calls. YOLO runs at 640, so large windows
 lose small icons: `--detail balanced` adds a coarse
 tiled pass and `--detail full` runs native 640px tiles (`CUA_DET_TILES=N` overrides, 0 off;
-expect 3-6s on a 2560px screen for full). Observations cache the visual build for an unchanged frame (`stages.*.cache_hit`); set
+expect 3-6s on a 2560px screen for full). A build with `--features cuda,autotune` keeps the detector on
+the GPU inside the resident service: `CUA_DET_BACKEND=cuda|wgpu|flex` overrides the choice, a
+640 pass drops from ~400 ms to ~40 ms after a one-time kernel compile (~40 s per service start),
+and full native tiling then costs ~0.3 s on a 1920px screen. `--features cuda` without autotune
+starts in ~1.5 s but stays at ~370 ms per pass, about WGPU speed. Observations cache the visual build for an unchanged frame (`stages.*.cache_hit`); set
 `CUA_PERCEPTION_CACHE=0` to force a fresh run. Stage `load_ms` is model load, `elapsed_ms`
 is inference. `perception click-element` goes through the same policy gate as `click`.
 Message-level `click --background` does reach these apps, so prefer it when the window

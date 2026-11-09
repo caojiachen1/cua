@@ -54,6 +54,30 @@ pub struct Detector {
     backend: &'static str,
 }
 
+/// Picks the detector device. `CUA_DET_BACKEND=cuda|wgpu|flex` forces one;
+/// otherwise CUDA (when compiled in) wins, then WGPU, then the CPU fallback.
+/// Failures are reported through the backend name, never silently hidden.
+fn pick_device() -> (Device, &'static str) {
+    let pref = std::env::var("CUA_DET_BACKEND")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    #[cfg(feature = "cuda")]
+    if pref != "wgpu" && pref != "flex" {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Device::cuda(0))) {
+            Ok(d) => return (d, "cuda"),
+            Err(_) => eprintln!("cua: CUDA detector device unavailable, falling back"),
+        }
+    }
+    if pref == "flex" {
+        return (Device::flex(), "flex-cpu");
+    }
+    match std::panic::catch_unwind(|| Device::wgpu(Default::default())) {
+        Ok(d) => (d, "wgpu"),
+        Err(_) => (Device::flex(), "flex-cpu"),
+    }
+}
+
 impl Detector {
     pub fn load() -> Result<Self> {
         let bpk = models::yolo_bpk();
@@ -63,12 +87,7 @@ impl Detector {
                 bpk.display()
             );
         }
-        // Prefer the discrete GPU; fall back to the pure-Rust CPU backend when
-        // WGPU cannot initialize. The backend is reported, never hidden.
-        let (device, backend) = match std::panic::catch_unwind(|| Device::wgpu(Default::default())) {
-            Ok(d) => (d, "wgpu"),
-            Err(_) => (Device::flex(), "flex-cpu"),
-        };
+        let (device, backend) = pick_device();
         let model = generated_yolo::Model::from_file(&bpk, &device);
         Ok(Self { model, device, backend })
     }
@@ -834,6 +853,68 @@ mod tests {
         let k = nms(items, 0.1, 10);
         assert_eq!(k.len(), 1);
         assert_eq!(k[0].score, 0.9);
+    }
+
+    /// CUDA vs WGPU on the same YOLOv9-E weights and input. Both backends run
+    /// the same Burn graph; the raw head output must agree to float noise.
+    #[test]
+    #[ignore]
+    #[cfg(feature = "cuda")]
+    fn cuda_matches_wgpu_raw() {
+        let bpk = models::yolo_bpk();
+        if !bpk.is_file() {
+            eprintln!("skip: {} missing", bpk.display());
+            return;
+        }
+        let cuda = Device::cuda(0);
+        let wgpu = match std::panic::catch_unwind(|| Device::wgpu(Default::default())) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("skip: wgpu unavailable");
+                return;
+            }
+        };
+        let n = (DET_SIZE * DET_SIZE * 3) as usize;
+        let mut data = vec![0f32; n];
+        let mut s = 1u32;
+        for v in data.iter_mut() {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            *v = ((s >> 8) & 0xff) as f32 / 255.0;
+        }
+        let infer = |device: &Device| -> Vec<f32> {
+            let model = generated_yolo::Model::from_file(&bpk, device);
+            let input = burn::tensor::Tensor::<4>::from_data(
+                TensorData::new(data.clone(), [1, 3, DET_SIZE as usize, DET_SIZE as usize]),
+                device,
+            );
+            model.forward(input).into_data().try_to_vec::<f32>().unwrap()
+        };
+        let out_cuda = infer(&cuda);
+        let out_wgpu = infer(&wgpu);
+        if let Ok(prefix) = std::env::var("CUA_DUMP_RAW") {
+            for (tag, out) in [("cuda", &out_cuda), ("wgpu", &out_wgpu)] {
+                let bytes: Vec<u8> = out.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let _ = std::fs::write(format!("{prefix}.{tag}.bin"), bytes);
+            }
+        }
+        assert_eq!(out_cuda.len(), out_wgpu.len());
+        let maxd = out_cuda
+            .iter()
+            .zip(&out_wgpu)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        let mean = out_cuda
+            .iter()
+            .zip(&out_wgpu)
+            .map(|(a, b)| (a - b).abs())
+            .sum::<f32>()
+            / out_cuda.len() as f32;
+        eprintln!("cuda vs wgpu raw: max|d|={maxd:.6} mean|d|={mean:.8} n={}", out_cuda.len());
+        // WGPU matches the ONNX CPU oracle to 6e-5. CUDA promotes f32 matmuls
+        // to TF32 tensor cores, so its raw head sits at mean ~9e-4 / max ~0.04
+        // against the oracle; the sigmoid moves by <=1.1e-3 and none of the
+        // 2000 above-threshold logits changed side in the oracle sample.
+        assert!(mean < 2e-3 && maxd < 0.1, "CUDA/WGPU diverged: max|d|={maxd} mean|d|={mean}");
     }
 }
 

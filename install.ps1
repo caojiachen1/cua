@@ -1,5 +1,6 @@
 # install.ps1 — one-click install for cua (UBB-style: build + expose + install skill)
-# Run:  powershell -ExecutionPolicy Bypass -File install.ps1
+# Run:  powershell -ExecutionPolicy Bypass -File install.ps1 [-Cuda] [-Autotune]
+param([switch]$Cuda, [switch]$Autotune)
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
 if (-not $root) { $root = Split-Path -Parent $MyInvocation.MyCommand.Path }
@@ -7,8 +8,25 @@ if (-not $root) { $root = Split-Path -Parent $MyInvocation.MyCommand.Path }
 Write-Host "== [1/4] cargo build --release" -ForegroundColor Cyan
 # A resident perception service locks the old binary on Windows; stop it first.
 if (Test-Path "$root\bin\cua.exe") { & "$root\bin\cua.exe" perception serve --stop 2>$null | Out-Null }
+# GPU choices come from the agent's install-time question (SKILL.md "Installing
+# with GPU acceleration"); nothing is enabled silently. No flags = WGPU only.
+$features = @()
+if ($Cuda) { $features += "cuda" }
+if ($Autotune) { $features += "autotune" }
+if ($Cuda) {
+    Write-Host ("   CUDA detector: on (autotune: {0})" -f $(if ($Autotune) { "on, ~40 s first call" } else { "off, ~1.5 s start" })) -ForegroundColor DarkGray
+    if (-not $env:CUDA_PATH -or -not (Test-Path $env:CUDA_PATH)) {
+        Write-Host "   warning: CUDA_PATH is not set; the detector will fall back to WGPU at runtime" -ForegroundColor Yellow
+    }
+} elseif ($Autotune) {
+    Write-Host "   autotune: WGPU kernels only (~2x, ~20 s first call)" -ForegroundColor DarkGray
+}
 Push-Location $root
-cargo build --release --bin cua --bin testpad
+if ($features.Count -gt 0) {
+    cargo build --release --bin cua --bin testpad ("--features=" + ($features -join ","))
+} else {
+    cargo build --release --bin cua --bin testpad
+}
 if ($LASTEXITCODE -ne 0) { Pop-Location; throw "cargo build failed" }
 Pop-Location
 

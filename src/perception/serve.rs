@@ -459,6 +459,14 @@ pub fn serve(idle: Duration, quiet: bool) -> Result<i32> {
     }
     let listener = TcpListener::bind(("127.0.0.1", 0)).context("bind 127.0.0.1")?;
     let port = listener.local_addr()?.port();
+    // A CUDA build keeps the detector on the GPU. The service is the one
+    // place where the first-run kernel compilation (~40 s) is paid once and
+    // then amortized; one-shot CLI calls stay on WGPU. An explicit
+    // CUA_DET_BACKEND always wins, and pick_device falls back on failure.
+    #[cfg(feature = "cuda")]
+    if std::env::var_os("CUA_DET_BACKEND").is_none() {
+        std::env::set_var("CUA_DET_BACKEND", "cuda");
+    }
     let token = crate::util::new_state_id();
     let state = json!({
         "schema": "cua-perception-serve-v1",
