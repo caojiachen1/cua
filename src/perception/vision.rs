@@ -27,6 +27,33 @@ pub const DET_NMS_IOU: f32 = 0.1;
 pub const DET_MAX: usize = 300;
 /// Cross-pass dedupe: same icon seen by two overlapping tiles.
 const TILE_MERGE_IOU: f32 = 0.55;
+/// Boxes above this fraction of the frame are re-examined at native
+/// resolution; see `Detector::verify_large`.
+const REFINE_AREA: f32 = 0.008;
+const REFINE_MIN_SIDE: f32 = 48.0;
+/// A crop detection below this score does not confirm a large box.
+const REFINE_SCORE: f32 = 0.15;
+const REFINE_MAX_BOXES: usize = 12;
+
+/// Florence captions are opt-in: they are the slowest stage and their labels
+/// are unreliable on custom icon sets (Blender, IDEs). `CUA_FLORENCE=1`
+/// re-enables them; the model assets stay installed either way.
+pub fn captions_enabled() -> bool {
+    matches!(
+        std::env::var("CUA_FLORENCE").as_deref().map(str::trim),
+        Ok("1") | Ok("true") | Ok("on")
+    )
+}
+
+fn refine_enabled() -> bool {
+    match std::env::var("CUA_DET_REFINE") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off"
+        ),
+        Err(_) => true,
+    }
+}
 
 /// How many extra 640px passes each detail level may spend. `CUA_DET_TILES`
 /// overrides it (0 disables tiling, N caps it).
@@ -101,7 +128,10 @@ impl Detector {
         items
             .into_iter()
             .filter(|d| {
-                if d.rect.area() < frame_area * 0.05 {
+                // A flat region this large is a panel/background, not a
+                // control: 0.8% is ~80x75 on a 968px window, and every real
+                // icon/button of that size carries text or a border.
+                if d.rect.area() < frame_area * 0.008 {
                     return true;
                 }
                 let r = d.rect.clamp_to(&Rect::new(0.0, 0.0, width as f32, height as f32));
@@ -154,17 +184,86 @@ impl Detector {
         let items = decode_raw(&raw, &lb, width, height)?;
         let mut items = Self::drop_uniform_large(items, width, height, rgba);
         if tile_budget == 0 || width.max(height) <= DET_SIZE + DET_SIZE / 4 {
-            return Ok(items);
+            return self.verify_large(items, width, height, rgba);
         }
         // A CPU fallback would pay 15x the forward cost; keep that bounded.
         let budget = if self.backend == "flex-cpu" { tile_budget.min(4) } else { tile_budget };
         let mut extra = self.detect_tiles(width, height, rgba, budget)?;
         if extra.is_empty() {
-            return Ok(items);
+            return self.verify_large(items, width, height, rgba);
         }
         items.append(&mut extra);
         let merged = nms(items, TILE_MERGE_IOU, DET_MAX * 2);
-        Ok(Self::drop_uniform_large(merged, width, height, rgba))
+        let merged = Self::drop_uniform_large(merged, width, height, rgba);
+        self.verify_large(merged, width, height, rgba)
+    }
+
+    /// A coarse 640 pass can mistake a blank region or a 3D scene for a large
+    /// control. Every box above `REFINE_AREA` is cropped at native resolution
+    /// and detected again: a tighter crop detection replaces it, no detection
+    /// drops it. Small boxes are left alone, so normal icons cost nothing.
+    fn verify_large(
+        &self,
+        items: Vec<DetItem>,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) -> Result<Vec<DetItem>> {
+        if !refine_enabled() || items.is_empty() {
+            return Ok(items);
+        }
+        let frame = Rect::new(0.0, 0.0, width as f32, height as f32);
+        let frame_area = frame.area().max(1.0);
+        let mut checked = 0usize;
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            let r = item.rect.clamp_to(&frame);
+            if r.area() < frame_area * REFINE_AREA
+                || r.w < REFINE_MIN_SIDE
+                || r.h < REFINE_MIN_SIDE
+                || checked >= REFINE_MAX_BOXES
+            {
+                out.push(item);
+                continue;
+            }
+            let pad = (r.w.max(r.h) * 0.08).max(8.0);
+            let x0 = (r.x - pad).floor().max(0.0);
+            let y0 = (r.y - pad).floor().max(0.0);
+            let x1 = (r.x + r.w + pad).ceil().min(width as f32);
+            let y1 = (r.y + r.h + pad).ceil().min(height as f32);
+            let (cw, ch) = ((x1 - x0) as u32, (y1 - y0) as u32);
+            if cw < 32 || ch < 32 {
+                out.push(item);
+                continue;
+            }
+            checked += 1;
+            let crop = crop_rgba(rgba, width, x0 as u32, y0 as u32, cw, ch);
+            let img = image::RgbaImage::from_raw(cw, ch, crop)
+                .ok_or_else(|| anyhow!("refine crop size mismatch"))?;
+            let (raw, lb) = self.forward_letterboxed(&img)?;
+            let mut best: Option<DetItem> = None;
+            for mut c in decode_raw(&raw, &lb, cw, ch)? {
+                if c.score < REFINE_SCORE {
+                    continue;
+                }
+                c.rect.x += x0;
+                c.rect.y += y0;
+                let inside = r.inter_area(&c.rect) / c.rect.area().max(1.0) >= 0.5;
+                if !inside && r.iou(&c.rect) < 0.2 {
+                    continue;
+                }
+                if best.as_ref().map(|b| c.score > b.score).unwrap_or(true) {
+                    best = Some(c);
+                }
+            }
+            if let Some(mut c) = best {
+                c.rect = c.rect.clamp_to(&frame);
+                if c.rect.w >= 2.0 && c.rect.h >= 2.0 {
+                    out.push(c);
+                }
+            }
+        }
+        Ok(out)
     }
 
     fn forward_letterboxed(&self, img: &image::RgbaImage) -> Result<(Vec<f32>, Letterbox)> {

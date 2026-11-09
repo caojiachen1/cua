@@ -13,7 +13,7 @@ use imageproc::rect::Rect as DrawRect;
 use super::fusion::{self, DetItem, OcrItem};
 use super::ocr_backend::AnyOcr;
 use super::types::{Detail, Element, OcrProfile, Source};
-use super::vision::{Captioner, Detector};
+use super::vision::{captions_enabled, Captioner, Detector};
 
 pub struct AnalyzeOutput {
     pub elements: Vec<Element>,
@@ -103,7 +103,8 @@ pub fn analyze(
     let build = fusion::fuse_boxes(&det_items, &ocr_items, 0.7);
     let mut build = build;
 
-    if detail.captions() {
+    let captions_on = detail.captions() && captions_enabled();
+    if captions_on {
         let unlabeled = build.icons.iter().filter(|i| i.text.is_none()).count();
         if unlabeled > 0 {
             let unlabeled = build.icons.iter().filter(|i| i.text.is_none()).count();
@@ -158,9 +159,10 @@ pub fn analyze(
             }
         }
     } else {
+        let status = if detail.captions() { "skipped_disabled" } else { "skipped_fast" };
         for icon in build.icons.iter_mut() {
             if icon.text.is_none() {
-                icon.caption_status = "skipped_fast".into();
+                icon.caption_status = status.into();
             }
         }
     }
@@ -171,7 +173,13 @@ pub fn analyze(
         ocr_backend,
         detector_backend,
         caption_backend: if caption_backend.is_empty() {
-            if detail.captions() { "not_loaded".into() } else { "skipped_fast".into() }
+            if !detail.captions() {
+                "skipped_fast".into()
+            } else if !captions_enabled() {
+                "disabled".into()
+            } else {
+                "not_loaded".into()
+            }
         } else {
             caption_backend
         },

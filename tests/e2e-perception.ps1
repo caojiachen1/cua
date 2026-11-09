@@ -228,22 +228,30 @@ if ($tractReady) {
 }
 
 $full = J (RunCua state --window $W --perception hybrid --detail full --deadline-ms 25000)
-$cap = @($full.elements | Where-Object { $_.caption })
-Check "P21 full detail runs the caption stage on the candle KV backend" (
-    $full.stages.caption.status -in @("complete", "skipped") -and
-    ($full.stages.caption.status -eq "skipped" -or ($cap.Count -ge 1 -and $full.perception.backend.caption -match "candle"))
-) "caption=$($full.stages.caption.status) backend=$($full.perception.backend.caption) captions=$($cap.Count)"
+Check "P21 Florence is off by default" (
+    $full.stages.caption.status -eq "skipped" -and
+    $full.perception.backend.caption -eq "disabled"
+) "caption=$($full.stages.caption.status) backend=$($full.perception.backend.caption)"
 Check "P22 full snapshot remains immutable and complete/partial" (
     $full.terminal -eq $true -and $full.status -in @("complete", "partial")
 ) "status=$($full.status) terminal=$($full.terminal)"
 
+$env:CUA_FLORENCE = "1"
+$fullOn = J (RunCua state --window $W --perception hybrid --detail full --deadline-ms 30000)
+$capOn = @($fullOn.elements | Where-Object { $_.caption })
+Check "P21b CUA_FLORENCE=1 runs the candle KV caption stage" (
+    $fullOn.stages.caption.status -eq "complete" -and
+    $capOn.Count -ge 1 -and
+    $fullOn.perception.backend.caption -match "candle"
+) "caption=$($fullOn.stages.caption.status) backend=$($fullOn.perception.backend.caption) captions=$($capOn.Count)"
+
 $env:CUA_FLORENCE_BATCH = "1"
 $batched = J (RunCua state --window $W --perception hybrid --detail full --deadline-ms 30000)
 Remove-Item Env:\CUA_FLORENCE_BATCH -ErrorAction SilentlyContinue
+Remove-Item Env:\CUA_FLORENCE -ErrorAction SilentlyContinue
 $batchCaps = @($batched.elements | Where-Object { $_.caption })
 Check "P26 forced Florence batch path runs" (
-    $batched.stages.caption.status -in @("complete", "skipped") -and
-    ($batched.stages.caption.status -eq "skipped" -or $batchCaps.Count -ge 1)
+    $batched.stages.caption.status -eq "complete" -and $batchCaps.Count -ge 1
 ) "caption=$($batched.stages.caption.status) captions=$($batchCaps.Count)"
 
 $easy = J (RunCua state --window $W --perception hybrid --detail fast --ocr-profile easyocr-en-reference --deadline-ms 20000)

@@ -312,6 +312,7 @@ pub fn run(req: Request) -> Result<i32> {
             frame_scale,
             req.ocr_profile.as_str(),
             det_budget,
+            super::vision::captions_enabled(),
         ) {
             ocr_backend = cached.0.clone();
             det_backend = cached.1.clone();
@@ -524,7 +525,11 @@ pub fn run(req: Request) -> Result<i32> {
         Detail::Balanced => 12,
         Detail::Full => usize::MAX,
     };
-    if !req.detail.captions() {
+    if !super::vision::captions_enabled() {
+        // Florence is opt-in: slow, and unreliable on custom icon sets.
+        stages.caption = Stage::skipped("florence_disabled");
+        caption_backend = "disabled".into();
+    } else if !req.detail.captions() {
         stages.caption = Stage::skipped("fast_detail");
     } else if build.icons.is_empty() {
         stages.caption = Stage::skipped("no_icons");
@@ -699,6 +704,7 @@ pub fn run(req: Request) -> Result<i32> {
                 frame_scale,
                 req.ocr_profile.as_str(),
                 super::vision::det_tile_budget(req.detail),
+                super::vision::captions_enabled(),
                 &ocr_backend,
                 &det_backend,
                 &caption_backend,
@@ -1002,8 +1008,12 @@ struct CachedText {
     confidence: Option<f32>,
 }
 
+const FRAME_CACHE_VERSION: u32 = 2;
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct FrameCacheFile {
+    #[serde(default)]
+    version: u32,
     sig: String,
     hash: u64,
     width: u32,
@@ -1015,6 +1025,8 @@ struct FrameCacheFile {
     ocr_profile: String,
     #[serde(default)]
     det_budget: usize,
+    #[serde(default)]
+    captions: bool,
     #[serde(default)]
     ocr_backend: String,
     #[serde(default)]
@@ -1035,19 +1047,22 @@ fn load_frame_cache(
     scale: f32,
     ocr_profile: &str,
     det_budget: usize,
+    captions: bool,
 ) -> Option<(String, String, String, fusion::VisualBuild)> {
     if !cache_enabled() {
         return None;
     }
     let bytes = std::fs::read(cache_path(hwnd)).ok()?;
     let cached: FrameCacheFile = serde_json::from_slice(&bytes).ok()?;
-    if cached.sig != sig
+    if cached.version != FRAME_CACHE_VERSION
+        || cached.sig != sig
         || (cached.hash != hash && !thumbs_close(&cached.thumb, thumb))
         || cached.width != w
         || cached.height != h
         || (cached.scale - scale).abs() > 0.001
         || cached.ocr_profile != ocr_profile
         || cached.det_budget != det_budget
+        || cached.captions != captions
     {
         return None;
     }
@@ -1099,6 +1114,7 @@ fn save_frame_cache(
     scale: f32,
     ocr_profile: &str,
     det_budget: usize,
+    captions: bool,
     ocr_backend: &str,
     det_backend: &str,
     caption_backend: &str,
@@ -1108,6 +1124,7 @@ fn save_frame_cache(
         return Ok(());
     }
     let file = FrameCacheFile {
+        version: FRAME_CACHE_VERSION,
         sig: sig.to_string(),
         hash,
         width: w,
@@ -1116,6 +1133,7 @@ fn save_frame_cache(
         thumb: thumb.to_vec(),
         ocr_profile: ocr_profile.to_string(),
         det_budget,
+        captions,
         ocr_backend: ocr_backend.to_string(),
         det_backend: det_backend.to_string(),
         caption_backend: caption_backend.to_string(),

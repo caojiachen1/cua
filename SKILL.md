@@ -230,12 +230,16 @@ name+type in a fresh walk and act on its current rectangle — the receipt says
 `no runtime id; re-located '<name>'`, or `cached rect (unnamed element)` — and refuse the
 action rather than clicking a stale position when the element is gone. Pattern actions
 (`set-value`, `toggle`, `get-value`) cannot target such nodes; the error says so.
-Captions default to the pure-Rust candle KV decoder (ORT encoder + candle decode);
-`CUA_FLORENCE_BACKEND=ort|tract` overrides it. UIA elements include `container` (nearest named ancestor), `relations` (parent/contains_text)
+Florence captions are opt-in: `CUA_FLORENCE=1` enables them (pure-Rust candle KV decoder by
+default; `CUA_FLORENCE_BACKEND=ort|tract` overrides it). They are the slowest stage and their
+labels are unreliable on custom icon sets, so the default skips them while keeping the models
+installed. UIA elements include `container` (nearest named ancestor), `relations` (parent/contains_text)
 and a stable `fingerprint`; the resident service keeps models loaded between CLI calls. YOLO runs at 640, so large windows
 lose small icons: `--detail balanced` adds a coarse
 tiled pass and `--detail full` runs native 640px tiles (`CUA_DET_TILES=N` overrides, 0 off;
-expect 3-6s on a 2560px screen for full). A build with `--features cuda,autotune` keeps the detector on
+expect 3-6s on a 2560px screen for full). Large detections (>=0.8% of the frame) get a second
+native-resolution pass: flat regions are dropped as background and confirmed boxes are tightened
+(`CUA_DET_REFINE=0` disables it). A build with `--features cuda,autotune` keeps the detector on
 the GPU inside the resident service: `CUA_DET_BACKEND=cuda|wgpu|flex` overrides the choice, a
 640 pass drops from ~400 ms to ~40 ms after a one-time kernel compile (~40 s per service start),
 and full native tiling then costs ~0.3 s on a 1920px screen. `--features cuda` without autotune
