@@ -45,6 +45,11 @@ pub fn florence_tokenizer() -> PathBuf {
     root().join("florence2-caption").join("tokenizer.json")
 }
 
+/// Decoder-only weights used by the candle KV runtime (no DaViT encoder).
+pub fn florence_decoder() -> PathBuf {
+    root().join("florence2-caption").join("decoder.safetensors")
+}
+
 pub fn easyocr_dir() -> PathBuf {
     root().join("easyocr-en")
 }
@@ -101,6 +106,14 @@ pub fn manifest() -> Vec<Asset> {
             sha256: "0ef8676bad7abe61088186f1057beb990af629cbfdb00ebbc782a119ab0c69dd",
             repo: REPO_FLORENCE,
             repo_path: "onnx/fl_decoder_b8.onnx",
+            group: GROUP_CORE,
+        },
+        Asset {
+            path: florence_decoder(),
+            bytes: 387_581_336,
+            sha256: "c28d34aa4b431cf45f8d6b7f55cc8e269709ba9860540b39d169af724059463b",
+            repo: REPO_FLORENCE,
+            repo_path: "decoder.safetensors",
             group: GROUP_CORE,
         },
         Asset {
@@ -241,14 +254,14 @@ mod tests {
 
     #[test]
     fn manifest_for_empty_returns_all() {
-        assert_eq!(manifest_for(&[]).len(), 11);
-        assert_eq!(manifest_for(&g(GROUP_ALL)).len(), 11);
+        assert_eq!(manifest_for(&[]).len(), 12);
+        assert_eq!(manifest_for(&g(GROUP_ALL)).len(), 12);
     }
 
     #[test]
     fn manifest_for_core_excludes_easyocr() {
         let core = manifest_for(&g(GROUP_CORE));
-        assert_eq!(core.len(), 8);
+        assert_eq!(core.len(), 9);
         assert!(core.iter().all(|a| a.group == GROUP_CORE));
         assert!(!core.iter().any(|a| a.repo == REPO_EASYOCR));
         assert!(!core.iter().any(|a| a.path.starts_with(easyocr_dir())));

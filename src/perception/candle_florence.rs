@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use candle_core::{DType, Device, Tensor, D};
 
 pub const HIDDEN: usize = 768;
@@ -110,8 +110,22 @@ fn causal_mask(seq: usize, dev: &Device) -> Result<Tensor> {
 }
 
 impl CandleFlorence {
+    /// Prefer the decoder-only safetensors (smaller, installed by
+    /// `perception models install`); fall back to the full checkpoint.
+    pub fn load_preferring_decoder(model_dir: &Path) -> Result<Self> {
+        let decoder = model_dir.join("decoder.safetensors");
+        if decoder.is_file() {
+            return Self::load_file(&decoder);
+        }
+        Self::load(model_dir)
+    }
+
     pub fn load(model_dir: &Path) -> Result<Self> {
         let path = model_dir.join("model.safetensors");
+        Self::load_file(&path)
+    }
+
+    fn load_file(path: &Path) -> Result<Self> {
         if !path.is_file() {
             return Err(anyhow!(
                 "Florence safetensors missing: {} (the candle backend reads the original weights)",
@@ -119,7 +133,7 @@ impl CandleFlorence {
             ));
         }
         let dev = Device::Cpu;
-        let map = candle_core::safetensors::load(&path, &dev)
+        let map = candle_core::safetensors::load(path, &dev)
             .with_context(|| format!("load {}", path.display()))?;
         let base = "language_model.model.decoder";
         let mut layers = Vec::with_capacity(LAYERS);
@@ -156,6 +170,14 @@ impl CandleFlorence {
             )?,
             layers,
         })
+    }
+
+    /// Build the [13, 768] encoder tensor for one caption row.
+    pub fn encode_hidden(&self, enc: &[f32]) -> Result<Tensor> {
+        if enc.len() != 13 * HIDDEN {
+            bail!("encoder hidden has {} floats, expected {}", enc.len(), 13 * HIDDEN);
+        }
+        Ok(Tensor::from_vec(enc.to_vec(), (13, HIDDEN), &self.dev)?)
     }
 
     pub fn empty_session(&self, enc: &Tensor) -> Result<Session> {

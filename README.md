@@ -80,8 +80,8 @@ graded `status` (`captured` / `suspected_black` / `no_pixels` / `capture_failed`
 `state` can add OCR, icon detection and Florence-2 captions on top of the UIA tree. The CLI
 is Rust; OCR defaults to the same **paddle-ocr-rs / RapidOCR PP-OCRv4** engine used by
 CommandFlow-rs (ONNX Runtime backend), icon detection uses Burn/WGPU YOLOv9-E, and captions
-use Florence-2 through ONNX Runtime with DirectML. Python, OpenCV and LibTorch are not
-loaded by the CLI. The earlier pure-Rust tract OCR port remains available as
+use Florence-2: ONNX Runtime runs the DaViT encoder and a pure-Rust candle decoder with a
+KV cache decodes one token per step. Python, OpenCV and LibTorch are not loaded by the CLI. The earlier pure-Rust tract OCR port remains available as
 `--ocr-profile ppocr-zh-desktop`; it needs the locally exported graphs and is not part of
 `models install`.
 
@@ -109,8 +109,11 @@ neither implements Florence-2/PP-OCR/YOLOv9, so a drop-in swap is not possible. 
 decoder was re-implemented on candle as a reference (`--features candle`,
 `cargo run --release --features candle --bin florence_bench`), validated against the exported
 graph's golden logits: candle max |Δlogit| 2.8e-5, ONNX Runtime 1.7e-5, argmax identical.
-CPU p50 on the 21-token decoder: ORT 7.9 ms, candle 18.5 ms, candle with KV cache 5.9 ms/step
-(1.35x faster than today's full-sequence per-step path). ggml has no matching GGUF
+CPU p50 on the 21-token decoder: ORT 7.9 ms, candle 18.5 ms, candle with KV cache 5.9 ms/step.
+That KV path is the default caption backend now: on the fixture the caption stage drops from
+6.4s (ORT DirectML, per-step full sequence) to 3.2s with identical captions, and rows run in
+parallel. `CUA_FLORENCE_BACKEND=ort|tract` forces the older backends; without the weight files
+the runtime falls back automatically. ggml has no matching GGUF
 architecture, so no GGUF number exists to report.
 
 A resident service (`cua perception serve`, spawned on first use; disable with
@@ -153,7 +156,8 @@ pixels.
 The runtime assets are downloaded from four public ModelScope repos:
 `cjc1887415157/yolov9e`, `cjc1887415157/florence2-caption`,
 `cjc1887415157/ppocr-v4`, and `cjc1887415157/easyocr-en-reference`, with
-`cua perception models install --accept-license` (about 1.6GB), and checked by
+`cua perception models install --accept-license` (about 1.9GB; the candle decoder adds a
+387MB decoder-only safetensors), and checked by
 `cua perception models verify --deep
 cua perception serve [--idle-minutes 30] [--stop]          # resident OCR/detector/caption`. `toolsench-perception.ps1` scores OCR recall and
 latency on the built-in fixture (or a `-Manifest` of images + expected strings), so accuracy

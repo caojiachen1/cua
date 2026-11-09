@@ -29,7 +29,7 @@ After building cua, **ask the user once** before enabling the perception models:
 If the user agrees, run:
 
 ```powershell
-cua perception models install --accept-license              # core + optional reference
+cua perception models install --accept-license              # core (incl. candle decoder) + optional reference
 cua perception models install --accept-license --groups core # OCR/detector/caption only
 cua perception models verify --deep
 cua perception serve --idle-minutes 30 | --stop     # resident models; CUA_PERCEPTION_SERVE=0 disables
@@ -203,7 +203,8 @@ name+type in a fresh walk and act on its current rectangle — the receipt says
 `no runtime id; re-located '<name>'`, or `cached rect (unnamed element)` — and refuse the
 action rather than clicking a stale position when the element is gone. Pattern actions
 (`set-value`, `toggle`, `get-value`) cannot target such nodes; the error says so.
-UIA elements include `container` (nearest named ancestor), `relations` (parent/contains_text)
+Captions default to the pure-Rust candle KV decoder (ORT encoder + candle decode);
+`CUA_FLORENCE_BACKEND=ort|tract` overrides it. UIA elements include `container` (nearest named ancestor), `relations` (parent/contains_text)
 and a stable `fingerprint`; the resident service keeps models loaded between CLI calls. YOLO runs at 640, so large windows
 lose small icons: `--detail balanced` adds a coarse
 tiled pass and `--detail full` runs native 640px tiles (`CUA_DET_TILES=N` overrides, 0 off;

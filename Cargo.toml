@@ -5,7 +5,8 @@ edition = "2021"
 description = "cua - Windows computer-use CLI (fusion of Trae / Qoder / ZCode designs)"
 
 [features]
-# Optional pure-Rust decoder runtime used by the Florence benchmark.
+default = ["candle"]
+# Pure-Rust Florence decoder (KV cache); the default caption backend.
 candle = ["dep:candle-core", "dep:candle-nn"]
 
 [[bin]]

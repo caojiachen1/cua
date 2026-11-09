@@ -352,12 +352,20 @@ enum FlorenceBackend {
         dec: Run,
         batch: usize,
     },
+    #[cfg(feature = "candle")]
+    Candle {
+        enc: ort::session::Session,
+        model: std::sync::Arc<super::candle_florence::CandleFlorence>,
+        batch: usize,
+    },
 }
 
 impl FlorenceBackend {
     fn batch(&self) -> usize {
         match self {
             Self::Ort { batch, .. } | Self::Tract { batch, .. } => *batch,
+            #[cfg(feature = "candle")]
+            Self::Candle { batch, .. } => *batch,
         }
     }
 
@@ -365,11 +373,28 @@ impl FlorenceBackend {
         match self {
             Self::Ort { device, .. } => device,
             Self::Tract { .. } => "tract-cpu",
+            #[cfg(feature = "candle")]
+            Self::Candle { .. } => "candle-cpu-kv",
         }
     }
 
     fn encode(&mut self, pixels: &[f32], batch: usize) -> Result<Vec<f32>> {
         match self {
+            #[cfg(feature = "candle")]
+            Self::Candle { enc, .. } => {
+                let input = ort::value::Tensor::from_array((
+                    [batch, 3, CAPTION_SIZE as usize, CAPTION_SIZE as usize],
+                    pixels.to_vec(),
+                ))
+                .map_err(|e| anyhow!("ORT encoder input: {e}"))?;
+                let outputs = enc
+                    .run(ort::inputs![input])
+                    .map_err(|e| anyhow!("ORT encoder run: {e}"))?;
+                let (_, data) = outputs[0]
+                    .try_extract_tensor::<f32>()
+                    .map_err(|e| anyhow!("ORT encoder output: {e}"))?;
+                Ok(data.to_vec())
+            }
             Self::Ort { enc, .. } => {
                 let input = ort::value::Tensor::from_array((
                     [batch, 3, CAPTION_SIZE as usize, CAPTION_SIZE as usize],
@@ -450,6 +475,8 @@ impl FlorenceBackend {
                 }
                 Ok(rows)
             }
+            #[cfg(feature = "candle")]
+            Self::Candle { .. } => bail!("the candle backend decodes incrementally"),
         }
     }
 }
@@ -535,6 +562,21 @@ fn clean_caption(text: String) -> String {
     if path_like { String::new() } else { text }
 }
 
+fn ort_session(path: &Path, gpu: bool) -> Result<ort::session::Session> {
+    let mut b = ort::session::Session::builder()
+        .map_err(|e| anyhow!("ORT session builder: {e}"))?;
+    if gpu {
+        b = b
+            .with_execution_providers([ort::ep::DirectML::default()
+                .with_device_id(0)
+                .build()
+                .error_on_failure()])
+            .map_err(|e| anyhow!("ORT DirectML registration: {e}"))?;
+    }
+    b.commit_from_file(path)
+        .map_err(|e| anyhow!("ORT load {}: {e}", path.display()))
+}
+
 fn ort_session_pair(
     enc_path: &Path,
     dec_path: &Path,
@@ -572,15 +614,16 @@ impl Captioner {
         let single_dec = models::omni_onnx("fl_decoder.onnx");
         let batch_files = batch_enc.is_file() && batch_dec.is_file();
         let single_files = single_enc.is_file() && single_dec.is_file();
-        let use_batch = batch_files && (batch_requested || !single_files);
+        let use_batch = (batch_enc.is_file() && batch_requested || !single_enc.is_file())
+            && batch_enc.is_file();
         let (enc_path, dec_path, batch) = if use_batch {
             (batch_enc, batch_dec, CAPTION_BATCH_SIZE)
         } else {
             (single_enc, single_dec, 1)
         };
-        if !enc_path.is_file() || !dec_path.is_file() {
+        if !enc_path.is_file() {
             bail!(
-                "Florence-2 ONNX graphs missing under {} (run 'cua perception models install')",
+                "Florence-2 encoder missing under {} (run 'cua perception models install')",
                 models::omni_dir().display()
             );
         }
@@ -588,6 +631,47 @@ impl Captioner {
         let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
             .map_err(|e| anyhow!("tokenizer {}: {e}", tok_path.display()))?;
 
+        let want = std::env::var("CUA_FLORENCE_BACKEND")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        // Decoder-only safetensors (smaller download) or the full checkpoint.
+        let weights = models::root().join("florence2-caption");
+        #[cfg(feature = "candle")]
+        {
+            let ready = models::florence_decoder().is_file() || weights.join("model.safetensors").is_file();
+            if (want.is_empty() || want == "candle") && ready {
+                let enc = ort_session(&enc_path, true).or_else(|gpu_err| {
+                    eprintln!("warning: Florence encoder DirectML unavailable ({gpu_err:#}); trying ORT CPU");
+                    ort_session(&enc_path, false)
+                });
+                match enc {
+                    Ok(enc) => match super::candle_florence::CandleFlorence::load_preferring_decoder(&weights) {
+                        Ok(model) => {
+                            return Ok(Self {
+                                backend: FlorenceBackend::Candle {
+                                    enc,
+                                    model: std::sync::Arc::new(model),
+                                    batch,
+                                },
+                                tokenizer,
+                            })
+                        }
+                        Err(e) => {
+                            eprintln!("warning: candle decoder unavailable ({e:#}); falling back to ORT");
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("warning: Florence encoder unavailable ({e:#}); falling back to ORT decode");
+                    }
+                }
+            }
+        }
+        if !dec_path.is_file() {
+            bail!(
+                "Florence-2 decoder missing under {} (run 'cua perception models install')",
+                models::omni_dir().display()
+            );
+        }
         let backend = match ort_session_pair(&enc_path, &dec_path, true) {
             Ok((enc, dec)) => FlorenceBackend::Ort {
                 enc,
@@ -653,6 +737,36 @@ impl Captioner {
             let hidden = self.backend.encode(&pixels, batch)?;
             if hidden.len() != batch * 13 * 768 {
                 bail!("unexpected Florence hidden size {}", hidden.len());
+            }
+            #[cfg(feature = "candle")]
+            if let FlorenceBackend::Candle { model, .. } = &self.backend {
+                // One KV sequence per row, rows in parallel: a B=8 ONNX graph
+                // always pays for eight rows, while real icon counts are often
+                // smaller and each row is memory-bound anyway.
+                let model = std::sync::Arc::clone(model);
+                let tokenizer = &self.tokenizer;
+                let texts: Vec<Result<String>> = std::thread::scope(|scope| {
+                    let mut handles = Vec::with_capacity(real);
+                    for row in 0..real {
+                        let model = std::sync::Arc::clone(&model);
+                        let enc_row =
+                            hidden[row * 13 * 768..(row + 1) * 13 * 768].to_vec();
+                        handles.push(scope.spawn(move || {
+                            candle_caption_row(&model, &enc_row, tokenizer)
+                        }));
+                    }
+                    handles
+                        .into_iter()
+                        .map(|h| {
+                            h.join()
+                                .unwrap_or_else(|_| Err(anyhow!("caption row panicked")))
+                        })
+                        .collect()
+                });
+                for (row, text) in texts.into_iter().enumerate() {
+                    out[start + row] = text?;
+                }
+                continue;
             }
             let seq = CAPTION_MAX_TOKENS + 1;
             let mut ids = vec![1i64; batch * seq];
@@ -721,4 +835,30 @@ mod tests {
         assert_eq!(k.len(), 1);
         assert_eq!(k[0].score, 0.9);
     }
+}
+
+/// One incremental KV caption. Equivalent to re-running the full 21-token
+/// graph and reading the last position (verified against golden logits).
+#[cfg(feature = "candle")]
+fn candle_caption_row(
+    model: &super::candle_florence::CandleFlorence,
+    enc: &[f32],
+    tokenizer: &tokenizers::Tokenizer,
+) -> Result<String> {
+    let enc_t = model.encode_hidden(enc)?;
+    let mut session = model.empty_session(&enc_t)?;
+    let mut generated: Vec<u32> = Vec::new();
+    let mut id = 2u32; // decoder start
+    for _ in 0..CAPTION_MAX_TOKENS {
+        let logits = model.step(id, &mut session)?;
+        let row = logits.flatten_all()?.to_vec1::<f32>()?;
+        let best = best_token(&row, &generated);
+        if best == CAPTION_EOS {
+            break;
+        }
+        generated.push(best as u32);
+        id = best as u32;
+    }
+    let text = tokenizer.decode(&generated, true).unwrap_or_default();
+    Ok(clean_caption(text))
 }

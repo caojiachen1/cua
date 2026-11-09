@@ -229,10 +229,10 @@ if ($tractReady) {
 
 $full = J (RunCua state --window $W --perception hybrid --detail full --deadline-ms 25000)
 $cap = @($full.elements | Where-Object { $_.caption })
-Check "P21 full detail runs the caption stage" (
+Check "P21 full detail runs the caption stage on the candle KV backend" (
     $full.stages.caption.status -in @("complete", "skipped") -and
-    ($full.stages.caption.status -eq "skipped" -or $cap.Count -ge 1)
-) "caption=$($full.stages.caption.status) captions=$($cap.Count)"
+    ($full.stages.caption.status -eq "skipped" -or ($cap.Count -ge 1 -and $full.perception.backend.caption -match "candle"))
+) "caption=$($full.stages.caption.status) backend=$($full.perception.backend.caption) captions=$($cap.Count)"
 Check "P22 full snapshot remains immutable and complete/partial" (
     $full.terminal -eq $true -and $full.status -in @("complete", "partial")
 ) "status=$($full.status) terminal=$($full.terminal)"
@@ -304,7 +304,7 @@ Check "P32 visualize renders a stored observation without re-parsing" (
 $core = J (RunCua perception models install --accept-license --groups core)
 $coreEntries = @($core.installed).Count + @($core.skipped).Count
 Check "P33 install --groups core excludes the EasyOCR reference" (
-    $core.ok -eq $true -and (@($core.groups) -contains "core") -and $coreEntries -eq 8
+    $core.ok -eq $true -and (@($core.groups) -contains "core") -and $coreEntries -eq 9
 ) "groups=$(@($core.groups) -join ',') entries=$coreEntries"
 
 # ---------- native-resolution tiles recover small controls on a large window ----------
