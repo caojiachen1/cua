@@ -24,6 +24,23 @@ namespace CuaSessionHost
         public static extern bool WTSLogoffSession(
             IntPtr serverHandle, uint sessionId, [MarshalAs(UnmanagedType.Bool)] bool wait);
 
+        [StructLayout(LayoutKind.Sequential)]
+        public struct WTS_SESSION_INFO
+        {
+            public uint SessionId;
+            public IntPtr WinStationName;
+            public int State;
+        }
+
+        [DllImport("wtsapi32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "WTSEnumerateSessionsW")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool WTSEnumerateSessions(
+            IntPtr serverHandle, int reserved, int version,
+            out IntPtr sessionInfo, out int count);
+
+        [DllImport("wtsapi32.dll")]
+        public static extern void WTSFreeMemory(IntPtr memory);
+
         [DllImport("user32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool EnumChildWindows(

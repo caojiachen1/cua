@@ -387,7 +387,7 @@ namespace CuaSessionHost
 
             _tray = new NotifyIcon
             {
-                Icon = Theme.TrayIcon(),
+                Icon = Theme.AppIcon(true),
                 Text = "cua child session",
                 Visible = true,
                 ContextMenuStrip = _trayMenu
@@ -465,8 +465,8 @@ namespace CuaSessionHost
         {
             if (_tray == null) return;
             string id = _childId.HasValue ? _childId.Value.ToString() : "—";
-            string state = !SessionConnected ? " · 未连接" : (_viewOnly ? " · 只读" : " · 可控");
-            _tray.Text = "cua 子会话 " + id + state;
+            _tray.Text = "cua child session · session " + id +
+                         (_viewOnly ? " · view only" : " · user control");
         }
 
         private void StartPipe()
@@ -589,6 +589,7 @@ namespace CuaSessionHost
             {
                 if (_connected)
                 {
+                    uint? lastSession = _childId;
                     _connected = false;
                     _childId = null;
                     _agentPipe = null;
@@ -601,10 +602,12 @@ namespace CuaSessionHost
                     _statusPill.SetState("子会话已断开", Theme.Warn);
                     UpdateMeta();
                     WriteState();
-                    // The tray icon is the "session is alive" light: once the
-                    // child session is gone the host goes with it, so a visible
-                    // icon can never outlive its session.
-                    if (!_opt.Preview) StopSession();
+                    // The tray icon means "a session is alive". A dropped viewer
+                    // connection is normal (it reconnects), so only leave when
+                    // the WTS session itself is gone; then the icon goes too.
+                    if (!_opt.Preview && lastSession.HasValue &&
+                        !ChildSessionApi.SessionExists(lastSession.Value))
+                        StopSession();
                 }
                 return;
             }

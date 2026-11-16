@@ -43,6 +43,38 @@ namespace CuaSessionHost
             return id;
         }
 
+        /// <summary>
+        /// True while that session still exists in WTS — active, disconnected or
+        /// idle all count; a logged-off session disappears from the list. The
+        /// host uses this (not the viewer's RDP connection, which drops and
+        /// reconnects) to decide whether the tray icon still has a session
+        /// behind it.
+        /// </summary>
+        public static bool SessionExists(uint id)
+        {
+            IntPtr buffer;
+            int count;
+            if (!Native.WTSEnumerateSessions(IntPtr.Zero, 0, 1, out buffer, out count))
+                return true; // never tear the host down on a failed probe
+            try
+            {
+                int size = Marshal.SizeOf(typeof(Native.WTS_SESSION_INFO));
+                for (int i = 0; i < count; i++)
+                {
+                    IntPtr item = new IntPtr(buffer.ToInt64() + (long)i * size);
+                    var info = (Native.WTS_SESSION_INFO)Marshal.PtrToStructure(
+                        item, typeof(Native.WTS_SESSION_INFO));
+                    if (info.SessionId != id) continue;
+                    return info.State != 7 && info.State != 8; // Reset, Down
+                }
+                return false;
+            }
+            finally
+            {
+                Native.WTSFreeMemory(buffer);
+            }
+        }
+
         public static void Logoff(uint id)
         {
             if (!Native.WTSLogoffSession(IntPtr.Zero, id, true))
