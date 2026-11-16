@@ -834,6 +834,9 @@ enum Cmd {
         /// Do not keep what the browser imports into a brand-new profile
         #[arg(long = "no-import-passwords")]
         no_import_passwords: bool,
+        /// Register this profile as a UBB slot (loads the extension and pairs it)
+        #[arg(long)]
+        ubb: bool,
     },
     /// Screen recording (JPEG frames -> mp4, or an HTML player when ffmpeg is missing)
     Rec {
@@ -1394,6 +1397,7 @@ fn dispatch(cmd: Cmd) -> i32 {
                 browser,
                 import_passwords,
                 no_import_passwords,
+                ubb,
             } => {
                 edge::cmd_edge(edge::EdgeOptions {
                     urls,
@@ -1405,6 +1409,7 @@ fn dispatch(cmd: Cmd) -> i32 {
                     wait_ms,
                     browser,
                     import_passwords: edge::consent_flag(import_passwords, no_import_passwords),
+                    ubb,
                 })
             }
             Cmd::Rec { op } => match op {

@@ -181,6 +181,38 @@ child session's holders; backup/delete refuse while any Edge is using the profil
 backup contains cookies and saved passwords and stays under the same user data directory, so
 treat it like the profile itself.
 
+## UBB (vendored)
+
+`ubb/` is the merged Universal Browser Bridge: the unpacked extension (`manifest.json`,
+`background.js`, `content/`, `popup/`, `offscreen/`), the Node daemon (`daemon/`), the tool
+catalog (`lib/`) and the Rust CLI + daemon (`rust-cli/`). `cua browser` resolves it as
+`$CUA_UBB` → config `ubb_path` → this checkout (`ubb/bin/ubb.exe`,
+`ubb/rust-cli/target/release/ubb.exe`, `bin/ubb.exe`) → PATH, so the merged sources win over an
+older machine-wide install. `install.ps1` builds `ubb/rust-cli` into `ubb/bin/ubb.exe` and
+copies it next to `cua.exe`.
+
+### Driving the profile through UBB (`cua edge --ubb`)
+
+`--ubb` asks the running daemon for a one-shot `browser.pair` nonce, launches the profile with
+`--load-extension=<ubb tree>` (plus `--disable-features=DisableLoadExtensionCommandLineSwitch`,
+which current Chromium needs) and the pair page as its first tab, and the extension registers
+that profile as a UBB slot: `cuaedge`, or `cuachrome` for Chrome. The full tool set then works
+against it, including the challenge tools:
+
+```powershell
+cua edge --ubb https://example.com
+cua browser --browser cuaedge tab.list '{}'
+cua browser --browser cuaedge challenge.detect '{}'
+cua browser --browser cuaedge challenge.solve '{"mode":"slider"}'
+```
+
+Web pages can no longer message unpacked extensions (`externally_connectable` stopped
+delivering in current Chromium), so pairing goes through a content script: it forwards only the
+nonce and the background asks the daemon that minted it for the credentials, which keeps a
+hostile local page from pointing the extension at a token of its own. The daemon can stay in
+the main session — localhost is shared across Windows sessions — and the nonce is single-use
+with a 120 s TTL.
+
 ## Perception (PaddleOCR + OmniParser visuals)
 
 `state` can add OCR, icon detection and Florence-2 captions on top of the UIA tree. The CLI

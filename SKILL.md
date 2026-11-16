@@ -419,6 +419,25 @@ prompt; on a **new** profile the no-import path opens it minimized, stops that i
 removed under `profile_import.purged` (measured: 462 logins before, 0 after). Existing profiles
 are never modified, and this is convenience, not isolation — the same Windows user can read it.
 
+### Pairing the profile with UBB (`cua edge --ubb`)
+
+`cua edge --ubb` / `cua child edge --ubb` register this profile as a UBB slot (`cuaedge`, or
+`cuachrome` for Chrome): cua takes a one-shot `browser.pair` nonce from the daemon, launches
+the browser with the vendored extension (`ubb/`) and the pair page as the first tab. Afterwards
+the whole UBB catalog drives that profile:
+
+```bash
+cua edge --ubb https://example.com          # launch + pair in one step
+cua browser --browser cuaedge tab.list '{}'
+cua browser --browser cuaedge challenge.detect '{}'
+cua browser --browser cuaedge challenge.solve '{"mode":"slider"}'
+```
+
+The daemon may run in the main session (localhost is shared across Windows sessions). Pairing
+goes through a content script because web pages can no longer message unpacked extensions; the
+page only carries a single-use nonce (120 s TTL), the credentials come from the daemon. Needs
+`ubb/` in this repository and a UBB daemon; `--ubb` is not accepted by `cua session edge`.
+
 `--cdp` is opt-in and reports `cdp.port` / `cdp.browser_ws` in the launch receipt and
 `cua edge --status`; `/json/version` and `/json/list` are localhost-only and live only while
 Edge runs. CDP has no authentication — any same-user local process can control the browser

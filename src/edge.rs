@@ -225,6 +225,7 @@ pub struct EdgeOptions {
     pub wait_ms: u64,
     pub browser: Option<BrowserPref>,
     pub import_passwords: Option<bool>,
+    pub ubb: bool,
 }
 
 /// `cua child edge ...` entry point. The child agent executes `cua edge ...`
@@ -311,11 +312,41 @@ pub fn cmd_edge(opts: EdgeOptions) -> Result<i32> {
     };
     let purge_import = new_profile && consent == ImportConsent::No;
 
+    // `--ubb` registers this profile as a UBB slot: mint the one-shot pair URL
+    // here and let the browser open it as its first tab.
+    let mut pair: Option<UbbPair> = None;
+    if opts.ubb {
+        match pair_profile(kind) {
+            Ok(p) => pair = Some(p),
+            Err(e) => {
+                let r = Receipt::new("edge").fail(
+                    json!({ "profile": profile.display().to_string(), "urls": opts.urls, "session": current }),
+                    &format!("{e:#}"),
+                );
+                return emit(r, launch_extra(kind, Some(edge.as_path()), &profile, &before, None, false, opts.fresh_profile, opts.automation));
+            }
+        }
+    }
+
     let launched = if purge_import {
-        launch_without_import(&edge, &profile, opts.automation, cdp_port, &opts.urls)
+        launch_without_import(
+            &edge,
+            &profile,
+            opts.automation,
+            cdp_port,
+            &opts.urls,
+            pair.as_ref(),
+        )
     } else {
-        spawn_browser(&edge, &profile, opts.automation, cdp_port, &opts.urls)
-            .map(|pid| (pid, Vec::new(), 0usize))
+        spawn_browser_with(
+            &edge,
+            &profile,
+            opts.automation,
+            cdp_port,
+            &opts.urls,
+            pair.as_ref(),
+        )
+        .map(|pid| (pid, Vec::new(), 0usize))
     };
     let (launched_pid, purged, stopped) = match launched {
         Ok(v) => v,
@@ -433,6 +464,14 @@ pub fn cmd_edge(opts: EdgeOptions) -> Result<i32> {
         "purged": purged,
         "processes_stopped": stopped,
     });
+    if let Some(p) = &pair {
+        extra["ubb"] = json!({
+            "slot": p.slot,
+            "pair_url": p.pair_url,
+            "extension_dir": p.extension_dir.display().to_string(),
+            "extension_id": p.extension_id,
+        });
+    }
     let cdp = if opts.cdp || after.holders.iter().any(|h| h.is_browser && h.cdp_port.is_some()) {
         let preferred = if already_running { None } else { cdp_port };
         wait_for_cdp_endpoint(&profile, &after, preferred, Duration::from_secs(3))
@@ -659,7 +698,7 @@ pub fn cmd_session_edge(opts: SessionEdgeOptions) -> Result<i32> {
     let import_purge = new_profile && consent == ImportConsent::No;
 
     let launched = if import_purge {
-        launch_without_import(&edge, &profile, false, None, &tabs)
+        launch_without_import(&edge, &profile, false, None, &tabs, None)
     } else {
         spawn_browser(&edge, &profile, false, None, &tabs).map(|pid| (pid, Vec::new(), 0usize))
     };
@@ -1346,6 +1385,7 @@ fn build_args(
     automation: bool,
     cdp_port: Option<u16>,
     urls: &[String],
+    load_extension: Option<&Path>,
 ) -> Vec<String> {
     let mut args = vec![
         format!("--user-data-dir={}", profile.display()),
@@ -1359,6 +1399,12 @@ fn build_args(
     ];
     if automation {
         args.push("--force-renderer-accessibility".into());
+    }
+    if let Some(ext) = load_extension {
+        // Chromium 137+ ignores --load-extension unless this feature is off
+        // (Edge 157 measured: the pair page opened, no extension ever loaded).
+        args.push("--disable-features=DisableLoadExtensionCommandLineSwitch".into());
+        args.push(format!("--load-extension={}", ext.display()));
     }
     if let Some(port) = cdp_port {
         args.push(format!("--remote-debugging-port={port}"));
@@ -1400,14 +1446,38 @@ fn spawn_browser(
     cdp_port: Option<u16>,
     urls: &[String],
 ) -> Result<u32> {
-    let args = build_args(profile, automation, cdp_port, urls);
+    spawn_browser_with(exe, profile, automation, cdp_port, urls, None)
+}
+
+/// Launch with an optional UBB pairing tab: the pair page goes first (it
+/// registers the slot), the caller's URLs follow.
+fn spawn_browser_with(
+    exe: &Path,
+    profile: &Path,
+    automation: bool,
+    cdp_port: Option<u16>,
+    urls: &[String],
+    pair: Option<&UbbPair>,
+) -> Result<u32> {
+    let mut tabs: Vec<String> = Vec::new();
+    if let Some(p) = pair {
+        tabs.push(p.pair_url.clone());
+    }
+    tabs.extend(urls.iter().cloned());
+    let args = build_args(
+        profile,
+        automation,
+        cdp_port,
+        &tabs,
+        pair.map(|p| p.extension_dir.as_path()),
+    );
     spawn_browser_args(exe, &args, false)
 }
 
 /// First-run window used only while the import is being undone: start it
 /// minimized so it does not steal the desktop for a second.
 fn spawn_browser_minimized(exe: &Path, profile: &Path) -> Result<u32> {
-    let args = build_args(profile, false, None, &[]);
+    let args = build_args(profile, false, None, &[], None);
     spawn_browser_args(exe, &args, true)
 }
 
@@ -1453,6 +1523,64 @@ fn spawn_browser_args(exe: &Path, args: &[String], minimized: bool) -> Result<u3
         let _ = CloseHandle(pi.hProcess);
     }
     Ok(pi.dwProcessId)
+}
+
+// ---------------------------------------------------------------- UBB pairing
+
+/// What `browser.pair` minted: cua launches the browser itself, so the pair
+/// page must be the first tab of that launch.
+#[derive(Clone, Debug)]
+struct UbbPair {
+    slot: String,
+    pair_url: String,
+    extension_dir: PathBuf,
+    extension_id: String,
+}
+
+fn ubb_slot(kind: BrowserKind) -> &'static str {
+    match kind {
+        BrowserKind::Edge => "cuaedge",
+        BrowserKind::Chrome => "cuachrome",
+    }
+}
+
+fn pair_profile(kind: BrowserKind) -> Result<UbbPair> {
+    let ext = crate::ubb::extension_dir().ok_or_else(|| {
+        anyhow::anyhow!(
+            "UBB extension not found: set CUA_UBB_EXTENSION_DIR or `ubb_extension_dir` in the cua config"
+        )
+    })?;
+    let slot = ubb_slot(kind);
+    let ext_str = ext.display().to_string();
+    let v = crate::ubb::call_json(
+        "browser.pair",
+        &serde_json::json!({
+            "name": slot,
+            "extension_dir": ext_str,
+        }),
+    )?;
+    let pair_url = v
+        .get("pair_url")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| anyhow::anyhow!("ubb browser.pair returned no pair_url"))?;
+    Ok(UbbPair {
+        slot: v
+            .get("slot")
+            .and_then(|x| x.as_str())
+            .unwrap_or(slot)
+            .to_string(),
+        pair_url: pair_url.to_string(),
+        extension_dir: PathBuf::from(
+            v.get("extension_dir")
+                .and_then(|x| x.as_str())
+                .unwrap_or(ext_str.as_str()),
+        ),
+        extension_id: v
+            .get("extension_id")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+    })
 }
 
 // ---------------------------------------------------------------- import consent
@@ -1501,6 +1629,7 @@ fn launch_without_import(
     automation: bool,
     cdp_port: Option<u16>,
     urls: &[String],
+    pair: Option<&UbbPair>,
 ) -> Result<(u32, Vec<String>, usize)> {
     spawn_browser_minimized(exe, profile).context("first-run launch (minimized)")?;
 
@@ -1540,7 +1669,7 @@ fn launch_without_import(
     }
 
     let purged = purge_imported_profile_data(profile);
-    let pid = spawn_browser(exe, profile, automation, cdp_port, urls)
+    let pid = spawn_browser_with(exe, profile, automation, cdp_port, urls, pair)
         .context("relaunch after removing the first-run import")?;
     Ok((pid, purged, stopped))
 }
@@ -2290,6 +2419,7 @@ mod tests {
             true,
             None,
             &["https://example.com".into()],
+            None,
         );
         assert_eq!(args[0], r"--user-data-dir=C:\Users\me\AppData\Local\cua\browser\CuaEdge");
         assert!(args.iter().any(|a| a == "--no-first-run"));
@@ -2303,19 +2433,19 @@ mod tests {
 
     #[test]
     fn automation_is_opt_in() {
-        let args = build_args(Path::new(r"C:\CuaEdge"), false, None, &[]);
+        let args = build_args(Path::new(r"C:\CuaEdge"), false, None, &[], None);
         assert!(!args.iter().any(|a| a == "--force-renderer-accessibility"));
     }
 
     #[test]
     fn cdp_args_bind_localhost_with_the_chosen_port() {
-        let args = build_args(Path::new(r"C:\CuaEdge"), false, Some(9333), &[]);
+        let args = build_args(Path::new(r"C:\CuaEdge"), false, Some(9333), &[], None);
         assert!(args.iter().any(|a| a == "--remote-debugging-port=9333"));
         assert!(args.iter().any(|a| a == "--remote-debugging-address=127.0.0.1"));
         assert!(args
             .iter()
             .any(|a| a == "--remote-allow-origins=http://127.0.0.1:9333"));
-        let plain = build_args(Path::new(r"C:\CuaEdge"), false, None, &[]);
+        let plain = build_args(Path::new(r"C:\CuaEdge"), false, None, &[], None);
         assert!(!plain.iter().any(|a| a.starts_with("--remote-debugging")));
     }
 
@@ -2598,6 +2728,33 @@ mod tests {
         let chrome = fresh_profile_path(BrowserKind::Chrome);
         assert!(edge.to_string_lossy().contains("cua-edge-fresh"));
         assert!(chrome.to_string_lossy().contains("cua-chrome-fresh"));
+    }
+
+    #[test]
+    fn load_extension_is_passed_before_urls() {
+        let args = build_args(
+            Path::new(r"C:\CuaEdge"),
+            false,
+            None,
+            &["http://127.0.0.1:8765/__ubb_pair?nonce=x".into()],
+            Some(Path::new(r"D:\Codebase\cua\ubb")),
+        );
+        let ext = args
+            .iter()
+            .position(|a| a.starts_with("--load-extension="))
+            .expect("--load-extension missing");
+        let url = args
+            .iter()
+            .position(|a| a.starts_with("http://"))
+            .expect("pair url missing");
+        assert!(ext < url, "the switch must precede the first tab");
+        assert_eq!(args[ext], r"--load-extension=D:\Codebase\cua\ubb");
+    }
+
+    #[test]
+    fn ubb_slots_are_per_browser() {
+        assert_eq!(ubb_slot(BrowserKind::Edge), "cuaedge");
+        assert_eq!(ubb_slot(BrowserKind::Chrome), "cuachrome");
     }
 
     #[test]

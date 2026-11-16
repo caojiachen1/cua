@@ -5,7 +5,7 @@ $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
 if (-not $root) { $root = Split-Path -Parent $MyInvocation.MyCommand.Path }
 
-Write-Host "== [1/5] cargo build --release" -ForegroundColor Cyan
+Write-Host "== [1/6] cargo build --release" -ForegroundColor Cyan
 # A resident perception service locks the old binary on Windows; stop it first.
 if (Test-Path "$root\bin\cua.exe") { & "$root\bin\cua.exe" perception serve --stop 2>$null | Out-Null }
 # GPU choices come from the agent's install-time question (SKILL.md "Installing
@@ -30,7 +30,7 @@ if ($features.Count -gt 0) {
 if ($LASTEXITCODE -ne 0) { Pop-Location; throw "cargo build failed" }
 Pop-Location
 
-Write-Host "== [2/5] build child-session host" -ForegroundColor Cyan
+Write-Host "== [2/6] build child-session host" -ForegroundColor Cyan
 $hostProj = Join-Path $root "tools\session-host\CuaSessionHost.csproj"
 if (Test-Path $hostProj) {
     if (Get-Command dotnet -ErrorAction SilentlyContinue) {
@@ -45,7 +45,23 @@ if (Test-Path $hostProj) {
     Write-Host "   warning: tools\session-host missing; `cua session` will be unavailable" -ForegroundColor Yellow
 }
 
-Write-Host "== [3/5] copy binaries to bin\" -ForegroundColor Cyan
+Write-Host "== [3/6] build ubb runtime" -ForegroundColor Cyan
+$ubbCrate = Join-Path $root "ubb\rust-cli\Cargo.toml"
+if (Test-Path $ubbCrate) {
+    Push-Location (Join-Path $root "ubb\rust-cli")
+    & cargo build --release
+    $ubbCode = $LASTEXITCODE
+    Pop-Location
+    if ($ubbCode -ne 0) {
+        Write-Host "   warning: ubb build failed; cua browser / cua edge --ubb fall back to a ubb on PATH" -ForegroundColor Yellow
+    } else {
+        Copy-Item (Join-Path $root "ubb\rust-cli\target\release\ubb.exe") (Join-Path $root "ubb\bin\ubb.exe") -Force
+    }
+} else {
+    Write-Host "   warning: ubb\rust-cli missing; cua browser needs a ubb on PATH" -ForegroundColor Yellow
+}
+
+Write-Host "== [4/6] copy binaries to bin\" -ForegroundColor Cyan
 New-Item -ItemType Directory -Force -Path "$root\bin" | Out-Null
 Copy-Item "$root\target\release\cua.exe" "$root\bin\cua.exe" -Force
 Copy-Item "$root\target\release\testpad.exe" "$root\bin\testpad.exe" -Force
@@ -55,13 +71,16 @@ if (Test-Path $sessionHost) {
     $sessionHostConfig = Join-Path $root "target\session-host\cua-session-host.exe.config"
     if (Test-Path $sessionHostConfig) { Copy-Item $sessionHostConfig "$root\bin\cua-session-host.exe.config" -Force }
 }
+# The vendored UBB runtime, when it was built above.
+$ubbExe = Join-Path $root "ubb\bin\ubb.exe"
+if (Test-Path $ubbExe) { Copy-Item $ubbExe "$root\bin\ubb.exe" -Force }
 # ONNX Runtime DirectML (Florence GPU path) and any runtime DLL copied by ort.
 foreach ($dll in @("DirectML.dll", "onnxruntime.dll")) {
     $src = Join-Path "$root\target\release" $dll
     if (Test-Path $src) { Copy-Item $src (Join-Path "$root\bin" $dll) -Force }
 }
 
-Write-Host "== [4/5] install skill to ~\.agents\skills\cua" -ForegroundColor Cyan
+Write-Host "== [5/6] install skill to ~\.agents\skills\cua" -ForegroundColor Cyan
 $skillDir = Join-Path $env:USERPROFILE ".agents\skills\cua"
 New-Item -ItemType Directory -Force -Path $skillDir | Out-Null
 Copy-Item "$root\SKILL.md" "$skillDir\SKILL.md" -Force
@@ -72,7 +91,7 @@ if ($userPath -notlike "*$root\bin*") {
     Write-Host "   added '$root\bin' to user PATH (reopen shells to take effect)"
 }
 
-Write-Host "== [5/5] smoke test" -ForegroundColor Cyan
+Write-Host "== [6/6] smoke test" -ForegroundColor Cyan
 $ver = & "$root\bin\cua.exe" check | ConvertFrom-Json
 if ($ver.uia -ne "ok") { throw "UIA unavailable: $($ver | ConvertTo-Json -Compress)" }
 Write-Host ("   cua {0} ok — UIA ok, screen {1}x{2}" -f $ver.version, $ver.screen.primary[0], $ver.screen.primary[1]) -ForegroundColor Green

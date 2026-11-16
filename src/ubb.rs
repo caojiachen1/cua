@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use crate::util::{self, Receipt};
 
 pub const USAGE: &str = r#"cua browser <ubb-tool> [json-params]      # forwarded to the ubb CLI
+              [--browser <slot>]          # target one paired slot (cuaedge/cuachrome/default)
 
 Core loop:
   cua browser session.start
@@ -52,7 +53,9 @@ fn on_path(name: &str) -> Option<PathBuf> {
         .find(|p| p.exists())
 }
 
-/// Locate the ubb CLI: $CUA_UBB, then `ubb_path` in cua's config, then PATH.
+/// Locate the ubb CLI: $CUA_UBB, then `ubb_path` in cua's config, then a copy
+/// vendored in this repository (ubb/ next to the binary or the checkout), then
+/// PATH.
 pub fn resolve() -> Option<Cli> {
     if let Ok(p) = std::env::var("CUA_UBB") {
         if let Some(c) = candidate(&p) {
@@ -64,7 +67,133 @@ pub fn resolve() -> Option<Cli> {
             return Some(c);
         }
     }
+    if let Some(p) = vendored_cli() {
+        return Some(Cli::Exe(p));
+    }
     on_path("ubb").or_else(|| on_path("ubb.exe")).map(Cli::Exe)
+}
+
+/// The repository now carries UBB under `ubb/`; prefer that copy over whatever
+/// happens to be on PATH so the merged sources and the running CLI match.
+fn vendored_cli() -> Option<PathBuf> {
+    let rels: [&[&str]; 3] = [
+        &["ubb", "bin", "ubb.exe"],
+        &["ubb", "rust-cli", "target", "release", "ubb.exe"],
+        &["bin", "ubb.exe"],
+    ];
+    for dir in search_roots() {
+        for rel in rels {
+            let mut p = dir.clone();
+            for part in rel {
+                p.push(part);
+            }
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// Extension root (the directory holding manifest.json) for `cua edge --ubb`.
+pub fn extension_dir() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("CUA_UBB_EXTENSION_DIR") {
+        let pb = PathBuf::from(p);
+        if pb.join("manifest.json").is_file() {
+            return Some(pb);
+        }
+    }
+    if let Some(p) = util::load_config_json()
+        .get("ubb_extension_dir")
+        .and_then(|v| v.as_str())
+    {
+        let pb = PathBuf::from(p);
+        if pb.join("manifest.json").is_file() {
+            return Some(pb);
+        }
+    }
+    let rels: [&[&str]; 2] = [&["ubb"], &[]];
+    for dir in search_roots() {
+        for rel in rels {
+            let mut p = dir.clone();
+            for part in rel {
+                p.push(part);
+            }
+            if p.join("manifest.json").is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// Directories worth probing: next to the running cua.exe, then up to three
+/// ancestors (target/debug -> target -> repo), then the working directory.
+fn search_roots() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        let mut cur = exe.parent().map(|p| p.to_path_buf());
+        let mut depth = 0;
+        while let Some(dir) = cur {
+            if !out.iter().any(|d| d == &dir) {
+                out.push(dir.clone());
+            }
+            depth += 1;
+            if depth >= 4 {
+                break;
+            }
+            cur = dir.parent().map(|p| p.to_path_buf());
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        if !out.iter().any(|d| d == &cwd) {
+            out.push(cwd);
+        }
+    }
+    out
+}
+
+/// Call a daemon-side UBB method (`browser.pair`, `meta.browsers`, ...) and
+/// return its JSON result.
+pub fn call_json(method: &str, params: &serde_json::Value) -> Result<serde_json::Value> {
+    let Some(cli) = resolve() else {
+        anyhow::bail!("ubb CLI not found: install UBB, or point $CUA_UBB / `ubb_path` at it");
+    };
+    let mut cmd = match &cli {
+        Cli::Exe(p) => {
+            let mut c = Command::new(p);
+            c.args([method, &params.to_string()]);
+            c
+        }
+        Cli::Node(script) => {
+            let mut c = Command::new("node");
+            c.arg(script);
+            c.args([method, &params.to_string()]);
+            c
+        }
+    };
+    cmd.env_remove("ELECTRON_RUN_AS_NODE");
+    cmd.env_remove("NODE_OPTIONS");
+    cmd.env_remove("NODE_PATH");
+    let timeout = ubb_timeout();
+    let (status, stdout, stderr, timed_out) = run_bounded(cmd, timeout)?;
+    if timed_out {
+        anyhow::bail!("ubb {method} timed out after {} ms", timeout.as_millis());
+    }
+    if !status.success() {
+        let err = String::from_utf8_lossy(&stderr).trim().to_string();
+        let out = String::from_utf8_lossy(&stdout).trim().to_string();
+        anyhow::bail!(
+            "ubb {method} failed: {}",
+            if err.is_empty() { out } else { err }
+        );
+    }
+    let v: serde_json::Value = serde_json::from_slice(&stdout)
+        .map_err(|e| anyhow::anyhow!("ubb {method} returned non-JSON: {e}"))?;
+    if let Some(err) = v.get("error") {
+        anyhow::bail!("ubb {method} error: {err}");
+    }
+    Ok(v)
 }
 
 fn candidate(p: &str) -> Option<Cli> {
