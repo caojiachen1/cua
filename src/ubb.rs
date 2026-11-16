@@ -95,6 +95,38 @@ fn vendored_cli() -> Option<PathBuf> {
     None
 }
 
+/// Port the daemon listens on: `$UBB_PORT`, `~/.ubb/config.json` `port`, else
+/// the UBB default 8765.
+pub fn daemon_port() -> u16 {
+    if let Ok(p) = std::env::var("UBB_PORT") {
+        if let Ok(n) = p.trim().parse::<u16>() {
+            return n;
+        }
+    }
+    let cfg = std::env::var("USERPROFILE")
+        .ok()
+        .map(|h| PathBuf::from(h).join(".ubb").join("config.json"));
+    if let Some(path) = cfg {
+        if let Ok(bytes) = std::fs::read(&path) {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                if let Some(n) = v.get("port").and_then(|x| x.as_u64()) {
+                    if n > 0 && n < 65536 {
+                        return n as u16;
+                    }
+                }
+            }
+        }
+    }
+    8765
+}
+
+/// Cheap "is a daemon already there" probe. Pairing from the child session must
+/// not let the CLI auto-start a daemon inside that child.
+pub fn daemon_alive() -> bool {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], daemon_port()));
+    std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(400)).is_ok()
+}
+
 /// Extension root (the directory holding manifest.json) for `cua edge --ubb`.
 pub fn extension_dir() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("CUA_UBB_EXTENSION_DIR") {

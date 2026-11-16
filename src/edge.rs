@@ -1545,6 +1545,15 @@ fn ubb_slot(kind: BrowserKind) -> &'static str {
 }
 
 fn pair_profile(kind: BrowserKind) -> Result<UbbPair> {
+    // Inside the child session the ubb CLI would auto-start a daemon *there*,
+    // which answers the pair call but leaves the launch hanging; the daemon has
+    // to be up in the main session before anything pairs.
+    if in_child_session() && !crate::ubb::daemon_alive() {
+        anyhow::bail!(
+            "no UBB daemon on 127.0.0.1:{} — start it in the main session first (`ubb status`), then retry",
+            crate::ubb::daemon_port()
+        );
+    }
     let ext = crate::ubb::extension_dir().ok_or_else(|| {
         anyhow::anyhow!(
             "UBB extension not found: set CUA_UBB_EXTENSION_DIR or `ubb_extension_dir` in the cua config"
