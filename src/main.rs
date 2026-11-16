@@ -227,6 +227,12 @@ pub(crate) enum SessionOp {
         /// Browser for the independent profile: auto (default), edge or chrome
         #[arg(long, value_enum)]
         browser: Option<edge::BrowserPref>,
+        /// Allow a brand-new profile to import the main browser's passwords/history (default)
+        #[arg(long = "import-passwords", conflicts_with = "no_import_passwords")]
+        import_passwords: bool,
+        /// Do not keep what the browser imports into a brand-new profile
+        #[arg(long = "no-import-passwords")]
+        no_import_passwords: bool,
     },
     /// Show the read-only viewer (mask + Take over button).
     View {
@@ -822,6 +828,12 @@ enum Cmd {
         /// Browser for the independent profile: auto (default), edge or chrome
         #[arg(long, value_enum)]
         browser: Option<edge::BrowserPref>,
+        /// Allow a brand-new profile to import the main browser's passwords/history (default)
+        #[arg(long = "import-passwords", conflicts_with = "no_import_passwords")]
+        import_passwords: bool,
+        /// Do not keep what the browser imports into a brand-new profile
+        #[arg(long = "no-import-passwords")]
+        no_import_passwords: bool,
     },
     /// Screen recording (JPEG frames -> mp4, or an HTML player when ffmpeg is missing)
     Rec {
@@ -1371,7 +1383,18 @@ fn dispatch(cmd: Cmd) -> i32 {
             Cmd::Session { op } => session::dispatch(op),
             Cmd::Agent { data_dir } => agent::run(data_dir),
             Cmd::Browser { rest } => ubb::cmd_browser(&rest),
-            Cmd::Edge { urls, fresh_profile, profile, automation, cdp, status, wait_ms, browser } => {
+            Cmd::Edge {
+                urls,
+                fresh_profile,
+                profile,
+                automation,
+                cdp,
+                status,
+                wait_ms,
+                browser,
+                import_passwords,
+                no_import_passwords,
+            } => {
                 edge::cmd_edge(edge::EdgeOptions {
                     urls,
                     fresh_profile,
@@ -1381,6 +1404,7 @@ fn dispatch(cmd: Cmd) -> i32 {
                     status,
                     wait_ms,
                     browser,
+                    import_passwords: edge::consent_flag(import_passwords, no_import_passwords),
                 })
             }
             Cmd::Rec { op } => match op {

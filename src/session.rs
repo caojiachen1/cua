@@ -236,17 +236,26 @@ pub fn dispatch(op: SessionOp) -> Result<i32> {
         SessionOp::Hide => cmd_simple("hide"),
         SessionOp::Takeover => cmd_simple("takeover"),
         SessionOp::Release => cmd_simple("release"),
-        SessionOp::Edge { sign_in, status, delete_profile, confirm, urls, timeout_min, browser } => {
-            crate::edge::cmd_session_edge(crate::edge::SessionEdgeOptions {
-                sign_in,
-                status,
-                delete_profile,
-                confirm,
-                urls,
-                timeout_min,
-                browser,
-            })
-        }
+        SessionOp::Edge {
+            sign_in,
+            status,
+            delete_profile,
+            confirm,
+            urls,
+            timeout_min,
+            browser,
+            import_passwords,
+            no_import_passwords,
+        } => crate::edge::cmd_session_edge(crate::edge::SessionEdgeOptions {
+            sign_in,
+            status,
+            delete_profile,
+            confirm,
+            urls,
+            timeout_min,
+            browser,
+            import_passwords: crate::edge::consent_flag(import_passwords, no_import_passwords),
+        }),
     }
 }
 

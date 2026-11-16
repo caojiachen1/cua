@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::OpenOptionsExt;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -35,14 +36,16 @@ use windows::Win32::System::RestartManager::{
 };
 use windows::Win32::System::Threading::{
     CreateProcessW, OpenProcess, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION,
-    PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW,
+    PROCESS_QUERY_LIMITED_INFORMATION, STARTF_USESHOWWINDOW, STARTUPINFOW,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    MessageBoxW, IDYES, MB_DEFBUTTON1, MB_ICONWARNING, MB_YESNO, SW_SHOWMINNOACTIVE,
 };
 use windows::Wdk::System::Threading::{NtQueryInformationProcess, ProcessCommandLineInformation};
 
 use crate::util::{self, Receipt};
 
 const PROFILE_SCHEMA: &str = "cua-browser-profile-v1";
-const LEGACY_PROFILE_SCHEMA: &str = "cua-edge-profile-v1";
 const STATUS_SCHEMA: &str = "cua-edge-status-v1";
 const MAX_URLS: usize = 8;
 const WAIT_STEP: Duration = Duration::from_millis(150);
@@ -163,6 +166,55 @@ impl BrowserKind {
     }
 }
 
+/// What the user decided about the browser's first-run import of the main
+/// profile's passwords/history into a brand-new cua profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImportConsent {
+    Yes,
+    No,
+    /// Nothing recorded yet; the caller decides (prompt, or default to Yes).
+    Unrecorded,
+}
+
+impl ImportConsent {
+    fn as_str(self) -> &'static str {
+        match self {
+            ImportConsent::Yes => "yes",
+            ImportConsent::No => "no",
+            ImportConsent::Unrecorded => "unrecorded",
+        }
+    }
+
+    fn from_meta(meta: Option<&ProfileMeta>) -> Self {
+        match meta.and_then(|m| m.local_import_consent.as_deref()) {
+            Some("yes") => ImportConsent::Yes,
+            Some("no") => ImportConsent::No,
+            _ => ImportConsent::Unrecorded,
+        }
+    }
+
+    /// An explicit flag always wins; otherwise the recorded decision; otherwise
+    /// undecided.
+    fn resolve(flag: Option<bool>, meta: Option<&ProfileMeta>) -> Self {
+        match flag {
+            Some(true) => ImportConsent::Yes,
+            Some(false) => ImportConsent::No,
+            None => Self::from_meta(meta),
+        }
+    }
+}
+
+/// Map the two mutually exclusive CLI flags onto the tri-state consent value.
+pub fn consent_flag(import: bool, no_import: bool) -> Option<bool> {
+    if import {
+        Some(true)
+    } else if no_import {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 pub struct EdgeOptions {
     pub urls: Vec<String>,
     pub fresh_profile: bool,
@@ -172,6 +224,7 @@ pub struct EdgeOptions {
     pub status: bool,
     pub wait_ms: u64,
     pub browser: Option<BrowserPref>,
+    pub import_passwords: Option<bool>,
 }
 
 /// `cua child edge ...` entry point. The child agent executes `cua edge ...`
@@ -247,8 +300,25 @@ pub fn cmd_edge(opts: EdgeOptions) -> Result<i32> {
         None
     };
 
-    let launched_pid = match spawn_browser(&edge, &profile, opts.automation, cdp_port, &opts.urls) {
-        Ok(pid) => pid,
+    // A brand-new profile is the only place Edge/Chrome imports the main
+    // profile's passwords/history; `--no-import-passwords` wipes that import
+    // before the real window opens.
+    let new_profile = !profile.exists();
+    let recorded = read_metadata();
+    let consent = match ImportConsent::resolve(opts.import_passwords, recorded.as_ref()) {
+        ImportConsent::Unrecorded => ImportConsent::Yes,
+        decided => decided,
+    };
+    let purge_import = new_profile && consent == ImportConsent::No;
+
+    let launched = if purge_import {
+        launch_without_import(&edge, &profile, opts.automation, cdp_port, &opts.urls)
+    } else {
+        spawn_browser(&edge, &profile, opts.automation, cdp_port, &opts.urls)
+            .map(|pid| (pid, Vec::new(), 0usize))
+    };
+    let (launched_pid, purged, stopped) = match launched {
+        Ok(v) => v,
         Err(e) => {
             let r = Receipt::new("edge").fail(
                 json!({ "profile": profile.display().to_string(), "urls": opts.urls, "session": current }),
@@ -259,7 +329,7 @@ pub fn cmd_edge(opts: EdgeOptions) -> Result<i32> {
     };
 
     if !opts.fresh_profile {
-        let _ = write_metadata(&profile, kind, &edge);
+        let _ = write_metadata(&profile, kind, &edge, consent);
     }
 
     let mut after = scan_profile(&profile);
@@ -320,12 +390,20 @@ pub fn cmd_edge(opts: EdgeOptions) -> Result<i32> {
         return emit(r, extra);
     }
 
+    let profile_name = if opts.fresh_profile {
+        profile
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| kind.profile_dir().to_string())
+    } else {
+        kind.profile_dir().to_string()
+    };
     let detail = if already_running {
         let h = best_of(same);
         format!(
             "opened a new {} window in the existing {} instance (PID {}, session {})",
             kind.label(),
-            kind.profile_dir(),
+            profile_name,
             h.pid,
             h.session
         )
@@ -333,7 +411,7 @@ pub fn cmd_edge(opts: EdgeOptions) -> Result<i32> {
         format!(
             "launched {} with the {} profile (launcher PID {launched_pid}; process using the profile at launch: PID {} in session {})",
             kind.label(),
-            kind.profile_dir(),
+            profile_name,
             h.pid,
             h.session
         )
@@ -341,7 +419,7 @@ pub fn cmd_edge(opts: EdgeOptions) -> Result<i32> {
         format!(
             "launched {} with the {} profile (launcher PID {launched_pid}); not waiting for the profile holder",
             kind.label(),
-            kind.profile_dir()
+            profile_name
         )
     };
     let r = Receipt::new("edge").ok(
@@ -349,6 +427,12 @@ pub fn cmd_edge(opts: EdgeOptions) -> Result<i32> {
         &detail,
     );
     let mut extra = launch_extra(kind, Some(edge.as_path()), &profile, &after, Some(launched_pid), already_running, opts.fresh_profile, opts.automation);
+    extra["profile_import"] = json!({
+        "new_profile": new_profile,
+        "consent": consent.as_str(),
+        "purged": purged,
+        "processes_stopped": stopped,
+    });
     let cdp = if opts.cdp || after.holders.iter().any(|h| h.is_browser && h.cdp_port.is_some()) {
         let preferred = if already_running { None } else { cdp_port };
         wait_for_cdp_endpoint(&profile, &after, preferred, Duration::from_secs(3))
@@ -420,6 +504,7 @@ pub struct SessionEdgeOptions {
     pub urls: Vec<String>,
     pub timeout_min: u64,
     pub browser: Option<BrowserPref>,
+    pub import_passwords: Option<bool>,
 }
 
 /// `cua session edge ...`: the user's main-session side of the CuaEdge/CuaChrome
@@ -562,8 +647,24 @@ pub fn cmd_session_edge(opts: SessionEdgeOptions) -> Result<i32> {
     let mut tabs = vec![file_url(&page)];
     tabs.extend(opts.urls.iter().cloned());
 
-    let launched_pid = match spawn_browser(&edge, &profile, false, None, &tabs) {
-        Ok(pid) => pid,
+    let new_profile = !profile.exists();
+    let recorded = read_metadata();
+    let mut consent = ImportConsent::resolve(opts.import_passwords, recorded.as_ref());
+    if new_profile && consent == ImportConsent::Unrecorded && std::io::stdin().is_terminal() {
+        consent = prompt_import_consent(kind, &profile);
+    }
+    if consent == ImportConsent::Unrecorded {
+        consent = ImportConsent::Yes;
+    }
+    let import_purge = new_profile && consent == ImportConsent::No;
+
+    let launched = if import_purge {
+        launch_without_import(&edge, &profile, false, None, &tabs)
+    } else {
+        spawn_browser(&edge, &profile, false, None, &tabs).map(|pid| (pid, Vec::new(), 0usize))
+    };
+    let (launched_pid, purged, stopped) = match launched {
+        Ok(v) => v,
         Err(e) => {
             return session_edge_failure(
                 kind,
@@ -574,14 +675,14 @@ pub fn cmd_session_edge(opts: SessionEdgeOptions) -> Result<i32> {
             );
         }
     };
-    let _ = write_metadata(&profile, kind, &edge);
+    let _ = write_metadata(&profile, kind, &edge, consent);
     let timeout_min = opts.timeout_min.clamp(1, 180);
     let started = Instant::now();
     let outcome = wait_for_sign_in(&profile, started, Duration::from_secs(timeout_min * 60));
 
     match outcome {
         SignInOutcome::Closed { scan, waited } => {
-            let _ = write_metadata(&profile, kind, &edge);
+            let _ = write_metadata(&profile, kind, &edge, consent);
             let detail = format!(
                 "{} sign-in finished: every browser process using the profile exited after {:.1}s. \
                  The profile keeps the cookies/passwords saved in that window; run `cua child edge` \
@@ -598,6 +699,12 @@ pub fn cmd_session_edge(opts: SessionEdgeOptions) -> Result<i32> {
                 session_edge_extra(kind, Some(edge.as_path()), &profile, json!({
                     "sign_in_page": page.display().to_string(),
                     "launched_pid": launched_pid,
+                    "profile_import": {
+                        "new_profile": new_profile,
+                        "consent": consent.as_str(),
+                        "purged": purged,
+                        "processes_stopped": stopped,
+                    },
                     "closed": true,
                     "waited_ms": waited.as_millis() as u64,
                     "timeout_min": timeout_min,
@@ -1083,6 +1190,10 @@ struct ProfileMeta {
     last_used_at: String,
     #[serde(default)]
     ephemeral: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    local_import_consent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    consent_at: Option<String>,
 }
 
 fn metadata_path() -> PathBuf {
@@ -1107,15 +1218,28 @@ fn read_metadata_at(path: &Path) -> Option<ProfileMeta> {
     serde_json::from_slice(b).ok()
 }
 
-fn write_metadata(profile: &Path, kind: BrowserKind, edge: &Path) -> Result<()> {
+fn write_metadata(
+    profile: &Path,
+    kind: BrowserKind,
+    edge: &Path,
+    consent: ImportConsent,
+) -> Result<()> {
     let path = metadata_path();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     }
-    let created_at = read_metadata()
-        .filter(|m| paths_equal(Path::new(&m.profile), profile))
-        .map(|m| m.created_at)
+    let existing = read_metadata().filter(|m| paths_equal(Path::new(&m.profile), profile));
+    let created_at = existing
+        .as_ref()
+        .map(|m| m.created_at.clone())
         .unwrap_or_else(util::now_iso);
+    let (consent_value, consent_at) = match consent {
+        ImportConsent::Unrecorded => (
+            existing.as_ref().and_then(|m| m.local_import_consent.clone()),
+            existing.as_ref().and_then(|m| m.consent_at.clone()),
+        ),
+        decided => (Some(decided.as_str().to_string()), Some(util::now_iso())),
+    };
     let meta = ProfileMeta {
         schema: PROFILE_SCHEMA.into(),
         browser: kind.as_str().into(),
@@ -1124,6 +1248,8 @@ fn write_metadata(profile: &Path, kind: BrowserKind, edge: &Path) -> Result<()> 
         created_at,
         last_used_at: util::now_iso(),
         ephemeral: false,
+        local_import_consent: consent_value,
+        consent_at,
     };
     let mut bytes = serde_json::to_vec_pretty(&meta)?;
     bytes.push(b'\n');
@@ -1275,10 +1401,17 @@ fn spawn_browser(
     urls: &[String],
 ) -> Result<u32> {
     let args = build_args(profile, automation, cdp_port, urls);
-    spawn_browser_args(exe, &args)
+    spawn_browser_args(exe, &args, false)
 }
 
-fn spawn_browser_args(exe: &Path, args: &[String]) -> Result<u32> {
+/// First-run window used only while the import is being undone: start it
+/// minimized so it does not steal the desktop for a second.
+fn spawn_browser_minimized(exe: &Path, profile: &Path) -> Result<u32> {
+    let args = build_args(profile, false, None, &[]);
+    spawn_browser_args(exe, &args, true)
+}
+
+fn spawn_browser_args(exe: &Path, args: &[String], minimized: bool) -> Result<u32> {
     let command_line = build_command_line(exe, args);
     let exe_w: Vec<u16> = exe
         .as_os_str()
@@ -1290,10 +1423,14 @@ fn spawn_browser_args(exe: &Path, args: &[String]) -> Result<u32> {
         .chain(std::iter::once(0))
         .collect();
     let env = util::sanitized_env_block();
-    let si = STARTUPINFOW {
+    let mut si = STARTUPINFOW {
         cb: std::mem::size_of::<STARTUPINFOW>() as u32,
         ..Default::default()
     };
+    if minimized {
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_SHOWMINNOACTIVE.0 as u16;
+    }
     let mut pi = PROCESS_INFORMATION::default();
     unsafe {
         CreateProcessW(
@@ -1317,6 +1454,130 @@ fn spawn_browser_args(exe: &Path, args: &[String]) -> Result<u32> {
     }
     Ok(pi.dwProcessId)
 }
+
+// ---------------------------------------------------------------- import consent
+
+/// Files Edge/Chrome fills from the main profile during its first run.
+const IMPORTED_PROFILE_PATHS: [&str; 14] = [
+    "Default/Login Data",
+    "Default/Login Data-journal",
+    "Default/Web Data",
+    "Default/Web Data-journal",
+    "Default/History",
+    "Default/History-journal",
+    "Default/Bookmarks",
+    "Default/Bookmarks.bak",
+    "Default/Top Sites",
+    "Default/Favicons",
+    "Default/Shortcuts",
+    "Default/Network/Cookies",
+    "Default/Network/Cookies-journal",
+    "Default/Sessions",
+];
+
+/// Delete only what the first run imported. Missing files are normal (a profile
+/// that imported nothing yet), so the report lists what was actually removed.
+fn purge_imported_profile_data(profile: &Path) -> Vec<String> {
+    let mut removed = Vec::new();
+    for rel in IMPORTED_PROFILE_PATHS {
+        let path = profile.join(rel.replace('/', "\\"));
+        if path.is_dir() {
+            if std::fs::remove_dir_all(&path).is_ok() {
+                removed.push(rel.to_string());
+            }
+        } else if path.is_file() && std::fs::remove_file(&path).is_ok() {
+            removed.push(rel.to_string());
+        }
+    }
+    removed
+}
+
+/// `--no-import-passwords` on a brand-new profile: let the browser run its
+/// first-run import minimized, stop it, wipe the imported files, then open the
+/// window the caller asked for.
+fn launch_without_import(
+    exe: &Path,
+    profile: &Path,
+    automation: bool,
+    cdp_port: Option<u16>,
+    urls: &[String],
+) -> Result<(u32, Vec<String>, usize)> {
+    spawn_browser_minimized(exe, profile).context("first-run launch (minimized)")?;
+
+    let deadline = Instant::now() + Duration::from_secs(25);
+    while Instant::now() < deadline {
+        let scan = scan_profile(profile);
+        if scan.holders.iter().any(|h| h.browser) {
+            break;
+        }
+        std::thread::sleep(WAIT_STEP * 2);
+    }
+    // The importer writes a moment after the first window appears.
+    std::thread::sleep(Duration::from_secs(3));
+
+    let scan = scan_profile(profile);
+    let mut stopped = 0usize;
+    for h in scan
+        .holders
+        .iter()
+        .filter(|h| h.browser && h.session == current_session())
+    {
+        stopped += crate::win::kill_process_tree(h.pid) as usize;
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let scan = scan_profile(profile);
+        let free = scan.holders.is_empty()
+            && matches!(
+                scan.lockfile,
+                LockFileState::Absent | LockFileState::Stale
+            );
+        if free || Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(WAIT_STEP * 2);
+    }
+
+    let purged = purge_imported_profile_data(profile);
+    let pid = spawn_browser(exe, profile, automation, cdp_port, urls)
+        .context("relaunch after removing the first-run import")?;
+    Ok((pid, purged, stopped))
+}
+
+/// Yes/No prompt shown in the main session before a new profile is created.
+/// Default button is Yes (import), matching the documented behaviour.
+fn prompt_import_consent(kind: BrowserKind, profile: &Path) -> ImportConsent {
+    let text = format!(
+        "即将创建 {} profile：\n{}\n\n\
+         {} 首次运行会把主 {} 的已保存密码和历史导入这份 profile（本机实测约 460 条登录、1190 条历史）。\n\n\
+         导入后，这份数据以当前 Windows 用户身份可被读取（子会话与 agent 也一样）；它不是安全沙箱。\n\n\
+         允许导入吗？\n\n是 = 允许导入（默认）\n否 = 不导入，只保留本次登录产生的数据",
+        kind.profile_dir(),
+        profile.display(),
+        kind.label(),
+        kind.label()
+    );
+    let text: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let caption: Vec<u16> = format!("cua · {} profile", kind.profile_dir())
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let rc = unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(text.as_ptr()),
+            PCWSTR(caption.as_ptr()),
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON1,
+        )
+    };
+    if rc == IDYES {
+        ImportConsent::Yes
+    } else {
+        ImportConsent::No
+    }
+}
+
 
 // ---------------------------------------------------------------- CDP endpoint
 
@@ -2236,13 +2497,70 @@ mod tests {
                 created_at: created.clone(),
                 last_used_at: created.clone(),
                 ephemeral: false,
+                local_import_consent: Some("no".into()),
+                consent_at: Some(created.clone()),
             })
             .unwrap(),
         )
         .unwrap();
         let meta = read_metadata_at(&path).unwrap();
         assert_eq!(meta.created_at, created);
+        assert_eq!(meta.local_import_consent.as_deref(), Some("no"));
         assert!(paths_equal(Path::new(&meta.profile), profile));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn consent_fixture() -> ProfileMeta {
+        ProfileMeta {
+            schema: PROFILE_SCHEMA.into(),
+            browser: "chrome".into(),
+            profile: r"C:\Users\me\AppData\Local\cua\browser\CuaChrome".into(),
+            browser_exe: r"C:\Chrome\chrome.exe".into(),
+            created_at: "2026-01-01T00:00:00.000Z".into(),
+            last_used_at: "2026-01-01T00:00:00.000Z".into(),
+            ephemeral: false,
+            local_import_consent: Some("no".into()),
+            consent_at: Some("2026-01-01T00:00:00.000Z".into()),
+        }
+    }
+
+    #[test]
+    fn explicit_consent_flags_beat_the_recorded_decision() {
+        assert_eq!(consent_flag(true, false), Some(true));
+        assert_eq!(consent_flag(false, true), Some(false));
+        assert_eq!(consent_flag(false, false), None);
+        let meta = consent_fixture();
+        assert_eq!(ImportConsent::from_meta(None), ImportConsent::Unrecorded);
+        assert_eq!(ImportConsent::from_meta(Some(&meta)), ImportConsent::No);
+        assert_eq!(
+            ImportConsent::resolve(None, Some(&meta)),
+            ImportConsent::No,
+            "a recorded no survives later runs"
+        );
+        assert_eq!(
+            ImportConsent::resolve(Some(true), Some(&meta)),
+            ImportConsent::Yes,
+            "an explicit flag overrides the record"
+        );
+        assert_eq!(ImportConsent::No.as_str(), "no");
+    }
+
+    #[test]
+    fn purge_removes_imported_files_and_keeps_settings() {
+        let dir = std::env::temp_dir().join(format!("cua-purge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("Default").join("Network")).unwrap();
+        std::fs::write(dir.join("Default").join("Login Data"), b"x").unwrap();
+        std::fs::write(dir.join("Default").join("History"), b"x").unwrap();
+        std::fs::write(dir.join("Default").join("Preferences"), b"keep").unwrap();
+        std::fs::write(dir.join("Default").join("Network").join("Cookies"), b"x").unwrap();
+
+        let removed = purge_imported_profile_data(&dir);
+        assert!(removed.contains(&"Default/Login Data".to_string()));
+        assert!(removed.contains(&"Default/History".to_string()));
+        assert!(removed.contains(&"Default/Network/Cookies".to_string()));
+        assert!(!dir.join("Default").join("Login Data").exists());
+        assert!(dir.join("Default").join("Preferences").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

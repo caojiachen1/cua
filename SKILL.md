@@ -408,6 +408,17 @@ Chrome uses `CuaChrome`; never point both at one directory. Discovery order is
 Files → `%LOCALAPPDATA%`. `cua edge --status` reports `browser`, `browser_exe`, `profile`,
 `profile_kind` and `browser_processes`.
 
+**First-run import consent.** A new profile lets the browser import the main profile's saved
+passwords/history (measured 462 logins). Import is allowed by default and recorded as
+`local_import_consent` in `browser-profile.json`. `cua session edge --sign-in` asks once with a
+Yes/No dialog (default Yes) when the profile is new and nothing is recorded; the `cua edge` /
+child-agent path never prompts. `--import-passwords` / `--no-import-passwords` decide without a
+prompt; on a **new** profile the no-import path opens it minimized, stops that instance, deletes
+`Login Data`, `Cookies`, `Web Data`, `History`, `Bookmarks`, `Top Sites`, `Favicons`,
+`Shortcuts` and `Sessions`, then opens the requested window. The receipt reports what was
+removed under `profile_import.purged` (measured: 462 logins before, 0 after). Existing profiles
+are never modified, and this is convenience, not isolation — the same Windows user can read it.
+
 `--cdp` is opt-in and reports `cdp.port` / `cdp.browser_ws` in the launch receipt and
 `cua edge --status`; `/json/version` and `/json/list` are localhost-only and live only while
 Edge runs. CDP has no authentication — any same-user local process can control the browser

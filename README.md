@@ -100,6 +100,17 @@ recorded profile, so a machine never silently switches browser mid-profile. Disc
 Files → `%LOCALAPPDATA%`. `cua edge --status` reports `browser`, `browser_exe`, `profile`,
 `profile_kind` and `browser_processes`. Edge and Chrome never share one profile directory.
 
+**First-run import consent.** A brand-new profile makes the browser import the main profile's
+saved passwords and history (measured: 462 logins, 1,191 history rows). That is allowed by
+default and recorded in `browser-profile.json` (`local_import_consent`). `cua session edge
+--sign-in` asks once with a Yes/No dialog when the profile does not exist yet and no decision is
+recorded (console only). `--import-passwords` / `--no-import-passwords` set the decision without
+a prompt; `--no-import-passwords` on a **new** profile opens it minimized, stops that instance,
+deletes what the importer wrote (`Login Data`, `Cookies`, `Web Data`, `History`, `Bookmarks`,
+`Top Sites`, `Favicons`, `Shortcuts`, `Sessions`) and then opens the real window. It never
+touches an existing profile, and the receipt reports `profile_import.purged`. The import is a
+convenience, not isolation: the data stays readable by the same Windows user.
+
 ```powershell
 cua child edge https://example.com        # launch / open a new window in the child session
 cua child edge --automation               # add --force-renderer-accessibility for a UIA-friendly tree
@@ -107,6 +118,8 @@ cua child edge --cdp                      # opt-in dedicated CDP on a random 127
 cua child state --window "Microsoft Edge" # then drive it with the normal UIA commands
 cua child edge --status                   # Edge path, profile, lock holders (PID/session)
 cua child edge --browser chrome            # force Chrome; separate CuaChrome profile
+cua child edge --no-import-passwords       # new profile: wipe the first-run import before the real window
+cua session edge --sign-in --no-import-passwords https://example.com  # scripted opt-out, no prompt
 cua session edge --sign-in --browser chrome https://example.com  # one-time Chrome login in the main session
 cua child edge --fresh-profile            # throwaway profile under %TEMP% (testing)
 cua session edge --sign-in https://example.com  # main session: one-time CuaEdge login; waits for every CuaEdge Edge process to exit
