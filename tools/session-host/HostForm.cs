@@ -363,7 +363,11 @@ namespace CuaSessionHost
             {
                 ShowImageMargin = false,
                 BackColor = Theme.Bar,
-                ForeColor = Theme.Text
+                ForeColor = Theme.Text,
+                Font = Theme.Ui(9f),
+                Padding = new Padding(0, 6, 0, 6),
+                Renderer = new TrayMenuRenderer(),
+                DropShadowEnabled = true
             };
             _trayMenu.Items.Add(MenuItem("打开观察窗", delegate { ShowViewer(!_viewOnly); }));
             _trayMenu.Items.Add(MenuItem("子会话设置…", OpenSettings));
@@ -384,6 +388,15 @@ namespace CuaSessionHost
             _trayMenu.Items.Add(new ToolStripSeparator());
             _trayMenu.Items.Add(_menuExit);
             _trayMenu.Opening += delegate { UpdateTrayMenu(); };
+            foreach (ToolStripItem item in _trayMenu.Items)
+            {
+                if (item is ToolStripSeparator)
+                    item.Margin = new Padding(0, 3, 0, 3);
+                else
+                    item.Padding = new Padding(8, 5, 14, 5);
+            }
+            _trayMenu.Opened += delegate { TrayMenuRenderer.RoundCorners(_trayMenu, 8); };
+            _trayMenu.SizeChanged += delegate { TrayMenuRenderer.RoundCorners(_trayMenu, 8); };
 
             _tray = new NotifyIcon
             {
