@@ -78,10 +78,10 @@ namespace CuaSessionHost
                 Padding = new Padding(12, 10, 12, 10)
             };
 
-            _openEdge = MakeButton("在子会话打开 Edge", true);
-            _refreshEdge = MakeButton("刷新 CuaEdge 状态", false);
+            _openEdge = MakeButton("在子会话打开浏览器", true);
+            _refreshEdge = MakeButton("刷新浏览器状态", false);
             _backupEdge = MakeButton("备份 profile…", false);
-            _deleteEdge = MakeButton("删除 CuaEdge profile…", false);
+            _deleteEdge = MakeButton("删除浏览器 profile…", false);
             _deleteEdge.Danger = true;
             _takeover = MakeButton("接管控制", true);
             _release = MakeButton("释放控制", false);
@@ -206,7 +206,7 @@ namespace CuaSessionHost
         {
             if (_edgeLoading || IsDisposed || !IsHandleCreated) return;
             _edgeLoading = true;
-            _edgeInfo.Text = "正在读取 CuaEdge 状态…";
+            _edgeInfo.Text = "正在读取浏览器状态…";
             Task.Run(() => _owner.EdgeSummary).ContinueWith(t =>
             {
                 if (IsDisposed) return;
@@ -217,7 +217,7 @@ namespace CuaSessionHost
                         if (IsDisposed) return;
                         _edgeInfo.Text = t.Status == TaskStatus.RanToCompletion
                             ? t.Result
-                            : "读取 CuaEdge 状态失败";
+                            : "读取浏览器状态失败";
                         _edgeLoading = false;
                     }));
                 }

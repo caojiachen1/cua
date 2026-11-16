@@ -27,3 +27,8 @@ docs/*-samples/
 docs/*-report.md
 docs/*-comparison.md
 tools/*-report*.md
+
+# Progress/status notes stay local and are never committed
+PROGRESS*.md
+STATUS*.md
+*进度*.md

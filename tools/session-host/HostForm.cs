@@ -121,7 +121,7 @@ namespace CuaSessionHost
             _release = new FluentButton { Text = "释放控制", Accent = false, Visible = false };
             _hide = new FluentButton { Text = "隐藏", Accent = false };
             _settings = new FluentButton { Text = "设置", Accent = false };
-            _edge = new FluentButton { Text = "子会话 Edge", Accent = false };
+            _edge = new FluentButton { Text = "子会话浏览器", Accent = false };
 
             _minimize = new FluentButton
             {
@@ -148,7 +148,7 @@ namespace CuaSessionHost
             _tips.SetToolTip(_close, "隐藏到托盘（子会话继续运行）");
             _tips.SetToolTip(_hide, "隐藏到托盘");
             _tips.SetToolTip(_settings, "子会话设置");
-            _tips.SetToolTip(_edge, "在子会话中打开独立的 CuaEdge 浏览器");
+            _tips.SetToolTip(_edge, "在子会话中打开独立浏览器（CuaEdge / CuaChrome）");
 
             _takeover.Click += delegate { SetViewOnly(false); };
             _release.Click += delegate { SetViewOnly(true); };
@@ -353,7 +353,7 @@ namespace CuaSessionHost
             };
             _trayMenu.Items.Add(MenuItem("打开观察窗", delegate { ShowViewer(!_viewOnly); }));
             _trayMenu.Items.Add(MenuItem("子会话设置…", OpenSettings));
-            _trayMenu.Items.Add(MenuItem("在子会话打开 CuaEdge", OpenChildEdge));
+            _trayMenu.Items.Add(MenuItem("在子会话打开浏览器", OpenChildEdge));
             _trayMenu.Items.Add(new ToolStripSeparator());
             _menuTakeover = MenuItem("接管控制", delegate { ShowViewer(false); });
             _menuRelease = MenuItem("释放控制", delegate { ShowViewer(true); });
@@ -851,9 +851,12 @@ namespace CuaSessionHost
                 var d = MergedEdgeStatus();
                 string profile = Json.Str(d, "profile");
                 if (string.IsNullOrEmpty(profile))
-                    profile = Path.Combine(_opt.DataDir, "browser", "CuaEdge");
+                    profile = Path.Combine(_opt.DataDir, "browser", ProfileKindName(d));
                 bool exists = Directory.Exists(profile);
-                string exe = Json.Str(d, "edge_exe");
+                string exe = Json.Str(d, "browser_exe");
+                if (string.IsNullOrEmpty(exe)) exe = Json.Str(d, "edge_exe");
+                string kindLabel = string.Equals(Json.Str(d, "browser"), "chrome", StringComparison.OrdinalIgnoreCase) ? "Chrome" : "Edge";
+                string exeName = kindLabel == "Chrome" ? "chrome.exe" : "msedge.exe";
                 string edge;
                 if (string.IsNullOrEmpty(exe))
                 {
@@ -868,7 +871,7 @@ namespace CuaSessionHost
                             version = FileVersionInfo.GetVersionInfo(exe).FileVersion;
                     }
                     catch { }
-                    edge = string.IsNullOrEmpty(version) ? "msedge.exe（版本未知）" : "Edge " + version;
+                    edge = string.IsNullOrEmpty(version) ? exeName + "（版本未知）" : kindLabel + " " + version;
                 }
                 string cdp = "未开启";
                 object cdpObj;
@@ -877,11 +880,19 @@ namespace CuaSessionHost
                     int port = Json.Int((Dictionary<string, object>)cdpObj, "port", 0);
                     if (port > 0) cdp = "127.0.0.1:" + port;
                 }
-                return "CuaEdge：" + profile + (exists ? "" : "（未创建）") + Environment.NewLine +
-                       "浏览器：" + edge + Environment.NewLine +
+                return kindLabel + " profile：" + profile + (exists ? "" : "（未创建）") + Environment.NewLine +
+                       "版本：" + edge + Environment.NewLine +
                        "状态：" + EdgeStateText(d) + Environment.NewLine +
-                       "CDP：" + cdp + "（仅 Edge 运行时）";
+                       "CDP：" + cdp + "（仅浏览器运行时）";
             }
+        }
+
+        private static string ProfileKindName(Dictionary<string, object> d)
+        {
+            string kind = Json.Str(d, "profile_kind");
+            if (!string.IsNullOrEmpty(kind)) return kind;
+            return string.Equals(Json.Str(d, "browser"), "chrome", StringComparison.OrdinalIgnoreCase)
+                ? "CuaChrome" : "CuaEdge";
         }
 
         private static string EdgeStateText(Dictionary<string, object> d)
@@ -958,8 +969,12 @@ namespace CuaSessionHost
                 merged["cdp"] = cdpObj;
             if (string.IsNullOrEmpty(Json.Str(merged, "profile")))
                 merged["profile"] = Json.Str(child, "profile");
-            if (string.IsNullOrEmpty(Json.Str(merged, "edge_exe")))
-                merged["edge_exe"] = Json.Str(child, "edge_exe");
+            if (string.IsNullOrEmpty(Json.Str(merged, "browser_exe")))
+                merged["browser_exe"] = Json.Str(child, "browser_exe");
+            if (string.IsNullOrEmpty(Json.Str(merged, "browser")))
+                merged["browser"] = Json.Str(child, "browser");
+            if (string.IsNullOrEmpty(Json.Str(merged, "profile_kind")))
+                merged["profile_kind"] = Json.Str(child, "profile_kind");
             return merged;
         }
 
@@ -1002,14 +1017,14 @@ namespace CuaSessionHost
         {
             if (!SessionConnected)
             {
-                MessageBox.Show(this, "子会话未连接。先启动子会话，再打开 CuaEdge。",
-                    "cua · CuaEdge", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MessageBox.Show(this, "子会话未连接。先启动子会话，再打开浏览器。",
+                    "cua · 浏览器", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
             if (!_agentReady)
             {
                 MessageBox.Show(this, "子会话 agent 尚未就绪，请稍等或查看状态。",
-                    "cua · CuaEdge", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    "cua · 浏览器", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
             Cursor previous = Cursor;
@@ -1020,7 +1035,7 @@ namespace CuaSessionHost
                 if (r.ExitCode != 0)
                 {
                     MessageBox.Show(this, "打开子会话 Edge 失败：\n\n" + CuaDetail(r),
-                        "cua · CuaEdge", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        "cua · 浏览器", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 }
             }
             finally
@@ -1034,19 +1049,19 @@ namespace CuaSessionHost
             var d = MergedEdgeStatus();
             string profile = Json.Str(d, "profile");
             if (string.IsNullOrEmpty(profile))
-                profile = Path.Combine(_opt.DataDir, "browser", "CuaEdge");
+                profile = Path.Combine(_opt.DataDir, "browser", ProfileKindName(d));
             if (!Directory.Exists(profile))
             {
-                MessageBox.Show(this, "CuaEdge profile 还不存在。先在主会话运行 `cua session edge --sign-in` 登录。",
-                    "cua · CuaEdge", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MessageBox.Show(this, "浏览器 profile 还不存在。先在主会话运行 `cua session edge --sign-in` 登录。",
+                    "cua · 浏览器", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
             string lockfile = Json.Str(d, "lockfile");
             if (HolderCount(d) > 0 || (lockfile != null && lockfile != "absent" && lockfile != "stale"))
             {
-                MessageBox.Show(this, "CuaEdge 正在被 Edge 使用（" + EdgeStateText(d) +
-                    "）。\n先关闭所有 CuaEdge Edge 窗口再备份。",
-                    "cua · CuaEdge", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show(this, "浏览器 profile 正在被使用（" + EdgeStateText(d) +
+                    "）。\n先关闭所有使用它的浏览器窗口再备份。",
+                    "cua · 浏览器", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
             if (!Warn("备份会复制该 profile 的 cookie 和已保存密码，仍然保存在本机同一用户目录。\n\n继续备份？"))
@@ -1058,12 +1073,12 @@ namespace CuaSessionHost
                 Cursor = Cursors.WaitCursor;
                 CopyDirectory(profile, dest);
                 MessageBox.Show(this, "已备份到：\n" + dest,
-                    "cua · CuaEdge", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    "cua · 浏览器", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
             catch (Exception ex)
             {
                 MessageBox.Show(this, "备份失败：\n" + ex.GetBaseException().Message,
-                    "cua · CuaEdge", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    "cua · 浏览器", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
             finally
             {
@@ -1073,28 +1088,28 @@ namespace CuaSessionHost
 
         internal void DeleteEdgeProfileFromSettings()
         {
-            if (!Warn("删除 CuaEdge profile 会删除其中的 cookie 和已保存密码，无法撤销。\n" +
+            if (!Warn("删除浏览器 profile 会删除其中的 cookie 和已保存密码，无法撤销。\n" +
                       "子会话之后需要重新登录。\n\n确定删除？"))
                 return;
             var d = MergedEdgeStatus();
             string lockfile = Json.Str(d, "lockfile");
             if (HolderCount(d) > 0 || (lockfile != null && lockfile != "absent" && lockfile != "stale"))
             {
-                MessageBox.Show(this, "CuaEdge 正在被 Edge 使用（" + EdgeStateText(d) +
-                    "）。\n先关闭所有 CuaEdge Edge 窗口再删除。",
-                    "cua · CuaEdge", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show(this, "浏览器 profile 正在被使用（" + EdgeStateText(d) +
+                    "）。\n先关闭所有使用它的浏览器窗口再删除。",
+                    "cua · 浏览器", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
             var r = RunCua("session edge --delete-profile --confirm", 30000);
             if (r.ExitCode == 0)
             {
                 MessageBox.Show(this, CuaDetail(r),
-                    "cua · CuaEdge", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    "cua · 浏览器", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
             else
             {
                 MessageBox.Show(this, "删除失败：\n\n" + CuaDetail(r),
-                    "cua · CuaEdge", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    "cua · 浏览器", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
         }
 

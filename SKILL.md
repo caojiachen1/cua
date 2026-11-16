@@ -381,7 +381,7 @@ inside the child session use `cua child edge` (a separate CuaEdge profile). Do n
 `cua child browser` for the user's logged-in browser, because the child has a separate
 profile/instance. Use a VM instead when the task must be isolated from the user's files.
 
-## Child-session Edge (`cua child edge` — independent profile)
+## Child-session browser (`cua child edge` — independent Edge/Chrome profile)
 
 The user's Edge profile is one-desktop-only and belongs to `cua browser` (UBB) in the main
 session. Browser work that must happen in the child session uses its own persistent profile:
@@ -389,15 +389,24 @@ session. Browser work that must happen in the child session uses its own persist
 ```bash
 cua child edge https://example.com     # real Edge window in the child desktop
 cua child edge --automation            # --force-renderer-accessibility for a stable first UIA pass
-cua child edge --cdp                   # opt-in CDP on a random 127.0.0.1 port (CuaEdge only)
-cua child edge --status                # Edge path, profile, lockfile, holders (PID/session)
-cua session edge --sign-in https://example.com  # main session: one-time login, waits for every CuaEdge Edge process to exit
+cua child edge --cdp                   # opt-in CDP on a random 127.0.0.1 port (profile-only)
+cua child edge --status                # browser path, profile, lockfile, holders (PID/session)
+cua child edge --browser chrome        # force Chrome; profile becomes CuaChrome
+cua session edge --sign-in --browser chrome https://example.com  # main session: one-time Chrome login
+cua session edge --sign-in https://example.com  # main session: one-time login, waits for every browser process to exit
 cua session edge --status              # same status from the main-session command family
-cua session edge --delete-profile --confirm    # delete CuaEdge cookies/passwords; refuses while in use
+cua session edge --delete-profile --confirm    # delete the profile's cookies/passwords; refuses while in use
 cua child state --window "Microsoft Edge" --depth 20
 cua child click --window "Microsoft Edge" --index N
 cua child set-value --window "Microsoft Edge" --index M --value "text"
 ```
+
+`--browser auto` (default) keeps using whichever browser created the recorded profile, and
+falls back to Edge → Chrome when there is none. Edge uses `%LOCALAPPDATA%\cua\browser\CuaEdge`,
+Chrome uses `CuaChrome`; never point both at one directory. Discovery order is
+`$CUA_EDGE_EXE`/`$CUA_CHROME_EXE` → config `edge_exe`/`chrome_exe` → `App Paths` → Program
+Files → `%LOCALAPPDATA%`. `cua edge --status` reports `browser`, `browser_exe`, `profile`,
+`profile_kind` and `browser_processes`.
 
 `--cdp` is opt-in and reports `cdp.port` / `cdp.browser_ws` in the launch receipt and
 `cua edge --status`; `/json/version` and `/json/list` are localhost-only and live only while
@@ -417,8 +426,9 @@ opens a local instruction page + up to 8 URLs and waits for every Edge process u
 profile to exit (default 30 min, `--timeout-min` up to 180). On timeout it reports holder
 PIDs/sessions and never kills them; check with `cua session edge --status`.
 
-Profile: `%LOCALAPPDATA%\cua\browser\CuaEdge`. It is **not data-isolated**: Edge sync is
-allowed by default and a new profile goes through Edge's normal first-run import (passwords,
+Profile: `%LOCALAPPDATA%\cua\browser\CuaEdge` for Edge, `...\CuaChrome` for Chrome. It is
+**not data-isolated**: browser sync is
+allowed by default and a new profile goes through the browser's normal first-run import (passwords,
 history, etc.) from the main profile where Edge offers it. CuaEdge may therefore contain the
 main Edge's local credentials and Microsoft account data; cua does not purge or block that
 data. In the 2026-11-16 test a new profile imported 462 saved logins (including all 8 UJS
@@ -446,10 +456,10 @@ in CuaEdge. Edge's first-run import already copies the main profile's local pass
 CuaEdge on the same machine, so autofill works without cloud sync.
 
 The command refuses if another Windows session already holds the profile and reports the
-holder PID/session — never kill that Edge unless the user asks. A second launch in the
+holder PID/session — never kill that browser unless the user asks. A second launch in the
 same session opens a new window in the existing instance. `--fresh-profile` uses a throwaway
-`%TEMP%` profile. Do not launch `msedge.exe` through `cua child launch`; it is refused on
-purpose in the child session.
+`%TEMP%` profile. Do not launch `msedge.exe`/`chrome.exe` through `cua child launch`; it is refused on
+purpose in the child session (use `cua child edge`).
 
 ## Browser (bridged to UBB — the user's own Edge/Chrome)
 

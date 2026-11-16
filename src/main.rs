@@ -224,6 +224,9 @@ pub(crate) enum SessionOp {
         /// Timeout for --sign-in in minutes
         #[arg(long, default_value_t = 30)]
         timeout_min: u64,
+        /// Browser for the independent profile: auto (default), edge or chrome
+        #[arg(long, value_enum)]
+        browser: Option<edge::BrowserPref>,
     },
     /// Show the read-only viewer (mask + Take over button).
     View {
@@ -816,6 +819,9 @@ enum Cmd {
         /// Wait this long for the launched Edge to take the profile (0 = do not wait)
         #[arg(long, default_value_t = 10000)]
         wait_ms: u64,
+        /// Browser for the independent profile: auto (default), edge or chrome
+        #[arg(long, value_enum)]
+        browser: Option<edge::BrowserPref>,
     },
     /// Screen recording (JPEG frames -> mp4, or an HTML player when ffmpeg is missing)
     Rec {
@@ -1365,7 +1371,7 @@ fn dispatch(cmd: Cmd) -> i32 {
             Cmd::Session { op } => session::dispatch(op),
             Cmd::Agent { data_dir } => agent::run(data_dir),
             Cmd::Browser { rest } => ubb::cmd_browser(&rest),
-            Cmd::Edge { urls, fresh_profile, profile, automation, cdp, status, wait_ms } => {
+            Cmd::Edge { urls, fresh_profile, profile, automation, cdp, status, wait_ms, browser } => {
                 edge::cmd_edge(edge::EdgeOptions {
                     urls,
                     fresh_profile,
@@ -1374,6 +1380,7 @@ fn dispatch(cmd: Cmd) -> i32 {
                     cdp,
                     status,
                     wait_ms,
+                    browser,
                 })
             }
             Cmd::Rec { op } => match op {

@@ -93,12 +93,21 @@ inside the child session, use `cua child edge`: it launches a real Edge window i
 desktop with a separate, persistent **CuaEdge** profile
 (`%LOCALAPPDATA%\cua\browser\CuaEdge`), so the user's own Edge, tabs and focus stay untouched.
 
+Edge is preferred when both browsers are installed. `--browser chrome` forces Chrome and keeps
+its state in `CuaChrome`; `--browser auto` (the default) reuses whichever browser created the
+recorded profile, so a machine never silently switches browser mid-profile. Discovery order is
+`$CUA_EDGE_EXE` / `$CUA_CHROME_EXE` → config `edge_exe` / `chrome_exe` → `App Paths` → Program
+Files → `%LOCALAPPDATA%`. `cua edge --status` reports `browser`, `browser_exe`, `profile`,
+`profile_kind` and `browser_processes`. Edge and Chrome never share one profile directory.
+
 ```powershell
 cua child edge https://example.com        # launch / open a new window in the child session
 cua child edge --automation               # add --force-renderer-accessibility for a UIA-friendly tree
 cua child edge --cdp                      # opt-in dedicated CDP on a random 127.0.0.1 port
 cua child state --window "Microsoft Edge" # then drive it with the normal UIA commands
 cua child edge --status                   # Edge path, profile, lock holders (PID/session)
+cua child edge --browser chrome            # force Chrome; separate CuaChrome profile
+cua session edge --sign-in --browser chrome https://example.com  # one-time Chrome login in the main session
 cua child edge --fresh-profile            # throwaway profile under %TEMP% (testing)
 cua session edge --sign-in https://example.com  # main session: one-time CuaEdge login; waits for every CuaEdge Edge process to exit
 cua session edge --status                 # same status, from the main-session command family

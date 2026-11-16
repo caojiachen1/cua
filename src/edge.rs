@@ -1,9 +1,14 @@
-//! edge.rs — an independent, persistent Edge profile for the child session.
+//! edge.rs — an independent, persistent Chromium profile for the child session.
 //!
-//! The user's own Edge profile can only be opened by one desktop at a time.
-//! `cua edge` therefore gives the child session its own `CuaEdge` profile,
-//! launches a real Edge window inside the session that runs the command, and
-//! refuses to start when another Windows session already holds that profile.
+//! The user's own Edge/Chrome profile can only be opened by one desktop at a
+//! time. `cua edge` therefore gives the child session its own `CuaEdge` (or
+//! `CuaChrome`) profile, launches a real browser window inside the session that
+//! runs the command, and refuses to start when another Windows session already
+//! holds that profile.
+//!
+//! Edge is preferred when both are installed; `--browser edge|chrome` forces one
+//! and `--browser auto` (the default) keeps using whatever kind created the
+//! profile, so a machine never silently switches browser mid-profile.
 //!
 //! First version deliberately uses the existing UIA/screenshot/real-input
 //! commands (`cua child state/click/set-value/...`) instead of CDP or UBB.
@@ -36,10 +41,127 @@ use windows::Wdk::System::Threading::{NtQueryInformationProcess, ProcessCommandL
 
 use crate::util::{self, Receipt};
 
-const PROFILE_SCHEMA: &str = "cua-edge-profile-v1";
+const PROFILE_SCHEMA: &str = "cua-browser-profile-v1";
+const LEGACY_PROFILE_SCHEMA: &str = "cua-edge-profile-v1";
 const STATUS_SCHEMA: &str = "cua-edge-status-v1";
 const MAX_URLS: usize = 8;
 const WAIT_STEP: Duration = Duration::from_millis(150);
+
+/// What the user asked for on the command line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum BrowserPref {
+    /// Use whatever browser created the profile, else Edge, else Chrome
+    Auto,
+    Edge,
+    Chrome,
+}
+
+impl BrowserPref {
+    fn resolve(self) -> (BrowserKind, Option<PathBuf>) {
+        match self {
+            BrowserPref::Edge => (BrowserKind::Edge, locate(BrowserKind::Edge)),
+            BrowserPref::Chrome => (BrowserKind::Chrome, locate(BrowserKind::Chrome)),
+            BrowserPref::Auto => {
+                // Keep the kind that created the recorded profile: switching
+                // browsers would point the user at an empty new profile.
+                if let Some(meta) = read_metadata() {
+                    if let Some(kind) = BrowserKind::from_str(&meta.browser) {
+                        if Path::new(&meta.browser_exe).is_file() {
+                            return (kind, Some(PathBuf::from(&meta.browser_exe)));
+                        }
+                    }
+                }
+                match locate(BrowserKind::Edge) {
+                    Some(p) => (BrowserKind::Edge, Some(p)),
+                    None => (BrowserKind::Chrome, locate(BrowserKind::Chrome)),
+                }
+            }
+        }
+    }
+}
+
+/// The browser that will actually be launched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrowserKind {
+    Edge,
+    Chrome,
+}
+
+impl BrowserKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            BrowserKind::Edge => "edge",
+            BrowserKind::Chrome => "chrome",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            BrowserKind::Edge => "Edge",
+            BrowserKind::Chrome => "Chrome",
+        }
+    }
+
+    fn exe_name(self) -> &'static str {
+        match self {
+            BrowserKind::Edge => "msedge.exe",
+            BrowserKind::Chrome => "chrome.exe",
+        }
+    }
+
+    fn profile_dir(self) -> &'static str {
+        match self {
+            BrowserKind::Edge => "CuaEdge",
+            BrowserKind::Chrome => "CuaChrome",
+        }
+    }
+
+    fn app_path_keys(self) -> [&'static str; 2] {
+        match self {
+            BrowserKind::Edge => [
+                "Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\msedge.exe",
+                "Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\App Paths\\msedge.exe",
+            ],
+            BrowserKind::Chrome => [
+                "Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\chrome.exe",
+                "Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\App Paths\\chrome.exe",
+            ],
+        }
+    }
+
+    fn install_subdir(self) -> &'static str {
+        match self {
+            BrowserKind::Edge => "Microsoft\\Edge\\Application",
+            BrowserKind::Chrome => "Google\\Chrome\\Application",
+        }
+    }
+
+    fn env_var(self) -> &'static str {
+        match self {
+            BrowserKind::Edge => "CUA_EDGE_EXE",
+            BrowserKind::Chrome => "CUA_CHROME_EXE",
+        }
+    }
+
+    fn config_key(self) -> &'static str {
+        match self {
+            BrowserKind::Edge => "edge_exe",
+            BrowserKind::Chrome => "chrome_exe",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "edge" | "msedge" => Some(BrowserKind::Edge),
+            "chrome" => Some(BrowserKind::Chrome),
+            _ => None,
+        }
+    }
+
+    fn is_browser_name(name: &str) -> bool {
+        name.eq_ignore_ascii_case("msedge.exe") || name.eq_ignore_ascii_case("chrome.exe")
+    }
+}
 
 pub struct EdgeOptions {
     pub urls: Vec<String>,
@@ -49,24 +171,28 @@ pub struct EdgeOptions {
     pub cdp: bool,
     pub status: bool,
     pub wait_ms: u64,
+    pub browser: Option<BrowserPref>,
 }
 
 /// `cua child edge ...` entry point. The child agent executes `cua edge ...`
 /// inside the child session, so everything here runs in the target desktop.
 pub fn cmd_edge(opts: EdgeOptions) -> Result<i32> {
-    let edge = resolve_edge();
-    let profile = resolve_profile(opts.profile.as_deref(), opts.fresh_profile);
+    let (kind, edge) = opts.browser.unwrap_or(BrowserPref::Auto).resolve();
+    let profile = resolve_profile(kind, opts.profile.as_deref(), opts.fresh_profile);
     let wait_ms = opts.wait_ms.min(300_000);
 
     if opts.status {
         if !opts.urls.is_empty() {
             let r = Receipt::new("edge").refused(
                 json!({ "profile": profile.display().to_string(), "urls": opts.urls }),
-                "`edge --status` does not launch Edge; remove URL arguments",
+                &format!(
+                    "`edge --status` does not launch {}; remove URL arguments",
+                    kind.label()
+                ),
             );
-            return emit(r, launch_extra(edge.as_deref(), &profile, &scan_profile(&profile), None, false, false, false));
+            return emit(r, launch_extra(kind, edge.as_deref(), &profile, &scan_profile(&profile), None, false, false, false));
         }
-        return print_status(edge.as_deref(), &profile, opts.fresh_profile);
+        return print_status(kind, edge.as_deref(), &profile, opts.fresh_profile);
     }
 
     if let Err(e) = validate_urls(&opts.urls) {
@@ -74,18 +200,20 @@ pub fn cmd_edge(opts: EdgeOptions) -> Result<i32> {
             json!({ "profile": profile.display().to_string(), "urls": opts.urls }),
             &e,
         );
-        return emit(r, launch_extra(edge.as_deref(), &profile, &scan_profile(&profile), None, false, false, opts.automation));
+        return emit(r, launch_extra(kind, edge.as_deref(), &profile, &scan_profile(&profile), None, false, false, opts.automation));
     }
 
     let Some(edge) = edge else {
         let r = Receipt::new("edge").fail(
             json!({ "profile": profile.display().to_string(), "urls": opts.urls }),
             &format!(
-                "msedge.exe not found. Checked $CUA_EDGE_EXE, config `edge_exe`, \
-                 App Paths\\msedge.exe and the standard Program Files paths"
+                "{} not found. Checked ${}, config `{}`, App Paths and the standard install paths",
+                kind.exe_name(),
+                kind.env_var(),
+                kind.config_key()
             ),
         );
-        return emit(r, launch_extra(None, &profile, &scan_profile(&profile), None, false, opts.fresh_profile, opts.automation));
+        return emit(r, launch_extra(kind, None, &profile, &scan_profile(&profile), None, false, opts.fresh_profile, opts.automation));
     };
 
     let current = current_session();
@@ -95,13 +223,13 @@ pub fn cmd_edge(opts: EdgeOptions) -> Result<i32> {
             json!({ "profile": profile.display().to_string(), "urls": opts.urls, "session": current }),
             &detail,
         );
-        return emit(r, launch_extra(Some(edge.as_path()), &profile, &before, None, false, opts.fresh_profile, opts.automation));
+        return emit(r, launch_extra(kind, Some(edge.as_path()), &profile, &before, None, false, opts.fresh_profile, opts.automation));
     }
 
     let same: Vec<&Holder> = before
         .holders
         .iter()
-        .filter(|h| h.is_edge && h.session == current)
+        .filter(|h| h.is_browser && h.session == current)
         .collect();
     let already_running = !same.is_empty();
     let cdp_port = if opts.cdp {
@@ -112,26 +240,26 @@ pub fn cmd_edge(opts: EdgeOptions) -> Result<i32> {
                     json!({ "profile": profile.display().to_string(), "urls": opts.urls, "session": current }),
                     "could not reserve a localhost port for the dedicated CDP endpoint",
                 );
-                return emit(r, launch_extra(Some(edge.as_path()), &profile, &before, None, false, opts.fresh_profile, opts.automation));
+                return emit(r, launch_extra(kind, Some(edge.as_path()), &profile, &before, None, false, opts.fresh_profile, opts.automation));
             }
         }
     } else {
         None
     };
 
-    let launched_pid = match spawn_edge(&edge, &profile, opts.automation, cdp_port, &opts.urls) {
+    let launched_pid = match spawn_browser(&edge, &profile, opts.automation, cdp_port, &opts.urls) {
         Ok(pid) => pid,
         Err(e) => {
             let r = Receipt::new("edge").fail(
                 json!({ "profile": profile.display().to_string(), "urls": opts.urls, "session": current }),
                 &format!("{e:#}"),
             );
-            return emit(r, launch_extra(Some(edge.as_path()), &profile, &before, None, false, opts.fresh_profile, opts.automation));
+            return emit(r, launch_extra(kind, Some(edge.as_path()), &profile, &before, None, false, opts.fresh_profile, opts.automation));
         }
     };
 
     if !opts.fresh_profile {
-        let _ = write_metadata(&profile, &edge);
+        let _ = write_metadata(&profile, kind, &edge);
     }
 
     let mut after = scan_profile(&profile);
@@ -159,55 +287,69 @@ pub fn cmd_edge(opts: EdgeOptions) -> Result<i32> {
     if let Some(h) = holder_outside(&after, current) {
         let h = h.clone();
         let detail = format!(
-            "Edge was spawned (PID {launched_pid}), but the CuaEdge profile was taken by \
-             session {} (PID {}). Close that Edge window and retry.",
-            h.session, h.pid
+            "{} was spawned (PID {launched_pid}), but the {} profile was taken by \
+             session {} (PID {}). Close that {} window and retry.",
+            kind.label(),
+            kind.profile_dir(),
+            h.session,
+            h.pid,
+            kind.label()
         );
         let r = Receipt::new("edge").fail(
             json!({ "profile": profile.display().to_string(), "urls": opts.urls, "session": current }),
             &detail,
         );
-        let extra = launch_extra(Some(edge.as_path()), &profile, &after, Some(launched_pid), already_running, opts.fresh_profile, opts.automation);
+        let extra = launch_extra(kind, Some(edge.as_path()), &profile, &after, Some(launched_pid), already_running, opts.fresh_profile, opts.automation);
         return emit(r, extra);
     }
 
     if !already_running && wait_ms > 0 && holder.is_none() {
         let detail = format!(
-            "Edge was spawned (PID {launched_pid}), but no process using '{}' appeared within {} ms. \
-             Run `cua edge --status` and check whether Edge showed an error dialog.",
+            "{} was spawned (PID {launched_pid}), but no process using '{}' appeared within {} ms. \
+             Run `cua edge --status` and check whether {} showed an error dialog.",
+            kind.label(),
             profile.display(),
-            wait_ms
+            wait_ms,
+            kind.label()
         );
         let r = Receipt::new("edge").fail(
             json!({ "profile": profile.display().to_string(), "urls": opts.urls, "session": current }),
             &detail,
         );
-        let extra = launch_extra(Some(edge.as_path()), &profile, &after, Some(launched_pid), already_running, opts.fresh_profile, opts.automation);
+        let extra = launch_extra(kind, Some(edge.as_path()), &profile, &after, Some(launched_pid), already_running, opts.fresh_profile, opts.automation);
         return emit(r, extra);
     }
 
     let detail = if already_running {
         let h = best_of(same);
         format!(
-            "opened a new Edge window in the existing CuaEdge instance (PID {}, session {})",
-            h.pid, h.session
+            "opened a new {} window in the existing {} instance (PID {}, session {})",
+            kind.label(),
+            kind.profile_dir(),
+            h.pid,
+            h.session
         )
     } else if let Some(h) = &holder {
         format!(
-            "launched Microsoft Edge with the CuaEdge profile (launcher PID {launched_pid}; process using the profile at launch: PID {} in session {})",
-            h.pid, h.session
+            "launched {} with the {} profile (launcher PID {launched_pid}; process using the profile at launch: PID {} in session {})",
+            kind.label(),
+            kind.profile_dir(),
+            h.pid,
+            h.session
         )
     } else {
         format!(
-            "launched Microsoft Edge with the CuaEdge profile (launcher PID {launched_pid}); not waiting for the profile holder"
+            "launched {} with the {} profile (launcher PID {launched_pid}); not waiting for the profile holder",
+            kind.label(),
+            kind.profile_dir()
         )
     };
     let r = Receipt::new("edge").ok(
         json!({ "profile": profile.display().to_string(), "urls": opts.urls, "session": current }),
         &detail,
     );
-    let mut extra = launch_extra(Some(edge.as_path()), &profile, &after, Some(launched_pid), already_running, opts.fresh_profile, opts.automation);
-    let cdp = if opts.cdp || after.holders.iter().any(|h| h.is_edge && h.cdp_port.is_some()) {
+    let mut extra = launch_extra(kind, Some(edge.as_path()), &profile, &after, Some(launched_pid), already_running, opts.fresh_profile, opts.automation);
+    let cdp = if opts.cdp || after.holders.iter().any(|h| h.is_browser && h.cdp_port.is_some()) {
         let preferred = if already_running { None } else { cdp_port };
         wait_for_cdp_endpoint(&profile, &after, preferred, Duration::from_secs(3))
     } else {
@@ -219,15 +361,19 @@ pub fn cmd_edge(opts: EdgeOptions) -> Result<i32> {
         }
     } else if opts.cdp {
         extra["cdp_error"] = json!(if already_running {
-            "the existing CuaEdge instance was not launched with --cdp; close it and relaunch with --cdp"
+            format!(
+                "the existing {} instance was not launched with --cdp; close it and relaunch with --cdp",
+                kind.profile_dir()
+            )
         } else {
-            "CDP endpoint did not appear within 3s; UIA still works"
+            "CDP endpoint did not appear within 3s; UIA still works".to_string()
         });
     }
     emit(r, extra)
 }
 
 fn launch_extra(
+    kind: BrowserKind,
     edge: Option<&Path>,
     profile: &Path,
     scan: &Scan,
@@ -238,8 +384,10 @@ fn launch_extra(
 ) -> Value {
     json!({
         "backend": "native",
-        "edge_exe": edge.map(|p| p.display().to_string()),
+        "browser": kind.as_str(),
+        "browser_exe": edge.map(|p| p.display().to_string()),
         "profile": profile.display().to_string(),
+        "profile_kind": kind.profile_dir(),
         "session_id": current_session(),
         "child_session": in_child_session(),
         "automation": automation,
@@ -271,18 +419,25 @@ pub struct SessionEdgeOptions {
     pub confirm: bool,
     pub urls: Vec<String>,
     pub timeout_min: u64,
+    pub browser: Option<BrowserPref>,
 }
 
-/// `cua session edge ...`: the user's main-session side of the CuaEdge profile.
-/// `--sign-in` opens the profile where the user actually is, waits for every
-/// Edge process using it to exit, and leaves `cua child edge` with the login.
+/// `cua session edge ...`: the user's main-session side of the CuaEdge/CuaChrome
+/// profile. `--sign-in` opens the profile where the user actually is, waits for
+/// every browser process using it to exit, and leaves `cua child edge` with the
+/// login.
 pub fn cmd_session_edge(opts: SessionEdgeOptions) -> Result<i32> {
+    let (kind, edge) = opts.browser.unwrap_or(BrowserPref::Auto).resolve();
+    let profile = default_profile(kind);
+
     let modes = [opts.sign_in, opts.status, opts.delete_profile]
         .iter()
         .filter(|b| **b)
         .count();
     if modes > 1 {
         return session_edge_refusal(
+            kind,
+            &profile,
             "session-edge",
             "choose exactly one of --sign-in, --status, --delete-profile",
             json!({ "urls": opts.urls }),
@@ -290,47 +445,63 @@ pub fn cmd_session_edge(opts: SessionEdgeOptions) -> Result<i32> {
     }
     if opts.confirm && !opts.delete_profile {
         return session_edge_refusal(
+            kind,
+            &profile,
             "session-edge",
             "--confirm is only valid with --delete-profile",
             json!({ "urls": opts.urls }),
         );
     }
 
-    let profile = default_profile();
-    let edge = resolve_edge();
-
     if opts.status || modes == 0 {
         if !opts.urls.is_empty() {
             return session_edge_refusal(
+                kind,
+                &profile,
                 "session-edge",
-                "--status does not launch Edge; remove URL arguments",
+                &format!(
+                    "--status does not launch {}; remove URL arguments",
+                    kind.label()
+                ),
                 json!({ "profile": profile.display().to_string(), "urls": opts.urls }),
             );
         }
-        return print_status(edge.as_deref(), &profile, false);
+        return print_status(kind, edge.as_deref(), &profile, false);
     }
 
     if opts.delete_profile {
         if !opts.urls.is_empty() {
             return session_edge_refusal(
+                kind,
+                &profile,
                 "session-edge-delete",
-                "--delete-profile does not launch Edge; remove URL arguments",
+                &format!(
+                    "--delete-profile does not launch {}; remove URL arguments",
+                    kind.label()
+                ),
                 json!({ "profile": profile.display().to_string(), "urls": opts.urls }),
             );
         }
         if !opts.confirm {
             return session_edge_refusal(
+                kind,
+                &profile,
                 "session-edge-delete",
-                "--delete-profile removes the CuaEdge cookies/passwords; pass --confirm to proceed",
+                &format!(
+                    "--delete-profile removes the {} cookies/passwords; pass --confirm to proceed",
+                    kind.profile_dir()
+                ),
                 json!({ "profile": profile.display().to_string() }),
             );
         }
-        return delete_session_profile(edge.as_deref(), &profile);
+        return delete_session_profile(kind, edge.as_deref(), &profile);
     }
 
     // sign-in
     if let Some(reason) = main_session_guard() {
         return session_edge_refusal(
+            kind,
+            &profile,
             "session-edge-signin",
             &reason,
             json!({ "profile": profile.display().to_string(), "urls": opts.urls }),
@@ -338,6 +509,8 @@ pub fn cmd_session_edge(opts: SessionEdgeOptions) -> Result<i32> {
     }
     if let Err(e) = validate_urls(&opts.urls) {
         return session_edge_refusal(
+            kind,
+            &profile,
             "session-edge-signin",
             &e,
             json!({ "profile": profile.display().to_string(), "urls": opts.urls }),
@@ -345,8 +518,15 @@ pub fn cmd_session_edge(opts: SessionEdgeOptions) -> Result<i32> {
     }
     let Some(edge) = edge else {
         return session_edge_failure(
+            kind,
+            &profile,
             "session-edge-signin",
-            "msedge.exe not found. Checked $CUA_EDGE_EXE, config `edge_exe`, App Paths\\msedge.exe and the standard Program Files paths",
+            &format!(
+                "{} not found. Checked ${}, config `{}`, App Paths and the standard install paths",
+                kind.exe_name(),
+                kind.env_var(),
+                kind.config_key()
+            ),
             json!({ "profile": profile.display().to_string(), "urls": opts.urls }),
         );
     };
@@ -360,17 +540,19 @@ pub fn cmd_session_edge(opts: SessionEdgeOptions) -> Result<i32> {
         );
         return emit(
             r,
-            session_edge_extra(Some(edge.as_path()), &profile, json!({
+            session_edge_extra(kind, Some(edge.as_path()), &profile, json!({
                 "lockfile": scan.lockfile.as_str(),
                 "holders": scan.holders,
             })),
         );
     }
 
-    let page = match write_sign_in_page(&opts.urls) {
+    let page = match write_sign_in_page(kind, &opts.urls) {
         Ok(p) => p,
         Err(e) => {
             return session_edge_failure(
+                kind,
+                &profile,
                 "session-edge-signin",
                 &format!("could not write the sign-in page: {e:#}"),
                 json!({ "profile": profile.display().to_string(), "urls": opts.urls }),
@@ -380,28 +562,31 @@ pub fn cmd_session_edge(opts: SessionEdgeOptions) -> Result<i32> {
     let mut tabs = vec![file_url(&page)];
     tabs.extend(opts.urls.iter().cloned());
 
-    let launched_pid = match spawn_edge(&edge, &profile, false, None, &tabs) {
+    let launched_pid = match spawn_browser(&edge, &profile, false, None, &tabs) {
         Ok(pid) => pid,
         Err(e) => {
             return session_edge_failure(
+                kind,
+                &profile,
                 "session-edge-signin",
                 &format!("{e:#}"),
                 json!({ "profile": profile.display().to_string(), "urls": opts.urls }),
             );
         }
     };
-    let _ = write_metadata(&profile, &edge);
+    let _ = write_metadata(&profile, kind, &edge);
     let timeout_min = opts.timeout_min.clamp(1, 180);
     let started = Instant::now();
     let outcome = wait_for_sign_in(&profile, started, Duration::from_secs(timeout_min * 60));
 
     match outcome {
         SignInOutcome::Closed { scan, waited } => {
-            let _ = write_metadata(&profile, &edge);
+            let _ = write_metadata(&profile, kind, &edge);
             let detail = format!(
-                "CuaEdge sign-in finished: every Edge process using the profile exited after {:.1}s. \
+                "{} sign-in finished: every browser process using the profile exited after {:.1}s. \
                  The profile keeps the cookies/passwords saved in that window; run `cua child edge` \
                  to use the same login in the child session.",
+                kind.profile_dir(),
                 waited.as_secs_f64()
             );
             let r = Receipt::new("session-edge-signin").ok(
@@ -410,7 +595,7 @@ pub fn cmd_session_edge(opts: SessionEdgeOptions) -> Result<i32> {
             );
             emit(
                 r,
-                session_edge_extra(Some(edge.as_path()), &profile, json!({
+                session_edge_extra(kind, Some(edge.as_path()), &profile, json!({
                     "sign_in_page": page.display().to_string(),
                     "launched_pid": launched_pid,
                     "closed": true,
@@ -423,27 +608,31 @@ pub fn cmd_session_edge(opts: SessionEdgeOptions) -> Result<i32> {
             )
         }
         SignInOutcome::Timeout { scan, seen, waited } => {
-            let edge_holders: Vec<&Holder> =
-                scan.holders.iter().filter(|h| h.is_edge).collect();
-            let list = if edge_holders.is_empty() {
-                "none (the profile lock may be held by a non-Edge process)".to_string()
+            let live_holders: Vec<&Holder> =
+                scan.holders.iter().filter(|h| h.is_browser).collect();
+            let list = if live_holders.is_empty() {
+                "none (the profile lock may be held by another process)".to_string()
             } else {
-                holder_summary(&edge_holders)
+                holder_summary(&live_holders)
             };
             let detail = if seen {
                 format!(
-                    "CuaEdge sign-in is still open after {} min. Edge processes using '{}': {}. \
-                     cua never kills them; close those Edge windows (or end the PIDs yourself), \
+                    "{} sign-in is still open after {} min. Browser processes using '{}': {}. \
+                     cua never kills them; close those {} windows (or end the PIDs yourself), \
                      then run `cua session edge --status`.",
+                    kind.profile_dir(),
                     timeout_min,
                     profile.display(),
-                    list
+                    list,
+                    kind.label()
                 )
             } else {
                 format!(
-                    "Edge was spawned (PID {launched_pid}) but no process using '{}' appeared within 20s. \
-                     Check whether Edge showed an error dialog, then run `cua session edge --status`.",
-                    profile.display()
+                    "{} was spawned (PID {launched_pid}) but no process using '{}' appeared within 20s. \
+                     Check whether {} showed an error dialog, then run `cua session edge --status`.",
+                    kind.label(),
+                    profile.display(),
+                    kind.label()
                 )
             };
             let r = Receipt::new("session-edge-signin").fail(
@@ -452,7 +641,7 @@ pub fn cmd_session_edge(opts: SessionEdgeOptions) -> Result<i32> {
             );
             emit(
                 r,
-                session_edge_extra(Some(edge.as_path()), &profile, json!({
+                session_edge_extra(kind, Some(edge.as_path()), &profile, json!({
                     "sign_in_page": page.display().to_string(),
                     "launched_pid": launched_pid,
                     "closed": false,
@@ -468,21 +657,40 @@ pub fn cmd_session_edge(opts: SessionEdgeOptions) -> Result<i32> {
     }
 }
 
-fn session_edge_refusal(cmd: &str, detail: &str, fields: Value) -> Result<i32> {
+fn session_edge_refusal(
+    kind: BrowserKind,
+    profile: &Path,
+    cmd: &str,
+    detail: &str,
+    fields: Value,
+) -> Result<i32> {
     let r = Receipt::new(cmd).refused(fields.clone(), detail);
-    emit(r, session_edge_extra(None, &default_profile(), fields))
+    emit(r, session_edge_extra(kind, None, profile, fields))
 }
 
-fn session_edge_failure(cmd: &str, detail: &str, fields: Value) -> Result<i32> {
+fn session_edge_failure(
+    kind: BrowserKind,
+    profile: &Path,
+    cmd: &str,
+    detail: &str,
+    fields: Value,
+) -> Result<i32> {
     let r = Receipt::new(cmd).fail(fields.clone(), detail);
-    emit(r, session_edge_extra(None, &default_profile(), fields))
+    emit(r, session_edge_extra(kind, None, profile, fields))
 }
 
-fn session_edge_extra(edge: Option<&Path>, profile: &Path, fields: Value) -> Value {
+fn session_edge_extra(
+    kind: BrowserKind,
+    edge: Option<&Path>,
+    profile: &Path,
+    fields: Value,
+) -> Value {
     let mut v = json!({
         "backend": "native",
-        "edge_exe": edge.map(|p| p.display().to_string()),
+        "browser": kind.as_str(),
+        "browser_exe": edge.map(|p| p.display().to_string()),
         "profile": profile.display().to_string(),
+        "profile_kind": kind.profile_dir(),
         "session_id": current_session(),
         "child_session": in_child_session(),
     });
@@ -508,7 +716,7 @@ fn wait_for_sign_in(profile: &Path, started: Instant, timeout: Duration) -> Sign
     let mut empty_since: Option<Instant> = None;
     loop {
         let scan = scan_profile(profile);
-        if scan.holders.iter().any(|h| h.is_edge) {
+        if scan.holders.iter().any(|h| h.is_browser) {
             seen = true;
             empty_since = None;
         } else if seen {
@@ -548,9 +756,15 @@ fn main_session_guard() -> Option<String> {
     None
 }
 
-fn delete_session_profile(edge: Option<&Path>, profile: &Path) -> Result<i32> {
+fn delete_session_profile(
+    kind: BrowserKind,
+    edge: Option<&Path>,
+    profile: &Path,
+) -> Result<i32> {
     if let Some(reason) = main_session_guard() {
         return session_edge_refusal(
+            kind,
+            profile,
             "session-edge-delete",
             &reason,
             json!({ "profile": profile.display().to_string() }),
@@ -558,12 +772,14 @@ fn delete_session_profile(edge: Option<&Path>, profile: &Path) -> Result<i32> {
     }
     let current = current_session();
     let scan = scan_profile(profile);
-    let holders: Vec<&Holder> = scan.holders.iter().filter(|h| h.is_edge).collect();
+    let holders: Vec<&Holder> = scan.holders.iter().filter(|h| h.is_browser).collect();
     if !holders.is_empty() {
         let list = holder_summary(&holders);
         let detail = format!(
-            "refusing to delete '{}': Edge is still using it ({list}). Close those Edge windows first.",
-            profile.display()
+            "refusing to delete '{}': {} is still using it ({list}). Close those {} windows first.",
+            profile.display(),
+            kind.label(),
+            kind.label()
         );
         let r = Receipt::new("session-edge-delete").refused(
             json!({ "profile": profile.display().to_string(), "session": current }),
@@ -571,7 +787,7 @@ fn delete_session_profile(edge: Option<&Path>, profile: &Path) -> Result<i32> {
         );
         return emit(
             r,
-            session_edge_extra(edge, profile, json!({
+            session_edge_extra(kind, edge, profile, json!({
                 "lockfile": scan.lockfile.as_str(),
                 "restart_manager_ok": scan.rm_ok,
                 "holders": scan.holders,
@@ -580,10 +796,11 @@ fn delete_session_profile(edge: Option<&Path>, profile: &Path) -> Result<i32> {
     }
     if !matches!(scan.lockfile, LockFileState::Absent | LockFileState::Stale) {
         let detail = format!(
-            "refusing to delete '{}': its lockfile is {} (held or unreadable). Close any Edge using \
+            "refusing to delete '{}': its lockfile is {} (held or unreadable). Close any {} using \
              the profile, then retry.",
             profile.display(),
-            scan.lockfile.as_str()
+            scan.lockfile.as_str(),
+            kind.label()
         );
         let r = Receipt::new("session-edge-delete").refused(
             json!({ "profile": profile.display().to_string(), "session": current }),
@@ -591,7 +808,7 @@ fn delete_session_profile(edge: Option<&Path>, profile: &Path) -> Result<i32> {
         );
         return emit(
             r,
-            session_edge_extra(edge, profile, json!({
+            session_edge_extra(kind, edge, profile, json!({
                 "lockfile": scan.lockfile.as_str(),
                 "restart_manager_ok": scan.rm_ok,
                 "holders": scan.holders,
@@ -599,7 +816,7 @@ fn delete_session_profile(edge: Option<&Path>, profile: &Path) -> Result<i32> {
         );
     }
 
-    // A junction/symlink could point at the user's real Edge profile; only
+    // A junction/symlink could point at the user's real browser profile; only
     // delete a path that really lives under cua's browser directory.
     let browser_dir = util::ensure_data_dir().join("browser");
     let canon_browser = std::fs::canonicalize(&browser_dir).unwrap_or(browser_dir);
@@ -608,6 +825,8 @@ fn delete_session_profile(edge: Option<&Path>, profile: &Path) -> Result<i32> {
         if let Ok(md) = std::fs::symlink_metadata(profile) {
             if md.file_type().is_symlink() {
                 return session_edge_refusal(
+                    kind,
+                    profile,
                     "session-edge-delete",
                     "refusing to delete a symlinked profile; remove the link yourself if it is safe",
                     json!({ "profile": profile.display().to_string() }),
@@ -618,6 +837,8 @@ fn delete_session_profile(edge: Option<&Path>, profile: &Path) -> Result<i32> {
             std::fs::canonicalize(profile).unwrap_or_else(|_| profile.to_path_buf());
         if !canon_profile.starts_with(&canon_browser) {
             return session_edge_refusal(
+                kind,
+                profile,
                 "session-edge-delete",
                 "refusing to delete a profile that resolves outside the cua browser directory",
                 json!({ "profile": profile.display().to_string() }),
@@ -632,11 +853,15 @@ fn delete_session_profile(edge: Option<&Path>, profile: &Path) -> Result<i32> {
         .is_some();
     let detail = if exists {
         format!(
-            "deleted CuaEdge profile '{}' (its cookies and saved passwords are gone)",
+            "deleted {} profile '{}' (its cookies and saved passwords are gone)",
+            kind.profile_dir(),
             profile.display()
         )
     } else {
-        "CuaEdge profile did not exist; nothing to delete".to_string()
+        format!(
+            "{} profile did not exist; nothing to delete",
+            kind.profile_dir()
+        )
     };
     let r = Receipt::new("session-edge-delete").ok(
         json!({ "profile": profile.display().to_string(), "session": current }),
@@ -644,7 +869,7 @@ fn delete_session_profile(edge: Option<&Path>, profile: &Path) -> Result<i32> {
     );
     emit(
         r,
-        session_edge_extra(edge, profile, json!({
+        session_edge_extra(kind, edge, profile, json!({
             "deleted": exists,
             "metadata_removed": meta_removed,
         })),
@@ -653,17 +878,17 @@ fn delete_session_profile(edge: Option<&Path>, profile: &Path) -> Result<i32> {
 
 // ---------------------------------------------------------------- sign-in page
 
-fn write_sign_in_page(urls: &[String]) -> Result<PathBuf> {
+fn write_sign_in_page(kind: BrowserKind, urls: &[String]) -> Result<PathBuf> {
     let path = util::ensure_data_dir().join("browser").join("sign-in.html");
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     }
-    std::fs::write(&path, sign_in_page_html(urls))
+    std::fs::write(&path, sign_in_page_html(kind, urls))
         .with_context(|| format!("write {}", path.display()))?;
     Ok(path)
 }
 
-fn sign_in_page_html(urls: &[String]) -> String {
+fn sign_in_page_html(kind: BrowserKind, urls: &[String]) -> String {
     let list = if urls.is_empty() {
         String::new()
     } else {
@@ -673,25 +898,27 @@ fn sign_in_page_html(urls: &[String]) -> String {
             .collect::<String>();
         format!("<p>本次已打开的站点：</p><ul>{items}</ul>")
     };
+    let label = kind.label();
+    let dir = kind.profile_dir();
     format!(
         r#"<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
-<title>cua · CuaEdge 登录</title>
+<title>cua · {dir} 登录</title>
 <style>
 body{{font:15px/1.7 system-ui,"Segoe UI",sans-serif;background:#1b1a20;color:#eee;max-width:760px;margin:40px auto;padding:0 24px}}
 h1{{font-size:22px;font-weight:600}} code{{background:#2b2a33;padding:2px 5px;border-radius:4px}}
 li{{margin:6px 0}} .warn{{color:#ffcf70}} .muted{{color:#aaa}}
 </style></head><body>
-<h1>CuaEdge 登录</h1>
-<p>这是 cua 为子会话准备的<strong>独立 Edge 配置</strong>。请在这个窗口里登录需要的站点，2FA 也在这里完成。</p>
+<h1>{dir} 登录</h1>
+<p>这是 cua 为子会话准备的<strong>独立 {label} 配置</strong>。请在这个窗口里登录需要的站点，2FA 也在这里完成。</p>
 <ol>
   <li>在其它标签页完成登录。</li>
-  <li>登录完成后，<strong>关闭所有 CuaEdge Edge 窗口</strong>（包括这个说明页）。</li>
-  <li>cua 会等到所有使用该 profile 的 Edge 进程退出后返回。</li>
+  <li>登录完成后，<strong>关闭所有 {dir} {label} 窗口</strong>（包括这个说明页）。</li>
+  <li>cua 会等到所有使用该 profile 的 {label} 进程退出后返回。</li>
   <li>之后在子会话运行 <code>cua child edge</code>，会复用这里的 cookie 和已保存密码。</li>
 </ol>
-<p class="warn">cua 不会读取、打印或保存你的密码；主 Edge 的 cookie/密码不会自动复制到这里。不要把不想让子会话访问的账号登录到这个 profile。</p>
-<p class="muted">Edge 可能通过 Windows 账号自动 SSO；同步默认开启，同一微软账号保存的密码可能同步到 CuaEdge。关闭窗口后如果命令仍不返回，运行 <code>cua session edge --status</code> 查看持有 profile 的 PID。</p>
+<p class="warn">cua 不会读取、打印或保存你的密码；主 {label} 的 cookie/密码不会自动复制到这里。不要把不想让子会话访问的账号登录到这个 profile。</p>
+<p class="muted">{label} 可能通过 Windows 账号自动 SSO；同步默认开启，同一账号保存的密码可能同步到 {dir}。关闭窗口后如果命令仍不返回，运行 <code>cua session edge --status</code> 查看持有 profile 的 PID。</p>
 {list}
 </body></html>"#
     )
@@ -717,18 +944,25 @@ fn file_url(path: &Path) -> String {
     out
 }
 
-fn print_status(edge: Option<&Path>, profile: &Path, fresh: bool) -> Result<i32> {
+fn print_status(kind: BrowserKind, edge: Option<&Path>, profile: &Path, fresh: bool) -> Result<i32> {
     let scan = scan_profile(profile);
     let meta = read_metadata();
     let current = current_session();
     let other = holder_outside(&scan, current);
     let same = holder_in(&scan, current);
     let note = if edge.is_none() {
-        "msedge.exe not found; checked $CUA_EDGE_EXE, config `edge_exe`, App Paths\\msedge.exe and the standard Program Files paths".to_string()
+        format!(
+            "{} not found; checked ${}, config `{}`, App Paths and the standard install paths",
+            kind.exe_name(),
+            kind.env_var(),
+            kind.config_key()
+        )
     } else if let Some(h) = other {
         format!(
-            "profile is held by Edge in session {} (PID {}); close it before launching",
-            h.session, h.pid
+            "profile is held by {} in session {} (PID {}); close it before launching",
+            kind.label(),
+            h.session,
+            h.pid
         )
     } else if same.is_some() {
         "profile is in use in this session; `cua edge <url>` opens a new window in that instance"
@@ -741,10 +975,11 @@ fn print_status(edge: Option<&Path>, profile: &Path, fresh: bool) -> Result<i32>
     } else {
         "profile is free".to_string()
     };
-    print_status_value(edge, profile, fresh, &scan, meta, current, &note)
+    print_status_value(kind, edge, profile, fresh, &scan, meta, current, &note)
 }
 
 fn print_status_value(
+    kind: BrowserKind,
     edge: Option<&Path>,
     profile: &Path,
     fresh: bool,
@@ -761,8 +996,10 @@ fn print_status_value(
     let v = json!({
         "schema": STATUS_SCHEMA,
         "ok": edge.is_some(),
-        "edge_exe": edge.map(|p| p.display().to_string()),
+        "browser": kind.as_str(),
+        "browser_exe": edge.map(|p| p.display().to_string()),
         "profile": profile.display().to_string(),
+        "profile_kind": kind.profile_dir(),
         "metadata_path": metadata_path().display().to_string(),
         "metadata": meta,
         "metadata_matches_profile": meta_matches,
@@ -771,7 +1008,7 @@ fn print_status_value(
         "fresh_profile": fresh,
         "lockfile": scan.lockfile.as_str(),
         "restart_manager_ok": scan.rm_ok,
-        "edge_processes": scan.edge_processes,
+        "browser_processes": scan.browser_processes,
         "holders": scan.holders,
         "cdp": cdp,
         "note": note,
@@ -782,27 +1019,32 @@ fn print_status_value(
 
 // ---------------------------------------------------------------- profile
 
-fn default_profile() -> PathBuf {
-    util::ensure_data_dir().join("browser").join("CuaEdge")
+fn default_profile(kind: BrowserKind) -> PathBuf {
+    util::ensure_data_dir()
+        .join("browser")
+        .join(kind.profile_dir())
 }
 
-fn resolve_profile(override_path: Option<&str>, fresh: bool) -> PathBuf {
+fn resolve_profile(kind: BrowserKind, override_path: Option<&str>, fresh: bool) -> PathBuf {
     if fresh {
-        fresh_profile_path()
+        fresh_profile_path(kind)
     } else if let Some(p) = override_path.filter(|p| !p.trim().is_empty()) {
-        let p = absolutize(Path::new(p.trim()));
-        p
+        absolutize(Path::new(p.trim()))
     } else {
-        default_profile()
+        default_profile(kind)
     }
 }
 
-fn fresh_profile_path() -> PathBuf {
+fn fresh_profile_path(kind: BrowserKind) -> PathBuf {
     let ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    std::env::temp_dir().join(format!("cua-edge-fresh-{}-{ms}", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "cua-{}-fresh-{}-{ms}",
+        kind.as_str(),
+        std::process::id()
+    ))
 }
 
 fn absolutize(p: &Path) -> PathBuf {
@@ -830,9 +1072,12 @@ fn paths_equal(a: &Path, b: &Path) -> bool {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct ProfileMeta {
+    #[serde(default)]
     schema: String,
+    #[serde(default)]
     browser: String,
     profile: String,
+    #[serde(default)]
     browser_exe: String,
     created_at: String,
     last_used_at: String,
@@ -841,11 +1086,19 @@ struct ProfileMeta {
 }
 
 fn metadata_path() -> PathBuf {
+    util::ensure_data_dir()
+        .join("browser")
+        .join("browser-profile.json")
+}
+
+/// `cua edge` used to write `edge-profile.json`; keep reading it so an existing
+/// CuaEdge profile is still recognised as Edge after the rename.
+fn legacy_metadata_path() -> PathBuf {
     util::ensure_data_dir().join("browser").join("edge-profile.json")
 }
 
 fn read_metadata() -> Option<ProfileMeta> {
-    read_metadata_at(&metadata_path())
+    read_metadata_at(&metadata_path()).or_else(|| read_metadata_at(&legacy_metadata_path()))
 }
 
 fn read_metadata_at(path: &Path) -> Option<ProfileMeta> {
@@ -854,18 +1107,18 @@ fn read_metadata_at(path: &Path) -> Option<ProfileMeta> {
     serde_json::from_slice(b).ok()
 }
 
-fn write_metadata(profile: &Path, edge: &Path) -> Result<()> {
+fn write_metadata(profile: &Path, kind: BrowserKind, edge: &Path) -> Result<()> {
     let path = metadata_path();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     }
-    let created_at = read_metadata_at(&path)
+    let created_at = read_metadata()
         .filter(|m| paths_equal(Path::new(&m.profile), profile))
         .map(|m| m.created_at)
         .unwrap_or_else(util::now_iso);
     let meta = ProfileMeta {
         schema: PROFILE_SCHEMA.into(),
-        browser: "edge".into(),
+        browser: kind.as_str().into(),
         profile: profile.display().to_string(),
         browser_exe: edge.display().to_string(),
         created_at,
@@ -878,24 +1131,24 @@ fn write_metadata(profile: &Path, edge: &Path) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------- Edge lookup
+// ---------------------------------------------------------------- browser lookup
 
-fn resolve_edge() -> Option<PathBuf> {
-    first_existing(&edge_candidates())
+fn locate(kind: BrowserKind) -> Option<PathBuf> {
+    first_existing(&candidates(kind))
 }
 
-fn edge_candidates() -> Vec<PathBuf> {
+fn candidates(kind: BrowserKind) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
-    if let Ok(p) = std::env::var("CUA_EDGE_EXE") {
+    if let Ok(p) = std::env::var(kind.env_var()) {
         push_candidate(&mut out, &p);
     }
-    if let Some(p) = util::load_config_json().get("edge_exe").and_then(Value::as_str) {
+    if let Some(p) = util::load_config_json()
+        .get(kind.config_key())
+        .and_then(Value::as_str)
+    {
         push_candidate(&mut out, p);
     }
-    for path in [
-        "Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\msedge.exe",
-        "Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\App Paths\\msedge.exe",
-    ] {
+    for path in kind.app_path_keys() {
         for hive in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
             if let Some(p) = reg_value_string(hive, path) {
                 push_candidate(&mut out, &p);
@@ -904,7 +1157,10 @@ fn edge_candidates() -> Vec<PathBuf> {
     }
     for base in ["ProgramFiles(x86)", "ProgramFiles", "LOCALAPPDATA"] {
         if let Ok(dir) = std::env::var(base) {
-            push_candidate(&mut out, &format!("{dir}\\Microsoft\\Edge\\Application\\msedge.exe"));
+            push_candidate(
+                &mut out,
+                &format!("{dir}\\{}\\{}", kind.install_subdir(), kind.exe_name()),
+            );
         }
     }
     out
@@ -1011,7 +1267,7 @@ fn validate_urls(urls: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn spawn_edge(
+fn spawn_browser(
     exe: &Path,
     profile: &Path,
     automation: bool,
@@ -1019,10 +1275,10 @@ fn spawn_edge(
     urls: &[String],
 ) -> Result<u32> {
     let args = build_args(profile, automation, cdp_port, urls);
-    spawn_edge_args(exe, &args)
+    spawn_browser_args(exe, &args)
 }
 
-fn spawn_edge_args(exe: &Path, args: &[String]) -> Result<u32> {
+fn spawn_browser_args(exe: &Path, args: &[String]) -> Result<u32> {
     let command_line = build_command_line(exe, args);
     let exe_w: Vec<u16> = exe
         .as_os_str()
@@ -1102,7 +1358,7 @@ fn cdp_ports(profile: &Path, scan: &Scan) -> Vec<u16> {
     for p in scan
         .holders
         .iter()
-        .filter(|h| h.is_edge)
+        .filter(|h| h.is_browser)
         .filter_map(|h| h.cdp_port)
     {
         if !ports.contains(&p) {
@@ -1114,7 +1370,7 @@ fn cdp_ports(profile: &Path, scan: &Scan) -> Vec<u16> {
     // command line without --remote-debugging-port means this Edge has no CDP,
     // so a stale file must not turn into a false endpoint.
     let has_cmdline = scan.holders.iter().any(|h| {
-        h.is_edge
+        h.is_browser
             && h.sources
                 .iter()
                 .any(|s| s.eq_ignore_ascii_case("command_line"))
@@ -1169,14 +1425,14 @@ fn endpoint_from_version(port: u16, v: &Value) -> Option<CdpEndpoint> {
         .get("Browser")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let is_edge = browser
+    let is_chromium = browser
         .as_deref()
         .map(|b| {
             let b = b.to_ascii_lowercase();
-            b.contains("edg/") || b.contains("edge")
+            b.contains("edg/") || b.contains("edge") || b.contains("chrome")
         })
         .unwrap_or(false);
-    if !is_edge {
+    if !is_chromium {
         return None;
     }
     Some(CdpEndpoint {
@@ -1314,7 +1570,7 @@ struct Holder {
     started_ms: Option<i64>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     sources: Vec<String>,
-    is_edge: bool,
+    is_browser: bool,
     /// The main browser process (no Chromium `--type=` child role).
     browser: bool,
     /// Dedicated CDP port from this process's command line, when present.
@@ -1326,7 +1582,7 @@ struct Scan {
     holders: Vec<Holder>,
     lockfile: LockFileState,
     rm_ok: bool,
-    edge_processes: usize,
+    browser_processes: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -1341,7 +1597,7 @@ struct ProcInfo {
 }
 
 fn scan_profile(profile: &Path) -> Scan {
-    let procs = edge_processes();
+    let procs = browser_processes();
     let mut holders = Vec::new();
     for p in &procs {
         if let Some(cl) = &p.command_line {
@@ -1352,7 +1608,7 @@ fn scan_profile(profile: &Path) -> Scan {
                     process: p.name.clone(),
                     started_ms: p.started_ms,
                     sources: vec!["command_line".into()],
-                    is_edge: is_edge_name(&p.name),
+                    is_browser: BrowserKind::is_browser_name(&p.name),
                     browser: p.browser,
                     cdp_port: p.cdp_port,
                 });
@@ -1377,7 +1633,7 @@ fn scan_profile(profile: &Path) -> Scan {
         holders,
         lockfile,
         rm_ok,
-        edge_processes: procs.len(),
+        browser_processes: procs.len(),
     }
 }
 
@@ -1394,7 +1650,7 @@ fn merge_holder(holders: &mut Vec<Holder>, h: Holder) {
         if e.process.is_empty() {
             e.process = h.process;
         }
-        e.is_edge |= h.is_edge;
+        e.is_browser |= h.is_browser;
         e.browser |= h.browser;
         if e.cdp_port.is_none() {
             e.cdp_port = h.cdp_port;
@@ -1417,7 +1673,7 @@ fn holder_in(scan: &Scan, session: u32) -> Option<&Holder> {
     let cands = scan
         .holders
         .iter()
-        .filter(|h| h.is_edge && h.session == session)
+        .filter(|h| h.is_browser && h.session == session)
         .collect();
     best_of_opt(cands)
 }
@@ -1426,7 +1682,7 @@ fn holder_outside(scan: &Scan, session: u32) -> Option<&Holder> {
     let cands = scan
         .holders
         .iter()
-        .filter(|h| h.is_edge && h.session != session)
+        .filter(|h| h.is_browser && h.session != session)
         .collect();
     best_of_opt(cands)
 }
@@ -1448,7 +1704,7 @@ fn holder_summary(holders: &[&Holder]) -> String {
         .join(", ");
     let extra = holders.len().saturating_sub(shown);
     if extra > 0 {
-        out.push_str(&format!(" (+{extra} more Edge processes)"));
+        out.push_str(&format!(" (+{extra} more browser processes)"));
     }
     out
 }
@@ -1469,7 +1725,7 @@ fn inspect_profile(profile: &Path, current: u32) -> (Scan, Option<String>) {
         return (scan, Some(detail));
     }
     if matches!(scan.lockfile, LockFileState::Locked | LockFileState::Unknown)
-        && !scan.holders.iter().any(|h| h.is_edge)
+        && !scan.holders.iter().any(|h| h.is_browser)
         && !scan.rm_ok
     {
         let detail = format!(
@@ -1501,7 +1757,7 @@ fn lockfile_state(profile: &Path) -> LockFileState {
     }
 }
 
-fn edge_processes() -> Vec<ProcInfo> {
+fn browser_processes() -> Vec<ProcInfo> {
     let mut out = Vec::new();
     unsafe {
         let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
@@ -1519,7 +1775,7 @@ fn edge_processes() -> Vec<ProcInfo> {
                     .position(|c| *c == 0)
                     .unwrap_or(entry.szExeFile.len());
                 let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
-                if is_edge_name(&name) {
+                if BrowserKind::is_browser_name(&name) {
                     let pid = entry.th32ProcessID;
                     let command_line = process_command_line(pid);
                     let browser = command_line
@@ -1545,10 +1801,6 @@ fn edge_processes() -> Vec<ProcInfo> {
         let _ = CloseHandle(snap);
     }
     out
-}
-
-fn is_edge_name(name: &str) -> bool {
-    name.eq_ignore_ascii_case("msedge.exe")
 }
 
 fn cdp_port_from_cmdline(cmdline: &str) -> Option<u16> {
@@ -1685,9 +1937,11 @@ fn rm_holders(lockfile: &Path) -> Option<Vec<Holder>> {
                     .unwrap_or(false);
                 let started = ((info.Process.ProcessStartTime.dwHighDateTime as u64) << 32)
                     | info.Process.ProcessStartTime.dwLowDateTime as u64;
-                let is_edge = is_edge_name(&name)
-                    || app.to_ascii_lowercase().contains("microsoft edge")
-                    || app.to_ascii_lowercase().contains("msedge");
+                let app_lower = app.to_ascii_lowercase();
+                let is_browser = BrowserKind::is_browser_name(&name)
+                    || app_lower.contains("microsoft edge")
+                    || app_lower.contains("msedge")
+                    || app_lower.contains("google chrome");
                 out.push(Holder {
                     pid,
                     session: info.TSSessionId,
@@ -1698,7 +1952,7 @@ fn rm_holders(lockfile: &Path) -> Option<Vec<Holder>> {
                         Some(ticks_to_unix_ms(started))
                     },
                     sources: vec!["restart_manager".into()],
-                    is_edge,
+                    is_browser,
                     browser,
                     cdp_port: command_line.as_deref().and_then(cdp_port_from_cmdline),
                 });
@@ -1741,26 +1995,27 @@ pub fn in_child_session() -> bool {
         || util::session().starts_with("child-")
 }
 
-/// `cua launch --exe msedge.exe` inside the child session would use the user's
-/// default profile and fail invisibly. Route it to the dedicated command.
+/// `cua launch --exe msedge.exe` (or chrome.exe) inside the child session would
+/// use the user's default profile and fail invisibly. Route it to the dedicated
+/// command.
 pub fn child_launch_guard(exe: &str) -> Option<String> {
-    if !in_child_session() || !is_msedge_exe(exe) {
+    if !in_child_session() || !is_browser_exe(exe) {
         return None;
     }
     Some(format!(
-        "refused: launching '{exe}' from the child session would use the user's default Edge \
-         profile, which another desktop may already hold. Use `cua child edge <url>` (CuaEdge \
-         profile) instead."
+        "refused: launching '{exe}' from the child session would use the user's default browser \
+         profile, which another desktop may already hold. Use `cua child edge <url>` (CuaEdge or \
+         CuaChrome profile) instead."
     ))
 }
 
-fn is_msedge_exe(exe: &str) -> bool {
+fn is_browser_exe(exe: &str) -> bool {
     let base = Path::new(exe)
         .file_name()
         .map(|s| s.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_else(|| exe.trim().to_ascii_lowercase());
     let stem = base.trim_end_matches(".exe");
-    stem == "msedge"
+    stem == "msedge" || stem == "chrome"
 }
 
 #[cfg(test)]
@@ -1820,7 +2075,7 @@ mod tests {
     }
 
     #[test]
-    fn cdp_version_payload_must_be_edge() {
+    fn cdp_version_payload_accepts_edge_and_chrome() {
         let edge = serde_json::json!({
             "Browser": "Edg/157.0.0.0",
             "Protocol-Version": "1.3",
@@ -1833,7 +2088,9 @@ mod tests {
         assert!(ep.browser_ws.is_some());
 
         let chrome = serde_json::json!({ "Browser": "Chrome/157.0.0.0" });
-        assert!(endpoint_from_version(9333, &chrome).is_none());
+        assert!(endpoint_from_version(9333, &chrome).is_some());
+        let other = serde_json::json!({ "Browser": "Firefox/130.0" });
+        assert!(endpoint_from_version(9333, &other).is_none());
     }
 
     #[test]
@@ -1877,7 +2134,7 @@ mod tests {
 
     #[test]
     fn sign_in_page_documents_the_flow_and_escapes_urls() {
-        let html = sign_in_page_html(&["https://example.com/?a=1&b=<2>".into()]);
+        let html = sign_in_page_html(BrowserKind::Edge, &["https://example.com/?a=1&b=<2>".into()]);
         assert!(html.contains("cua child edge"));
         assert!(html.contains("关闭所有 CuaEdge Edge 窗口"));
         assert!(html.contains("同步默认开启"));
@@ -1898,7 +2155,7 @@ mod tests {
             process: "msedge.exe".into(),
             started_ms: None,
             sources: Vec::new(),
-            is_edge: true,
+            is_browser: true,
             browser: false,
             cdp_port: None,
         };
@@ -1908,14 +2165,14 @@ mod tests {
             process: "msedge.exe".into(),
             started_ms: None,
             sources: Vec::new(),
-            is_edge: true,
+            is_browser: true,
             browser: true,
             cdp_port: None,
         };
         let summary = holder_summary(&[&helper, &browser]);
         assert!(summary.contains("PID 22 in session 1"));
         assert!(!summary.contains("PID 11"));
-        assert!(summary.contains("+1 more Edge processes"));
+        assert!(summary.contains("+1 more browser processes"));
     }
 
     #[test]
@@ -1946,14 +2203,16 @@ mod tests {
     }
 
     #[test]
-    fn msedge_detection_covers_paths_and_bare_names() {
-        assert!(is_msedge_exe("msedge.exe"));
-        assert!(is_msedge_exe("MSEDGE.EXE"));
-        assert!(is_msedge_exe(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"));
-        assert!(is_msedge_exe("msedge"));
-        assert!(!is_msedge_exe("msedgewebview2.exe"));
-        assert!(!is_msedge_exe("chrome.exe"));
-        assert!(!is_msedge_exe(""));
+    fn browser_exe_detection_covers_paths_and_bare_names() {
+        assert!(is_browser_exe("msedge.exe"));
+        assert!(is_browser_exe("MSEDGE.EXE"));
+        assert!(is_browser_exe(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"));
+        assert!(is_browser_exe("msedge"));
+        assert!(is_browser_exe("chrome.exe"));
+        assert!(is_browser_exe(r"C:\Program Files\Google\Chrome\Application\chrome.exe"));
+        assert!(!is_browser_exe("msedgewebview2.exe"));
+        assert!(!is_browser_exe("chromedriver.exe"));
+        assert!(!is_browser_exe(""));
     }
 
     #[test]
@@ -1985,6 +2244,42 @@ mod tests {
         assert_eq!(meta.created_at, created);
         assert!(paths_equal(Path::new(&meta.profile), profile));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn browser_kinds_map_to_distinct_profiles_and_exes() {
+        assert_eq!(BrowserKind::Edge.profile_dir(), "CuaEdge");
+        assert_eq!(BrowserKind::Chrome.profile_dir(), "CuaChrome");
+        assert_eq!(BrowserKind::Edge.exe_name(), "msedge.exe");
+        assert_eq!(BrowserKind::Chrome.exe_name(), "chrome.exe");
+        assert_eq!(BrowserKind::from_str("Chrome"), Some(BrowserKind::Chrome));
+        assert_eq!(BrowserKind::from_str(" msedge "), Some(BrowserKind::Edge));
+        assert_eq!(BrowserKind::from_str("firefox"), None);
+        assert!(BrowserKind::is_browser_name("Chrome.exe"));
+        assert!(!BrowserKind::is_browser_name("firefox.exe"));
+    }
+
+    #[test]
+    fn chrome_candidates_use_chrome_install_paths() {
+        let cands = candidates(BrowserKind::Chrome);
+        let lower: Vec<String> = cands
+            .iter()
+            .map(|p| p.to_string_lossy().to_ascii_lowercase())
+            .collect();
+        assert!(lower.iter().any(|p| p.contains("google\\chrome\\application")));
+        assert!(lower.iter().all(|p| p.ends_with("chrome.exe")));
+        let edge_cands = candidates(BrowserKind::Edge);
+        assert!(edge_cands
+            .iter()
+            .all(|p| p.to_string_lossy().to_ascii_lowercase().ends_with("msedge.exe")));
+    }
+
+    #[test]
+    fn fresh_profiles_are_named_per_browser() {
+        let edge = fresh_profile_path(BrowserKind::Edge);
+        let chrome = fresh_profile_path(BrowserKind::Chrome);
+        assert!(edge.to_string_lossy().contains("cua-edge-fresh"));
+        assert!(chrome.to_string_lossy().contains("cua-chrome-fresh"));
     }
 
     #[test]
