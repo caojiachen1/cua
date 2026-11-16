@@ -393,7 +393,10 @@ namespace CuaSessionHost
                 if (item is ToolStripSeparator)
                     item.Margin = new Padding(0, 3, 0, 3);
                 else
-                    item.Padding = new Padding(8, 5, 14, 5);
+                {
+                    item.Padding = new Padding(16, 5, 16, 5);
+                    ((ToolStripMenuItem)item).TextAlign = ContentAlignment.MiddleCenter;
+                }
             }
             _trayMenu.Opened += delegate { TrayMenuRenderer.RoundCorners(_trayMenu, 8); };
             _trayMenu.SizeChanged += delegate { TrayMenuRenderer.RoundCorners(_trayMenu, 8); };

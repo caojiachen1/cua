@@ -39,28 +39,27 @@ namespace CuaSessionHost
             using (var path = Rounded(rect, 5))
             using (var brush = new SolidBrush(Theme.SubtleHover))
                 e.Graphics.FillPath(brush, path);
-            using (var accent = new SolidBrush(Theme.Accent))
-            {
-                var bar = new Rectangle(rect.X + 1, rect.Y + 5, 3, Math.Max(4, rect.Height - 10));
-                using (var barPath = Rounded(bar, 2))
-                    e.Graphics.FillPath(accent, barPath);
-            }
         }
 
         protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
         {
-            var color = !e.Item.Enabled
-                ? Color.FromArgb(118, 118, 124)
-                : (e.Item.Selected ? Theme.Text : Theme.Text);
-            var flags = TextFormatFlags.VerticalCenter | TextFormatFlags.Left
-                        | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis;
+            var color = e.Item.Enabled ? Theme.Text : Color.FromArgb(118, 118, 124);
             if (e.TextDirection != ToolStripTextDirection.Horizontal)
             {
+                e.TextColor = color;
                 base.OnRenderItemText(e);
                 return;
             }
-            TextRenderer.DrawText(e.Graphics, e.Text, e.TextFont ?? e.Item.Font,
-                e.TextRectangle, color, flags);
+            var font = e.TextFont ?? e.Item.Font;
+            var size = TextRenderer.MeasureText(e.Graphics, e.Text, font,
+                new Size(int.MaxValue, int.MaxValue), TextFormatFlags.NoPadding);
+            // Centre on the drop-down's visible width; Item.Width is wider than
+            // the panel (it includes the reserved image-margin column), which is
+            // what pushed earlier attempts to the right.
+            int x = Math.Max(0, (e.ToolStrip.Width - size.Width) / 2);
+            int y = e.TextRectangle.Y + Math.Max(0, (e.TextRectangle.Height - size.Height) / 2);
+            TextRenderer.DrawText(e.Graphics, e.Text, font, new Point(x, y), color,
+                TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding);
         }
 
         protected override void OnRenderSeparator(ToolStripSeparatorRenderEventArgs e)
