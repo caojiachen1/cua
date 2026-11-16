@@ -387,7 +387,7 @@ namespace CuaSessionHost
 
             _tray = new NotifyIcon
             {
-                Icon = Theme.AppIcon(true),
+                Icon = Theme.TrayIcon(),
                 Text = "cua child session",
                 Visible = true,
                 ContextMenuStrip = _trayMenu

@@ -37,6 +37,56 @@ namespace CuaSessionHost
             return new Font("Segoe Fluent Icons", size, FontStyle.Regular, GraphicsUnit.Point);
         }
 
+        /// <summary>
+        /// Tray glyph: a bright accent square with a white prompt mark. The
+        /// application icon is deliberately dark and disappeared into a dark
+        /// taskbar (measured: barely any bright pixels in its 25x25 slot), and
+        /// the tray icon is the "session is alive" indicator, so it has to be
+        /// unmistakable in both themes.
+        /// </summary>
+        public static System.Drawing.Icon TrayIcon()
+        {
+            int s = Math.Max(16, SystemInformation.SmallIconSize.Width);
+            using (var bmp = new Bitmap(s, s))
+            using (var g = Graphics.FromImage(bmp))
+            {
+                g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                g.Clear(Color.Transparent);
+                float r = s * 0.22f;
+                using (var path = RoundedRect(new RectangleF(0.5f, 0.5f, s - 1f, s - 1f), r))
+                using (var brush = new SolidBrush(Color.FromArgb(47, 155, 255)))
+                {
+                    g.FillPath(brush, path);
+                }
+                using (var pen = new Pen(Color.White, Math.Max(2f, s * 0.11f)))
+                {
+                    pen.StartCap = System.Drawing.Drawing2D.LineCap.Round;
+                    pen.EndCap = System.Drawing.Drawing2D.LineCap.Round;
+                    pen.LineJoin = System.Drawing.Drawing2D.LineJoin.Round;
+                    g.DrawLines(pen, new[]
+                    {
+                        new PointF(s * 0.30f, s * 0.31f),
+                        new PointF(s * 0.47f, s * 0.50f),
+                        new PointF(s * 0.30f, s * 0.69f),
+                    });
+                    g.DrawLine(pen, s * 0.55f, s * 0.69f, s * 0.72f, s * 0.69f);
+                }
+                return System.Drawing.Icon.FromHandle(bmp.GetHicon());
+            }
+        }
+
+        private static System.Drawing.Drawing2D.GraphicsPath RoundedRect(RectangleF rect, float radius)
+        {
+            var path = new System.Drawing.Drawing2D.GraphicsPath();
+            float d = radius * 2;
+            path.AddArc(rect.X, rect.Y, d, d, 180, 90);
+            path.AddArc(rect.Right - d, rect.Y, d, d, 270, 90);
+            path.AddArc(rect.Right - d, rect.Bottom - d, d, d, 0, 90);
+            path.AddArc(rect.X, rect.Bottom - d, d, d, 90, 90);
+            path.CloseFigure();
+            return path;
+        }
+
         public static System.Drawing.Icon AppIcon(bool small)
         {
             try
