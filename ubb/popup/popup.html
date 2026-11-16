@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: rgba(32, 31, 38, .92);
+      --card: rgba(255, 255, 255, .045);
+      --card-hover: rgba(255, 255, 255, .08);
+      --stroke: rgba(255, 255, 255, .07);
+      --text: #f3f3f6;
+      --text-2: #a8a8b3;
+      --accent: #8b93f8;
+      --accent-strong: #6d74e8;
+      --danger: #f1707a;
+      --ok: #6ccb5f;
+    }
+    * { box-sizing: border-box; }
+    html { background: transparent; }
+    body {
+      width: 360px; margin: 0; padding: 0;
+      font: 13px/1.5 "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(120% 90% at 85% -10%, rgba(139, 147, 248, .14), transparent 55%),
+        radial-gradient(110% 80% at -10% 110%, rgba(109, 116, 232, .10), transparent 50%),
+        var(--bg);
+      backdrop-filter: blur(28px) saturate(1.25);
+      -webkit-backdrop-filter: blur(28px) saturate(1.25);
+    }
+    header {
+      display: flex; align-items: center; gap: 10px;
+      padding: 14px 16px 10px;
+    }
+    .logo {
+      width: 26px; height: 26px; border-radius: 7px; flex: none;
+      background: linear-gradient(135deg, #8b93f8, #b18cf8);
+      color: #fff; display: flex; align-items: center; justify-content: center;
+      font-weight: 700; font-size: 12px;
+      box-shadow: 0 2px 8px rgba(109, 116, 232, .45);
+    }
+    h1 { font-size: 13.5px; font-weight: 600; margin: 0; flex: 1; letter-spacing: .2px; }
+    .status {
+      font-size: 11px; padding: 3px 10px; border-radius: 999px; flex: none;
+      border: 1px solid transparent; display: flex; align-items: center; gap: 6px;
+    }
+    .status::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+    .on  { background: rgba(108, 203, 95, .14); color: #8fd884; border-color: rgba(108, 203, 95, .35); }
+    .off { background: rgba(241, 112, 122, .12); color: #f4919a; border-color: rgba(241, 112, 122, .32); }
+    .mid { background: rgba(250, 204, 92, .12); color: #f5d06f; border-color: rgba(250, 204, 92, .3); }
+
+    section.card {
+      margin: 0 10px 8px; padding: 12px 14px;
+      background: var(--card); border: 1px solid var(--stroke); border-radius: 10px;
+    }
+    .row { display: flex; align-items: center; gap: 10px; margin: 9px 0; min-height: 26px; }
+    .row:first-child { margin-top: 0; }
+    .row:last-child { margin-bottom: 0; }
+    .row > label { flex: 1; color: var(--text); }
+
+    /* Fluent toggle switch */
+    input[type="checkbox"] {
+      appearance: none; -webkit-appearance: none;
+      width: 40px; height: 20px; margin: 0; flex: none; cursor: pointer;
+      border-radius: 999px; border: 1px solid rgba(255, 255, 255, .55);
+      background: rgba(255, 255, 255, .06); position: relative; transition: background .15s, border-color .15s;
+    }
+    input[type="checkbox"]::before {
+      content: ""; position: absolute; top: 3px; left: 4px;
+      width: 12px; height: 12px; border-radius: 50%; background: #e8e8ec;
+      transition: left .15s ease, background .15s;
+    }
+    input[type="checkbox"]:hover::before { transform: scale(1.15); }
+    input[type="checkbox"]:checked {
+      background: var(--accent-strong); border-color: var(--accent-strong);
+    }
+    input[type="checkbox"]:checked::before { left: 22px; background: #fff; }
+
+    input[type="text"], input[type="number"], input[type="password"] {
+      flex: 1; min-width: 0; border: 1px solid var(--stroke); border-radius: 6px;
+      padding: 5px 9px; font-size: 12.5px; color: var(--text);
+      background: rgba(0, 0, 0, .25); outline: none; transition: border-color .15s;
+    }
+    input[type="number"] { flex: none; width: 92px; }
+    input[type="text"]:focus, input[type="number"]:focus, input[type="password"]:focus {
+      border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent);
+    }
+    input[type="text"]::placeholder, input[type="password"]::placeholder { color: var(--text-2); }
+    select {
+      flex: none; border: 1px solid var(--stroke); border-radius: 6px;
+      padding: 5px 8px; font-size: 12.5px; color: var(--text);
+      background: rgba(0, 0, 0, .25); outline: none; cursor: pointer;
+    }
+    select:focus { border-color: var(--accent); }
+    select option { background: #26252c; color: var(--text); }
+
+    /* Fluent custom dropdown */
+    .dropdown { position: relative; flex: none; }
+    .dd-btn {
+      display: flex; align-items: center; gap: 8px;
+      border: 1px solid var(--stroke); border-radius: 6px;
+      padding: 5px 10px; font-size: 12.5px; color: var(--text);
+      background: rgba(0, 0, 0, .25); min-width: 170px;
+    }
+    .dd-btn:hover { border-color: rgba(255,255,255,.16); }
+    .dropdown.open .dd-btn { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+    .dd-btn .chev {
+      margin-left: auto; width: 7px; height: 7px; flex: none; opacity: .7;
+      border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor;
+      transform: rotate(45deg) translateY(-2px); transition: transform .15s;
+    }
+    .dropdown.open .dd-btn .chev { transform: rotate(225deg) translateY(-1px); }
+    .dd-menu {
+      display: none; position: absolute; right: 0; top: calc(100% + 5px); z-index: 30;
+      min-width: 100%; width: max-content;
+      background: rgba(40, 39, 46, .97); border: 1px solid rgba(255,255,255,.1);
+      border-radius: 8px; padding: 4px;
+      box-shadow: 0 10px 32px rgba(0,0,0,.5);
+      transform-origin: top right; animation: dd-pop .12s ease;
+    }
+    @keyframes dd-pop { from { opacity: 0; transform: scale(.96) translateY(-3px); } }
+    .dropdown.open .dd-menu { display: block; }
+    .dd-opt {
+      display: flex; align-items: center; gap: 8px;
+      padding: 7px 10px; border-radius: 5px; font-size: 12.5px;
+      color: var(--text); cursor: pointer; white-space: nowrap;
+    }
+    .dd-opt:hover { background: rgba(255,255,255,.09); }
+    .dd-opt .check { margin-left: auto; opacity: 0; color: var(--accent); font-weight: 600; }
+    .dd-opt.sel { color: var(--accent); }
+    .dd-opt.sel .check { opacity: 1; }
+
+    button {
+      all: unset; cursor: pointer; user-select: none;
+      border: 1px solid var(--stroke); border-radius: 6px; padding: 5px 12px;
+      font-size: 12px; font-weight: 500; color: var(--text);
+      background: var(--card-hover); transition: background .12s, border-color .12s;
+      text-align: center; flex: none;
+    }
+    button:hover { background: rgba(255, 255, 255, .12); }
+    button:active { background: rgba(255, 255, 255, .16); }
+    button.primary {
+      background: var(--accent-strong); border-color: transparent; color: #fff;
+    }
+    button.primary:hover { background: var(--accent); }
+    button.danger:hover { border-color: var(--danger); color: var(--danger); }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    button:disabled:hover { background: var(--card-hover); border-color: var(--stroke); color: var(--text); }
+    button.primary:disabled:hover { background: var(--accent-strong); border-color: transparent; color: #fff; }
+
+    .hint { font-size: 11px; color: var(--text-2); margin-top: 8px; line-height: 1.55; }
+    .hint code { color: #c9c9d4; background: rgba(255,255,255,.06); border-radius: 4px; padding: 0 4px; }
+    .hint.warn { color: var(--danger); }
+
+    /* advanced / token */
+    details.advanced { margin: 0 10px 8px; }
+    details.advanced summary {
+      list-style: none; cursor: pointer; user-select: none;
+      display: flex; align-items: center; gap: 8px;
+      padding: 10px 14px; margin: 0 0 8px;
+      background: var(--card); border: 1px solid var(--stroke); border-radius: 10px;
+      font-size: 12.5px; color: var(--text-2); transition: background .12s;
+    }
+    details.advanced summary:hover { background: var(--card-hover); color: var(--text); }
+    details.advanced summary::-webkit-details-marker { display: none; }
+    details.advanced summary::after {
+      content: ""; margin-left: auto; width: 7px; height: 7px; flex: none;
+      border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor;
+      transform: rotate(45deg); transition: transform .15s; opacity: .7;
+    }
+    details.advanced[open] summary::after { transform: rotate(225deg); }
+    details.advanced .card { margin: 0 0 8px; }
+
+    .token { display: flex; gap: 6px; align-items: stretch; }
+    .token code {
+      flex: 1; background: rgba(0, 0, 0, .28); border: 1px solid var(--stroke);
+      border-radius: 6px; padding: 6px 9px; font-size: 11px; font-family: Consolas, monospace;
+      word-break: break-all; max-height: 44px; overflow: hidden; color: #c9c9d4;
+      display: flex; align-items: center;
+    }
+
+    .audit {
+      font-size: 11px; color: var(--text-2); font-family: Consolas, monospace;
+      margin-top: 6px; max-height: 96px; overflow: auto; white-space: pre;
+      scrollbar-width: thin; scrollbar-color: rgba(255,255,255,.18) transparent;
+    }
+    .audit::-webkit-scrollbar { width: 6px; }
+    .audit::-webkit-scrollbar-thumb { background: rgba(255,255,255,.18); border-radius: 3px; }
+
+    /* 安全凭据（secret.request，Codex browserAuth 式） */
+    .pill {
+      font-size: 10.5px; padding: 2px 9px; border-radius: 999px; flex: none; font-weight: 600;
+      background: rgba(250, 204, 92, .14); color: #f5d06f; border: 1px solid rgba(250, 204, 92, .3);
+    }
+    .sec-item {
+      margin-top: 10px; padding: 10px 11px;
+      background: rgba(0, 0, 0, .22); border: 1px solid rgba(250, 204, 92, .28); border-radius: 8px;
+    }
+    .sec-item.expired { opacity: .45; border-color: var(--stroke); }
+    .sec-head { display: flex; align-items: center; gap: 8px; }
+    .sec-origin {
+      font-family: Consolas, monospace; font-size: 12px; font-weight: 600;
+      color: #f5d06f; word-break: break-all;
+    }
+    .sec-title { font-size: 12px; color: var(--text-2); margin-top: 3px; }
+    .sec-field { margin-top: 9px; }
+    .sec-field-head { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+    .sec-label {
+      flex: 1; min-width: 0; font-size: 12px; color: var(--text);
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .badge, .lifetime {
+      font-size: 10px; padding: 1px 7px; border-radius: 999px; flex: none;
+      font-weight: 600; border: 1px solid;
+    }
+    .bt-username { color: #8fd884; border-color: rgba(108, 203, 95, .35); background: rgba(108, 203, 95, .10); }
+    .bt-password { color: #f4919a; border-color: rgba(241, 112, 122, .32); background: rgba(241, 112, 122, .10); }
+    .bt-otp      { color: #f5d06f; border-color: rgba(250, 204, 92, .30); background: rgba(250, 204, 92, .10); }
+    .bt-text     { color: var(--text-2); border-color: var(--stroke); background: rgba(255, 255, 255, .05); }
+    .secure-mark {
+      font-size: 10px; padding: 1px 7px; border-radius: 999px; flex: none; font-weight: 600;
+      color: #8fd884; border: 1px dashed rgba(108, 203, 95, .40);
+    }
+    .sec-field input { width: 100%; display: block; }
+    .sec-item input.invalid { border-color: var(--danger); box-shadow: 0 0 0 1px var(--danger); }
+    .sec-err { font-size: 11.5px; color: var(--danger); margin-top: 6px; }
+    .sec-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 9px; }
+
+    /* 高级 · 安全开关 */
+    .origin-item {
+      display: flex; align-items: center; gap: 8px;
+      margin-top: 6px; padding: 6px 9px;
+      background: rgba(0, 0, 0, .22); border: 1px solid var(--stroke); border-radius: 8px;
+    }
+    .origin-item .origin {
+      flex: 1; min-width: 0; font-family: Consolas, monospace; font-size: 11px;
+      color: #c9c9d4; word-break: break-all;
+    }
+    .lt-once    { color: #f5d06f; border-color: rgba(250, 204, 92, .30); background: rgba(250, 204, 92, .10); }
+    .lt-session { color: #8b93f8; border-color: rgba(139, 147, 248, .35); background: rgba(139, 147, 248, .12); }
+    .lt-forever { color: #f4919a; border-color: rgba(241, 112, 122, .32); background: rgba(241, 112, 122, .10); }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="logo">U</div>
+    <h1>UBB · 浏览器桥</h1>
+    <span id="status" class="status off">未连接</span>
+  </header>
+
+  <section class="card" id="secCard">
+    <div class="row">
+      <label>安全凭据</label>
+      <span id="secReqCount" class="pill" style="display:none">待处理 0</span>
+    </div>
+    <div class="hint" id="secReqEmpty">当 AI 请求你输入登录凭据时，会在这里出现。值只填入页面，不会进入对话或日志。</div>
+    <div id="secReqList"></div>
+  </section>
+
+  <section class="card">
+    <div class="row">
+      <label>启用桥接</label>
+      <input type="checkbox" id="enabled" />
+    </div>
+    <div class="row">
+      <label>daemon 端口</label>
+      <input type="number" id="port" min="1" max="65535" />
+      <button id="save" class="primary">保存</button>
+    </div>
+    <div class="row">
+      <label>浏览器名（多浏览器槽位）</label>
+      <input type="text" id="browserName" placeholder="default" maxlength="32" style="width:130px" />
+    </div>
+    <div class="row">
+      <label>拟人操作模式（实验性）</label>
+      <input type="checkbox" id="humanMode" />
+    </div>
+    <div class="row">
+      <label>受控页防护罩</label>
+      <div class="dropdown" id="shieldDD">
+        <button type="button" class="dd-btn" id="shieldBtn">
+          <span id="shieldLabel">边框 + 拦截点击（默认）</span>
+          <span class="chev"></span>
+        </button>
+        <div class="dd-menu" id="shieldMenu">
+          <div class="dd-opt" data-value="block">边框 + 拦截点击（默认）<span class="check">✓</span></div>
+          <div class="dd-opt" data-value="border">仅高亮边框<span class="check">✓</span></div>
+          <div class="dd-opt" data-value="off">关闭<span class="check">✓</span></div>
+        </div>
+      </div>
+      <select id="shieldMode" hidden>
+        <option value="block">边框 + 拦截点击（默认）</option>
+        <option value="border">仅高亮边框</option>
+        <option value="off">关闭</option>
+      </select>
+    </div>
+  </section>
+
+  <details class="advanced">
+    <summary>高级 · 配对与令牌</summary>
+    <section class="card">
+      <div class="hint" style="margin:0 0 8px">
+        通常无需手动配置：<code>ubb install</code> 后通过原生消息主机自动配对。
+        手动启动 daemon：<code>ubb status</code> 自动拉起；或
+        <code>node daemon/ubb-bridge.mjs --port 8765 --token &lt;令牌&gt;</code>
+      </div>
+      <div class="row"><label>当前令牌（daemon 需一致）</label><button id="reveal">显示</button></div>
+      <div class="row token">
+        <code id="token">…</code>
+        <button id="copy">复制</button>
+        <button id="regen" class="danger">重置</button>
+      </div>
+      <div class="row">
+        <input type="text" id="tokenInput" placeholder="粘贴外部令牌后点应用（排障用）" />
+        <button id="applyToken">应用</button>
+      </div>
+    </section>
+  </details>
+
+  <details class="advanced">
+    <summary>高级 · 安全开关</summary>
+    <section class="card">
+      <div class="row">
+        <label>原始 CDP（full 档）</label>
+        <input type="checkbox" id="cdpRaw" />
+      </div>
+      <div class="hint warn" style="margin-top:4px">
+        开启后 AI 可在本开关允许的网站上使用底层调试命令；仍受站点批准与方法黑名单约束。
+      </div>
+      <div class="row" style="margin-top:12px"><label>已授权站点</label></div>
+      <div id="cdpOriginList"></div>
+      <div class="row" style="margin-top:12px">
+        <label>外站框架守卫</label>
+        <div class="dropdown" id="guardDD">
+          <button type="button" class="dd-btn" id="guardBtn">
+            <span id="guardLabel">仅会话标签页（默认）</span>
+            <span class="chev"></span>
+          </button>
+          <div class="dd-menu" id="guardMenu">
+            <div class="dd-opt" data-value="session">仅会话标签页（默认）<span class="check">✓</span></div>
+            <div class="dd-opt" data-value="always">所有标签页<span class="check">✓</span></div>
+            <div class="dd-opt" data-value="off">关闭<span class="check">✓</span></div>
+          </div>
+        </div>
+        <select id="guardMode" hidden>
+          <option value="session">仅会话标签页（默认）</option>
+          <option value="always">所有标签页</option>
+          <option value="off">关闭</option>
+        </select>
+      </div>
+      <div class="hint" style="margin-top:4px">
+        守卫决定防护罩是否自武装到外站框架：仅会话标签页（默认）/ 所有标签页 / 关闭。
+      </div>
+      <div class="row" style="margin-top:12px">
+        <label>Agent 操作光标提示</label>
+        <input type="checkbox" id="cursorEnabled" />
+      </div>
+      <div class="hint" style="margin-top:4px">在受控页面上显示 AI 每次操作的圆点位置提示。</div>
+      <div class="row" style="margin-top:12px">
+        <label>严格确认档</label>
+        <input type="checkbox" id="policyStrict" />
+      </div>
+      <div class="hint" style="margin-top:4px">开启后 解CAPTCHA/删除/敏感传输/原始CDP 每次都要求人工确认。</div>
+    </section>
+  </details>
+
+  <section class="card">
+    <div class="row"><label id="session">会话：无</label></div>
+    <div class="audit" id="audit"></div>
+  </section>
+
+  <script src="popup.js"></script>
+</body>
+</html>

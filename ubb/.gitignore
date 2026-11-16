@@ -1,0 +1,38 @@
+# Runtime artifacts
+*.log
+*.pid
+daemon.log
+
+# Keys & packaged output
+*.pem
+*.crx
+.ubb-key.pem
+
+# Node
+node_modules/
+package-lock.json
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Test / scratch
+_*/
+screenshots/
+ubb-screenshots/
+
+# Rust build artifacts (bin/ubb.exe is the committed, redistributable build)
+rust-cli/target/
+
+# E2E tests and fixtures are local-only
+e2e/
+
+# Local docs/reports; keep the project's tracked docs
+*.md
+!README.md
+!INSTALL.md
+
+# Local tooling dotfiles/dirs
+.*
+!.gitignore

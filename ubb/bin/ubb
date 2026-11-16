@@ -1,0 +1,4 @@
+#!/bin/sh
+# UBB launcher: the Rust binary is the default runtime (zero deps, instant start).
+# Node CLI remains available for development: node daemon/ubb.mjs "$@"
+exec "$(cd "$(dirname "$0")" && pwd)/ubb.exe" "$@"

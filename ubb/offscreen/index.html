@@ -1,0 +1,13 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8" /></head>
+<body>
+<!-- THE single offscreen document: this Edge build allows only one offscreen
+     document per extension, so clipboard ops and the video recorder share this
+     page (E2E finding: creating a second document for the recorder threw
+     "Only a single offscreen document may be created"). -->
+<script src="offscreen.js"></script>
+<script type="module" src="recorder.js"></script>
+<textarea id="ta"></textarea>
+</body>
+</html>

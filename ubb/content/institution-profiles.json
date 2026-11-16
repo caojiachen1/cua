@@ -1,0 +1,20 @@
+{
+  "_comment": "Institution access profiles are DATA, not code. Add one entry per school under profiles[] (or via institution.profile.set). The tools never hardcode a school or a WebVPN host. template below documents the fields.",
+  "template": {
+    "name": "example",
+    "carsi_school": "Example University",
+    "webvpn": {
+      "cas_login": "https://sso.example.edu.cn/cas/login?service={service}",
+      "service": "https://webvpn.example.edu.cn/login?cas_login=true",
+      "home_pattern": "^https://webvpn\\.example\\.edu\\.cn/?$",
+      "library_link_text": "图书馆数据库导航",
+      "library_link_class": "",
+      "library_url_pattern": "zy\\.jsp",
+      "library_search_input": "input[type=text]",
+      "library_query_button_text": "查询",
+      "library_entry_prefix": "入口",
+      "row_name_cell": 1
+    }
+  },
+  "profiles": []
+}
