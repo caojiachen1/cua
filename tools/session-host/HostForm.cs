@@ -394,6 +394,53 @@ namespace CuaSessionHost
             };
             _tray.DoubleClick += delegate { ShowViewer(!_viewOnly); };
             UpdateTrayMenu();
+            UpdateTrayText();
+            PromoteTrayIcon();
+        }
+
+        /// <summary>
+        /// The tray icon is the "session is alive" indicator and must be visible
+        /// in every mode (viewer shown or hidden). Windows 11 files new icons
+        /// into the overflow area; Explorer keeps that per icon under
+        /// HKCU\Control Panel\NotifyIconSettings, so mark ours promoted and
+        /// re-add it once to apply. Best effort: a locked-down shell just keeps
+        /// the icon in the overflow, never breaks startup.
+        /// </summary>
+        private void PromoteTrayIcon()
+        {
+            try
+            {
+                string exe = Process.GetCurrentProcess().MainModule.FileName;
+                bool changed = false;
+                using (var root = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(
+                           @"Control Panel\NotifyIconSettings", true))
+                {
+                    if (root == null) return;
+                    foreach (string name in root.GetSubKeyNames())
+                    {
+                        using (var sub = root.OpenSubKey(name, true))
+                        {
+                            if (sub == null) continue;
+                            if (!string.Equals(sub.GetValue("ExecutablePath") as string, exe,
+                                    StringComparison.OrdinalIgnoreCase))
+                                continue;
+                            object promoted = sub.GetValue("IsPromoted");
+                            if (!(promoted is int) || (int)promoted != 1)
+                            {
+                                sub.SetValue("IsPromoted", 1, Microsoft.Win32.RegistryValueKind.DWord);
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                if (changed && _tray != null)
+                {
+                    // re-add so Explorer re-reads the setting for this icon
+                    _tray.Visible = false;
+                    _tray.Visible = true;
+                }
+            }
+            catch { }
         }
 
         private static ToolStripMenuItem MenuItem(string text, Action action)
@@ -418,8 +465,8 @@ namespace CuaSessionHost
         {
             if (_tray == null) return;
             string id = _childId.HasValue ? _childId.Value.ToString() : "—";
-            _tray.Text = "cua child session · session " + id +
-                         (_viewOnly ? " · view only" : " · user control");
+            string state = !SessionConnected ? " · 未连接" : (_viewOnly ? " · 只读" : " · 可控");
+            _tray.Text = "cua 子会话 " + id + state;
         }
 
         private void StartPipe()
@@ -526,6 +573,12 @@ namespace CuaSessionHost
         private void Poll()
         {
             if (_stopping) return;
+            // The tray icon means "this child session is alive" and must never
+            // stay hidden, whether the viewer is showing or hidden.
+            if (_tray != null && !_tray.Visible)
+            {
+                try { _tray.Visible = true; } catch { }
+            }
             int state = _rdp.Connected;
             if (state == 2)
             {
@@ -548,6 +601,10 @@ namespace CuaSessionHost
                     _statusPill.SetState("子会话已断开", Theme.Warn);
                     UpdateMeta();
                     WriteState();
+                    // The tray icon is the "session is alive" light: once the
+                    // child session is gone the host goes with it, so a visible
+                    // icon can never outlive its session.
+                    if (!_opt.Preview) StopSession();
                 }
                 return;
             }
