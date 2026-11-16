@@ -1552,13 +1552,26 @@ fn pair_profile(kind: BrowserKind) -> Result<UbbPair> {
     })?;
     let slot = ubb_slot(kind);
     let ext_str = ext.display().to_string();
-    let v = crate::ubb::call_json(
+    let v = match crate::ubb::call_json(
         "browser.pair",
         &serde_json::json!({
             "name": slot,
             "extension_dir": ext_str,
         }),
-    )?;
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!("{e:#}");
+            // A daemon left over from an older UBB install answers but has no
+            // browser.pair; cua cannot fix that without killing it.
+            if msg.contains("UNKNOWN_TOOL") {
+                anyhow::bail!(
+                    "{msg}\n(hint: the running UBB daemon predates this CLI — run `ubb daemon stop`, then retry; cua restarts the daemon from this repository)"
+                );
+            }
+            return Err(e);
+        }
+    };
     let pair_url = v
         .get("pair_url")
         .and_then(|x| x.as_str())

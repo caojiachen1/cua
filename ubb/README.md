@@ -176,9 +176,32 @@ A workspace is a separate Edge/Chrome *process* with its own profile (`~/.ubb/pr
 ubb browser launch scratch [--exe edge]   # or: node daemon/ubb.mjs browser launch scratch
 ```
 
-Spawns Edge/Chrome with a **fresh user-data-dir** (`~/.ubb/profiles/<name>` — relaunching the same name reuses the profile, so logins made inside the instance survive), the unpacked UBB extension pre-loaded (`--load-extension`), and one tab pointing at the daemon's **one-shot pairing page** (`/__ubb_pair?nonce=…`). The page pushes `{type:'UBB_PAIR_LAUNCH', token, port, name}` into the extension via `externally_connectable`; the extension stores it, reconnects, clears the pairing tab to `about:blank`, and the slot appears in `ubb browsers` a few seconds later. Launches are **focus-free**: `--start-minimized` at spawn, plus the extension's one-shot minimize (see the workspace section above). From then on the instance is a full citizen: `--browser scratch …` drives it exactly like the main browser.
+Spawns Edge/Chrome with a **fresh user-data-dir** (`~/.ubb/profiles/<name>` — relaunching the same name reuses the profile, so logins made inside the instance survive), the unpacked UBB extension pre-loaded (`--load-extension`), and one tab pointing at the daemon's **one-shot pairing page** (`/__ubb_pair?nonce=…`). The page hands `{type:'UBB_PAIR_LAUNCH', token, port, name}` to the extension — directly via `externally_connectable` where the browser still allows it, otherwise through `content/pair.js` (see `browser.pair`) — the extension stores it, reconnects, clears the pairing tab to `about:blank`, and the slot appears in `ubb browsers` a few seconds later. Launches are **focus-free**: `--start-minimized` at spawn, plus the extension's one-shot minimize (see the workspace section above). From then on the instance is a full citizen: `--browser scratch …` drives it exactly like the main browser.
 
 Trust shape, stated plainly: the pairing page exists for exactly one fetch (the nonce is 128-bit random, single-use, 120s TTL, minted only by `browser.launch`), and the credentials it carries never leave loopback. A page without the nonce gets a 404. The unpacked extension id is derived from the extension path the way the browser derives it (`sha256(path)→a-p`, where on Windows "path bytes" means **UTF-16LE**), which is also what the pair page targets; if your browser disagrees, pass `extension_dir` / `browser_exe` in `~/.ubb/config.json` or as params, and check `edge://extensions` for the real id.
+
+### browser.pair — pair a browser you launch yourself
+
+```bash
+ubb browser pair cuaedge '{"extension_dir":"D:/Codebase/cua/ubb"}'
+# → {"slot":"cuaedge","pair_url":"http://127.0.0.1:8765/__ubb_pair?nonce=…","extension_dir":…,"extension_id":…,"ttl_s":120}
+```
+
+Same one-shot nonce as `browser.launch`, but the daemon spawns nothing: you launch the browser
+yourself (`--user-data-dir=<profile> --load-extension=<extension_dir>`, `pair_url` as the first
+tab) and it registers under `slot`. `cua edge --ubb` uses this to pair a profile launched in
+another Windows session. Two things matter on current Chromium:
+
+- pass `--disable-features=DisableLoadExtensionCommandLineSwitch` — without it the switch is
+  ignored (Chromium 137+) and no extension loads;
+- pass `extension_dir` as the exact absolute path you give `--load-extension` (Windows
+  backslashes), because the unpacked extension id is `sha256(UTF-16LE path) → a-p`.
+
+Web pages can no longer deliver messages to unpacked extensions (`externally_connectable` still
+matches, the message still fails with `Receiving end does not exist`), so `content/pair.js`
+forwards only the nonce from the pair page and the background fetches
+`/__ubb_pair?nonce=…&format=json` from the daemon that minted it. The page never carries
+credentials, so a hostile local page cannot aim the extension at a token of its own.
 
 ### browser.close — end a workspace instance
 
