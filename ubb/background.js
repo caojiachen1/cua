@@ -347,23 +347,10 @@ chrome.tabs.onUpdated.addListener((tabId, change, tab) => {
 // Web-page channel: manifest externally_connectable admits http://localhost/* and
 // http://127.0.0.1/* pages only, and every message must carry the same token the
 // daemon uses — so a page served from any local port can drive UBB without the CLI.
-chrome.runtime.onMessageExternal.addListener((msg, sender, sendResponse) => {
-  (async () => {
-    const origin = sender.origin || sender.url || '';
-    if (!/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
-      return { ok: false, error: 'origin not allowed: ' + origin };
-    }
-    if (!msg) return { ok: false, error: 'no message' };
-
-    // ---- pairing for `browser.launch` instances ─────────────────────────────
-    // The daemon serves /__ubb_pair?nonce=<N> (nonce single-use, 120s TTL,
-    // minted only by `browser.launch` and the workspace auto-launch). The page
-    // it renders carries the daemon's own token/port and the slot name for the
-    // freshly launched profile. The token arrives here over the SAME channel
-    // the daemon's /shutdown?token= gate already trusts: loopback + a 128-bit
-    // single-use nonce. A page without the nonce gets a 404 from the daemon,
-    // so the credentials never reach an uninvited origin.
-    if (msg.type === 'UBB_PAIR_LAUNCH') {
+// Shared by the web-page channel (externally_connectable) and the
+// content-script channel. Credentials always come from the daemon for a
+// single-use nonce, never from the page itself.
+async function applyLaunchPair(msg, sender, origin) {
       const st = await chrome.storage.local.get([STORAGE_KEYS.enabled]);
       if (st[STORAGE_KEYS.enabled] === false) return { ok: false, error: 'UBB disabled' };
       const okShape =
@@ -392,6 +379,24 @@ chrome.runtime.onMessageExternal.addListener((msg, sender, sendResponse) => {
       return { ok: true, paired_as: msg.name.toLowerCase() };
     }
 
+chrome.runtime.onMessageExternal.addListener((msg, sender, sendResponse) => {
+  (async () => {
+    const origin = sender.origin || sender.url || '';
+    if (!/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
+      return { ok: false, error: 'origin not allowed: ' + origin };
+    }
+    if (!msg) return { ok: false, error: 'no message' };
+
+    // ---- pairing for `browser.launch` instances ─────────────────────────────
+    // The daemon serves /__ubb_pair?nonce=<N> (nonce single-use, 120s TTL,
+    // minted only by `browser.launch` and the workspace auto-launch). The page
+    // it renders carries the daemon's own token/port and the slot name for the
+    // freshly launched profile. The token arrives here over the SAME channel
+    // the daemon's /shutdown?token= gate already trusts: loopback + a 128-bit
+    // single-use nonce. A page without the nonce gets a 404 from the daemon,
+    // so the credentials never reach an uninvited origin.
+    if (msg.type === 'UBB_PAIR_LAUNCH') return applyLaunchPair(msg, sender, origin);
+
     if (msg.type !== 'UBB_WEB_RPC') {
       return { ok: false, error: 'unknown message type' };
     }
@@ -409,6 +414,35 @@ chrome.runtime.onMessageExternal.addListener((msg, sender, sendResponse) => {
     return { ok: true, result: reply && reply.result };
   })().then((r) => sendResponse(r)).catch((e) => sendResponse({ ok: false, error: String(e && e.message || e) }));
   return true; // async sendResponse
+});
+
+// Content-script channel: current Edge/Chrome builds refuse web-page ->
+// unpacked-extension messages even with externally_connectable, so
+// content/pair.js forwards only the nonce and the background fetches the
+// credentials from the daemon that minted it.
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (!msg || msg.type !== 'UBB_PAIR_PAGE') return;
+  (async () => {
+    const tabUrl = (sender.tab && sender.tab.url) || '';
+    if (!/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?\/__ubb_pair\?/.test(tabUrl)) {
+      return { ok: false, error: 'not a pair page' };
+    }
+    const u = new URL(tabUrl);
+    const nonce = String(msg.nonce || '');
+    if (!/^[0-9a-f]{32,128}$/i.test(nonce) || u.searchParams.get('nonce') !== nonce) {
+      return { ok: false, error: 'nonce mismatch' };
+    }
+    const res = await fetch(u.origin + '/__ubb_pair?nonce=' + encodeURIComponent(nonce) + '&format=json');
+    if (!res.ok) return { ok: false, error: 'pair nonce rejected (' + res.status + ')' };
+    const payload = await res.json();
+    if (!payload || payload.ok !== true) return { ok: false, error: (payload && payload.error) || 'pair rejected' };
+    return applyLaunchPair(
+      { type: 'UBB_PAIR_LAUNCH', nonce, token: payload.token, port: payload.port, name: payload.slot },
+      sender,
+      u.origin,
+    );
+  })().then(sendResponse).catch((e) => sendResponse({ ok: false, error: String((e && e.message) || e) }));
+  return true;
 });
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {

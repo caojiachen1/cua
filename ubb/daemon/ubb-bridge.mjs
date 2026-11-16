@@ -264,6 +264,39 @@ function daemonMethod(agent, msg) {
     agent.send({ id: msg.id, result: { nonce, ttl_s: PAIR_NONCE_TTL_MS / 1000 } });
     return true;
   }
+  if (m === 'browser.pair') {
+    const name = String(msg.params?.name || '');
+    if (!BROWSER_NAME_RE.test(name)) {
+      agent.send({ id: msg.id, error: { code: 'BAD_PARAMS', message: 'browser.pair needs name matching [a-z0-9_-]{1,32} (the slot the instance registers under)' } });
+      return true;
+    }
+    const cfg = readConfig();
+    let extDir = String(msg.params?.extension_dir || cfg.extension_dir || '');
+    if (!extDir) {
+      // the daemon lives in <repo>/daemon, the manifest in <repo>
+      const guess = path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), '..');
+      if (fs.existsSync(path.join(guess, 'manifest.json'))) extDir = guess;
+    }
+    if (!extDir || !fs.existsSync(path.join(extDir, 'manifest.json'))) {
+      agent.send({ id: msg.id, error: { code: 'BAD_PARAMS', message: 'extension_dir unknown — pass it, or set extension_dir in ~/.ubb/config.json' } });
+      return true;
+    }
+    const nonce = crypto.randomBytes(32).toString('hex');
+    pairNonces.set(nonce, { name, minted: Date.now() });
+    agent.send({
+      id: msg.id,
+      result: {
+        slot: name,
+        pair_url: `http://127.0.0.1:${PORT}/__ubb_pair?nonce=${nonce}`,
+        extension_dir: extDir,
+        extension_id: unpackedExtId(extDir),
+        ttl_s: PAIR_NONCE_TTL_MS / 1000,
+        note: 'launch the browser yourself with --user-data-dir=<profile> --load-extension=<extension_dir> and pair_url as the first tab; it connects under slot <name> after that page runs',
+      },
+    });
+    return true;
+  }
+
   if (m === 'session.transfer') {
     void sessionTransfer(agent, msg);
     return true;
@@ -1043,8 +1076,14 @@ const server = http.createServer((req, res) => {
     if (rec && Date.now() - rec.minted < PAIR_NONCE_TTL_MS) {
       pairNonces.delete(nonce);
       const extDir = String(readConfig().extension_dir || path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), '..'));
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(pairPage(TOKEN, rec.name, nonce, unpackedExtId(extDir)));
+      const wantJson = new URL(req.url, 'http://127.0.0.1').searchParams.get('format') === 'json';
+      if (wantJson) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, slot: rec.name, token: TOKEN, port: PORT, nonce }));
+      } else {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(pairPage(TOKEN, rec.name, nonce, unpackedExtId(extDir)));
+      }
     } else {
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: false, error: 'unknown or expired pairing nonce (single-use, 120s TTL)' }));

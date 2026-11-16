@@ -452,6 +452,49 @@ fn daemon_method(state: &Arc<AppState>, sink: &Sink, msg: &Value, method: &str) 
             state.send_agent(sink, &json!({"id": id, "result": {"nonce": nonce, "ttl_s": PAIR_NONCE_TTL.as_secs()}}));
             true
         }
+        "browser.pair" => {
+            // Launch-less pairing: mint the same one-shot nonce browser.launch
+            // uses, but let the caller spawn the browser (cua does this for its
+            // CuaEdge/CuaChrome profiles in another Windows session).
+            let name = msg.pointer("/params/name").and_then(|v| v.as_str()).unwrap_or("");
+            if !valid_browser_name(name) {
+                state.send_agent(
+                    sink,
+                    &json!({"id": id, "error": {"code": "BAD_PARAMS", "message": "browser.pair needs name matching [a-z0-9_-]{1,32} (the slot the instance registers under)"}}),
+                );
+                return true;
+            }
+            let empty = json!({});
+            let params = msg.get("params").filter(|p| p.is_object()).unwrap_or(&empty);
+            let ext_dir = match resolve_extension_dir(state, params) {
+                Ok(d) => d,
+                Err(e) => {
+                    state.send_agent(sink, &json!({"id": id, "error": e}));
+                    return true;
+                }
+            };
+            let Some(nonce) = crypto_token() else {
+                state.send_agent(
+                    sink,
+                    &json!({"id": id, "error": {"code": "INTERNAL", "message": "OS CSPRNG unavailable"}}),
+                );
+                return true;
+            };
+            state.nonces.lock().unwrap().insert(nonce.clone(), (name.to_string(), Instant::now()));
+            state.send_agent(
+                sink,
+                &json!({"id": id, "result": {
+                    "slot": name,
+                    "pair_url": format!("http://127.0.0.1:{}/__ubb_pair?nonce={nonce}", state_port(state)),
+                    "extension_dir": ext_dir,
+                    "extension_id": unpacked_ext_id(&ext_dir),
+                    "ttl_s": PAIR_NONCE_TTL.as_secs(),
+                    "note": "launch the browser yourself with --user-data-dir=<profile> --load-extension=<extension_dir> and pair_url as the first tab; it connects under slot <name> after that page runs",
+                }}),
+            );
+            true
+        }
+
         "diag.browsers" => {
             // read-only multi-browser scan (mirrors the Node daemon's daemonMethod;
             // what this minimal sibling skips is declared in result.limitations)
@@ -976,6 +1019,38 @@ fn unpacked_ext_id(path: &str) -> String {
         .flat_map(|b| [b >> 4, b & 0x0f])
         .map(|n| char::from(b'a' + n))
         .collect()
+}
+
+/// Extension root for pairing: param > config > next to this binary > repo root
+/// (the merged layout puts the extension in <repo>/ubb with the CLI in
+/// <repo>/bin or <repo>/ubb/bin).
+fn resolve_extension_dir(state: &Arc<AppState>, params: &Value) -> Result<String, Value> {
+    let cfg = state.read_config();
+    let mut cands: Vec<String> = Vec::new();
+    for v in [
+        params.get("extension_dir").and_then(|v| v.as_str()).unwrap_or(""),
+        cfg.get("extension_dir").and_then(|v| v.as_str()).unwrap_or(""),
+    ] {
+        let v = v.trim();
+        if !v.is_empty() {
+            cands.push(v.to_string());
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            cands.push(dir.display().to_string());
+            if let Some(parent) = dir.parent() {
+                cands.push(parent.display().to_string());
+                cands.push(parent.join("ubb").display().to_string());
+            }
+        }
+    }
+    for c in cands {
+        if std::path::Path::new(&c).join("manifest.json").is_file() {
+            return Ok(c);
+        }
+    }
+    Err(json!({"code": "BAD_PARAMS", "message": "extension_dir unknown — pass extension_dir, or set it in ~/.ubb/config.json"}))
 }
 
 fn handle_agent_message(state: &Arc<AppState>, sink: &Sink, msg: &Value) {
@@ -1548,6 +1623,9 @@ async fn handle_connection(state: Arc<AppState>, token: String, mut stream: TcpS
                 .find_map(|kv| kv.strip_prefix("nonce="))
                 .unwrap_or("")
                 .to_string();
+            // The extension's content script cannot read the page's JS, so it
+            // asks for the same credentials as JSON instead of rendering them.
+            let want_json = rest.split('&').any(|kv| kv == "format=json");
             let claim: Option<String> = {
                 let mut nonces = state.nonces.lock().unwrap();
                 let valid = nonces
@@ -1572,7 +1650,22 @@ async fn handle_connection(state: Arc<AppState>, token: String, mut stream: TcpS
                             .unwrap_or_default()
                     });
                     let page = pair_page(tok, state_port(&state), &name, &nonce, &unpacked_ext_id(&ext_dir));
-                    ("200 OK", page, "text/html; charset=utf-8")
+                    if want_json {
+                        (
+                            "200 OK",
+                            json!({
+                                "ok": true,
+                                "slot": name,
+                                "token": tok,
+                                "port": state_port(&state),
+                                "nonce": nonce,
+                            })
+                            .to_string(),
+                            "application/json",
+                        )
+                    } else {
+                        ("200 OK", page, "text/html; charset=utf-8")
+                    }
                 }
                 None => (
                     "404 Not Found",
@@ -2443,6 +2536,38 @@ Run `ubb install` once on a new machine to put it on the per-user PATH.");
             Ok(m) => std::process::exit(print_result(&m, out_flag.as_deref())),
             Err(e) => die(&format!("rpc failed: {e}")),
         },
+        "browser" if rest.first().map(String::as_str) == Some("pair") => {
+            let name = rest.get(1).cloned().unwrap_or_default();
+            let mut params = json!({"name": name});
+            if let Some(raw) = rest.get(2) {
+                match serde_json::from_str::<Value>(raw) {
+                    Ok(extra) => {
+                        if let (Some(dst), Some(src)) = (params.as_object_mut(), extra.as_object()) {
+                            for (k, v) in src {
+                                dst.insert(k.clone(), v.clone());
+                            }
+                        }
+                    }
+                    Err(e) => die(&format!("params must be valid JSON: {e}")),
+                }
+            }
+            match call(port, &token, "browser.pair", &params, None).await {
+                Ok(m) => std::process::exit(print_result(&m, out_flag.as_deref())),
+                Err(e) => die(&format!("rpc failed: {e}")),
+            }
+        }
+        "browser.pair" => {
+            let raw = rest.first().cloned().unwrap_or_default();
+            let params: Value = if raw.is_empty() {
+                json!({})
+            } else {
+                serde_json::from_str(&raw).unwrap_or_else(|e| die(&format!("params must be valid JSON: {e}")))
+            };
+            match call(port, &token, "browser.pair", &params, None).await {
+                Ok(m) => std::process::exit(print_result(&m, out_flag.as_deref())),
+                Err(e) => die(&format!("rpc failed: {e}")),
+            }
+        }
         "browser" if rest.first().map(String::as_str) == Some("launch") => {
             let name = rest.get(1).cloned().unwrap_or_default();
             let mut params = json!({"name": name});
