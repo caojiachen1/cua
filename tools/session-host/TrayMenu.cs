@@ -57,7 +57,11 @@ namespace CuaSessionHost
             // the panel (it includes the reserved image-margin column), which is
             // what pushed earlier attempts to the right.
             int x = Math.Max(0, (e.ToolStrip.Width - size.Width) / 2);
-            int y = e.TextRectangle.Y + Math.Max(0, (e.TextRectangle.Height - size.Height) / 2);
+            // centre on the item row itself: TextRectangle is the text box, not
+            // the row, and using it left the labels ~7px high.
+            // -2: the glyph box TextRenderer reports sits slightly low in the
+            // row (measured 8px above / 5px below); nudge so both gaps match.
+            int y = e.Item.Bounds.Y + Math.Max(0, (e.Item.Bounds.Height - size.Height) / 2) - 2;
             TextRenderer.DrawText(e.Graphics, e.Text, font, new Point(x, y), color,
                 TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding);
         }
