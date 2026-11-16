@@ -190,6 +190,20 @@ namespace CuaSessionHost
                 InitTray();
                 try { StartupQuarantine.RestoreStale(_opt.DataDir); } catch { }
                 StartPipe();
+                // Windows 11 hides new tray icons in the overflow area; say once
+                // where the viewer went so "no icon" is not a mystery. Never let
+                // a notification failure abort startup (it runs before StartPipe).
+                if (!_opt.Preview && !_trayTipShown && _tray != null)
+                {
+                    _trayTipShown = true;
+                    try
+                    {
+                        _tray.ShowBalloonTip(5000, "cua 子会话",
+                            "关掉观察窗只会隐藏到托盘（Windows 11 在 ^ 溢出区），子会话继续运行；双击托盘图标可恢复。",
+                            ToolTipIcon.Info);
+                    }
+                    catch { }
+                }
                 if (_opt.Preview)
                 {
                     _connected = true;
