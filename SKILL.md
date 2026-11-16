@@ -300,13 +300,156 @@ non-input desktop (OS rule). Shortcuts that read raw key state need foreground m
 This is not an implementation gap: a keeper thread attached to the hidden desktop and calling
 `SendInput` gets `ERROR_ACCESS_DENIED` back, because the system only accepts injected input
 for the desktop that is currently the input desktop. Real keyboard/mouse plus zero user
-disturbance is therefore only possible from **another logon session or a VM** (that session
-has its own input desktop); inside one session the choice is UIA patterns and window
-messages, which is what the sandbox uses. The suite asserts the flip side: driving the
+disturbance is therefore only possible from **another logon session (including a Windows
+Child Session) or a VM** (that session has its own input desktop); inside one session the
+choice is UIA patterns and window messages, which is what the sandbox uses. The suite asserts the flip side: driving the
 sandbox never moves the user's cursor and never changes their foreground window.
 The hidden desktop supports multiple apps; `sandbox.json` records each process with its
 creation time, and `stop` kills only processes whose identity still matches (a reused PID
 is never treated as sandbox content).
+
+## Child-session background desktop (same user, real input — ask the user first)
+
+This is the fourth mode: a real Windows **Child Session**. It is a second logon session
+for the same user with its own desktop, input queue and focus; files, account, network
+and installed apps are shared. It is not a VM and not a security sandbox. Use it when a
+task needs real keyboard/mouse (games, drag & drop, VCL/GTK, canvas, modal dialogs) while
+the user keeps the main desktop.
+
+**Ask before enabling or opening it.** Prerequisites: Windows 10/11 Pro/Enterprise/Education
+(Home unsupported); `cua session setup` once as administrator (UAC), then sign out of
+Windows and sign back in; Remote Desktop host enabled in Settings > System > Remote Desktop;
+RDP Wrapper uninstalled; only one child session. A PIN/Windows Hello parent session cannot
+reuse that sign-in for the child; run `cua session login` once to save the account password in
+Windows Credential Manager if the child shows a logon screen.
+
+```bash
+cua session setup                      # one-time admin; sign out/in afterwards
+cua session setup --enable-rdp         # also enables Remote Desktop (security change; ask first)
+cua session start                      # default: startup isolation + maximized read-only viewer
+cua session start --keep-startup       # let the child run the user's startup apps too
+cua session login                      # optional one-time Windows password for PIN/Hello logon
+cua session logout                     # remove the saved child-session password
+cua session start --hide               # background only; no viewer
+cua session status
+cua session view                       # read-only viewer; user may click Take over
+cua session view --interactive         # input enabled (only with explicit user approval)
+cua session hide                       # viewer hidden; session/agent stay alive
+cua session takeover                   # user takes keyboard/mouse (hides the read-only state)
+cua session release                    # back to read-only observation
+cua session stop                       # sign out child session and close its apps
+```
+
+All normal cua commands run inside the session with a `child` prefix (or `--child`):
+
+```bash
+cua child apps
+cua child state --window "Notepad" --out child.png
+cua child click --window "Notepad" --index 2
+cua child type --text "hello"
+cua child key --keys "ctrl+s"
+cua --child state --window "Notepad"
+```
+
+The parent stays in the user's session; only the child agent executes. State and
+observations are scoped as `CUA_SESSION=child-<id>`.
+
+**Viewer contract:** the viewer opens maximized in a dark Fluent top bar; it does not dim or
+cover the child desktop, and the RDP canvas starts below the bar. The top bar shows the session,
+child resolution/DPI and a **只读观察 · 键鼠已屏蔽** state, with **设置**, **接管控制**, **隐藏** and
+minimize / maximize-restore / close-to-tray controls. Read-only input is blocked at the RDP input
+window, so colors stay exactly as the child renders them. The child desktop size and scale default
+to the primary monitor's working area and DPI, 1:1 (the top bar is outside the RDP surface);
+`--width/--height` override it. Restoring or resizing the viewer only scales the fixed-size
+child image with black bars; it does not change the child resolution or force an RDP display
+reconfigure. Closing or hiding the viewer leaves the session running; a
+persistent tray icon (possibly in the Windows overflow) reopens it by double-click or its
+right-click menu. The **设置** panel can start, restart, log off, change the automatic-logon
+credential, hide, or log off and exit; logoff/restart/exit show a confirmation warning first.
+Never call `cua session takeover` or `--interactive` unless the user explicitly asks; the user
+owns that decision.
+
+**Boundaries:** the child session shares the user's profile, so Office, browser profiles,
+single-instance apps, VPN clients and startup apps can conflict; the clipboard is shared;
+it is an RDP session, so GPU/audio and remote-session detection may differ; it does not
+clone the user's current windows; it runs as the user and is not a security boundary. The
+optional password saved by `cua session login` lives in Windows Credential Manager under the
+current Windows user; it is never printed in cua state, pipes or logs. Use `cua session logout`
+to remove it.
+Keep the user's browser tasks in the main session via `cua browser` (ubb); for browser work
+inside the child session use `cua child edge` (a separate CuaEdge profile). Do not use
+`cua child browser` for the user's logged-in browser, because the child has a separate
+profile/instance. Use a VM instead when the task must be isolated from the user's files.
+
+## Child-session Edge (`cua child edge` — independent profile)
+
+The user's Edge profile is one-desktop-only and belongs to `cua browser` (UBB) in the main
+session. Browser work that must happen in the child session uses its own persistent profile:
+
+```bash
+cua child edge https://example.com     # real Edge window in the child desktop
+cua child edge --automation            # --force-renderer-accessibility for a stable first UIA pass
+cua child edge --cdp                   # opt-in CDP on a random 127.0.0.1 port (CuaEdge only)
+cua child edge --status                # Edge path, profile, lockfile, holders (PID/session)
+cua session edge --sign-in https://example.com  # main session: one-time login, waits for every CuaEdge Edge process to exit
+cua session edge --status              # same status from the main-session command family
+cua session edge --delete-profile --confirm    # delete CuaEdge cookies/passwords; refuses while in use
+cua child state --window "Microsoft Edge" --depth 20
+cua child click --window "Microsoft Edge" --index N
+cua child set-value --window "Microsoft Edge" --index M --value "text"
+```
+
+`--cdp` is opt-in and reports `cdp.port` / `cdp.browser_ws` in the launch receipt and
+`cua edge --status`; `/json/version` and `/json/list` are localhost-only and live only while
+Edge runs. CDP has no authentication — any same-user local process can control the browser
+while it is exposed, so enable it only for trusted CuaEdge work. No Playwright dependency;
+UIA remains the default.
+
+The viewer's top bar has **子会话 Edge** (also in the tray menu) and **设置 → CuaEdge** shows
+the profile, Edge version, lock holders and CDP, with open/refresh/backup/delete buttons. The
+host merges the main-session and child-agent status, so a non-elevated viewer still sees the
+child's holders; backup/delete refuse while Edge is using the profile. Backups contain
+cookies/passwords; treat them as sensitive.
+
+Run `--sign-in`/`--delete-profile` in the user's main session, never inside the child (the
+child agent blocks `cua session`, and the command also refuses child-session ids). Sign-in
+opens a local instruction page + up to 8 URLs and waits for every Edge process using the
+profile to exit (default 30 min, `--timeout-min` up to 180). On timeout it reports holder
+PIDs/sessions and never kills them; check with `cua session edge --status`.
+
+Profile: `%LOCALAPPDATA%\cua\browser\CuaEdge`. It is **not data-isolated**: Edge sync is
+allowed by default and a new profile goes through Edge's normal first-run import (passwords,
+history, etc.) from the main profile where Edge offers it. CuaEdge may therefore contain the
+main Edge's local credentials and Microsoft account data; cua does not purge or block that
+data. In the 2026-11-16 test a new profile imported 462 saved logins (including all 8 UJS
+entries) and 1,191 history rows; Edge did not import bookmarks or extensions, and only Bing/
+MSN account cookies — "all data" means whatever Edge imports or syncs, not a byte-for-byte
+clone. The independent user-data-dir exists only for Edge's single-profile-per-desktop lock;
+use a separate Windows account/VM when real isolation is required. `--disable-background-mode`
+is still passed. **Persistent profile:** the fixed default is `%LOCALAPPDATA%\cua\browser\CuaEdge`; `cua edge
+--status` (or `cua child edge --status`) reports the actual `profile` path. Create it when
+missing and reuse it on every later `cua edge` / `cua child edge`. Do not delete it after a
+test just because it now contains cookies/passwords. Use `--fresh-profile` only when you
+deliberately need a from-zero test profile; use `--delete-profile --confirm` only when the
+user asks to erase it. The independent user-data-dir is for Edge's single-profile lock, not
+data isolation.
+
+For autofill, use imported/account-synced credentials, let Edge save a missing password in the
+CuaEdge sign-in window, or import browser data via Edge settings. Windows Hello may still ask
+for verification.
+
+**Sync troubleshooting (measured 2026-11-16):** enabling sync in CuaEdge does not upload the
+main profile's local passwords. The main Edge had ~453 local passwords while the Microsoft
+account had 0 and `sync.keep_everything_synced` was false. To cloud-sync, enable Sync +
+Passwords (or "keep everything synced") in the main Edge, wait for the upload, then enable sync
+in CuaEdge. Edge's first-run import already copies the main profile's local passwords into
+CuaEdge on the same machine, so autofill works without cloud sync.
+
+The command refuses if another Windows session already holds the profile and reports the
+holder PID/session — never kill that Edge unless the user asks. A second launch in the
+same session opens a new window in the existing instance. `--fresh-profile` uses a throwaway
+`%TEMP%` profile. Do not launch `msedge.exe` through `cua child launch`; it is refused on
+purpose in the child session.
 
 ## Browser (bridged to UBB — the user's own Edge/Chrome)
 
@@ -375,14 +518,19 @@ the top-level actions that carry `--sandbox` (click/type/key/scroll/drag/launch/
 recorded argv keeps `--sandbox`, so replay drives the same hidden desktop.
 
 ## Safety model (Qoder no-negotiables + ZCode grants spirit)
-- Deny list (never automate): terminals (cmd/powershell/pwsh/wt), taskmgr, regedit,
-  mmc, control, password managers (1password/keepass/bitwarden/…), system settings.
+- Standard mode (default) deny list: terminals (cmd/powershell/pwsh/wt), taskmgr,
+  regedit, mmc, control, password managers (1password/keepass/bitwarden/…), system settings.
+- Policy modes: `cua mode` prints the effective policy. `cua mode full --confirm`
+  persists `"full_mode": true` in config.json and stops enforcing `deny_processes`,
+  so every application (including the classes above) becomes automatable.
+  `cua mode standard` restores the list without confirmation. Full mode warns on
+  stderr for every command and `cua check` reports `safety.mode: "full"`.
 - Windows-logo key refused. `close` and `alt+f4` require `--confirm` (Always-Confirm).
-- Coordinate actions need a fresh shot_id. Override policy via
+- Coordinate actions need a fresh shot_id. The remaining policy can be tuned via
   `%LOCALAPPDATA%\cua\config.json` (`deny_processes`, `require_shot_id_for_coords`).
 - Every action receipt carries `verification` (not_requested/passed/failed/unknown),
-  `evidence` (complete/incomplete), and (where applicable) `input_mode`
-  (auto/a11y/event/background/background-a11y). An action whose recording could not be
+  `evidence` (complete/incomplete), `safety_mode` (standard/full), and (where applicable)
+  `input_mode` (auto/a11y/event/background/background-a11y). An action whose recording could not be
   written still exits as success for the action, but is marked `evidence: incomplete` and
   says so in `detail`; do not treat it as fully auditable.
 - `strategy=a11y` never falls back to coordinates or messages: a raw-coordinate click is

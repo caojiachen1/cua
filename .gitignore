@@ -1,17 +1,29 @@
+# Build output
 /target/
+target-final/
 /bin/
+obj/
+tools/*/bin/
+tools/*/obj/
+
+# Local runtime and debug artifacts
 *.log
-.tmp-*
-SUMMARY.md
 *.mp4
-tools/uia-report*.md
+.tmp-*
 .e2e/
-.models/
-.venv-oracle/
+.e2e-*/
 .e2e-perception/
 .tmp-burn-yolo/
-.e2e-*/
-target-final/
-docs/perception-samples/
-docs/perception-example.png
-docs/commandflow-uia-comparison.md
+.models/
+.venv-oracle/
+/*.json
+/*.err
+/*.png
+
+# Locally generated reports, screenshots and samples (matched by kind, not by name)
+/*SUMMARY*.md
+docs/*.png
+docs/*-samples/
+docs/*-report.md
+docs/*-comparison.md
+tools/*-report*.md

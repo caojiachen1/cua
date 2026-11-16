@@ -3,10 +3,12 @@
 // Controls: multiline EDIT, buttons, checkbox (Toggle), listbox (SelectionItem),
 // trackbar (RangeValue), and a custom hit area that records right/double/message clicks.
 #![windows_subsystem = "windows"]
+use std::sync::atomic::{AtomicBool, Ordering};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{BeginPaint, CreateFontW, EndPaint, PAINTSTRUCT};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::Pointer::EnableMouseInPointer;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW,
     PostQuitMessage, RegisterClassW, SendMessageW, ShowWindow, TranslateMessage, CS_DBLCLKS,
@@ -16,6 +18,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WNDCLASSW,
     WS_CHILD, WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
 };
+
+const WM_POINTERDOWN: u32 = 0x0246;
+const WM_POINTERUP: u32 = 0x0247;
+static POINTER_MARK: AtomicBool = AtomicBool::new(false);
 
 const IDC_EDIT: isize = 1001;
 const IDC_BTN: isize = 1002;
@@ -37,6 +43,14 @@ const TBM_SETTICFREQ: u32 = 0x0414;
 
 unsafe extern "system" fn hit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
+        WM_POINTERDOWN if POINTER_MARK.load(Ordering::Relaxed) => {
+            append_line("PEN:DOWN");
+            LRESULT(0)
+        }
+        WM_POINTERUP if POINTER_MARK.load(Ordering::Relaxed) => {
+            append_line("PEN:CLICK");
+            LRESULT(0)
+        }
         WM_LBUTTONDOWN => {
             append_line("MDOWN");
             LRESULT(0)
@@ -277,13 +291,24 @@ fn title_from_args() -> String {
 
 fn main() -> anyhow::Result<()> {
     dump_env();
+    let silent = std::env::args().any(|a| a == "--silent-class");
+    POINTER_MARK.store(silent, Ordering::Relaxed);
+    if silent {
+        unsafe {
+            let _ = EnableMouseInPointer(true);
+        }
+    }
+    let mut main_class: Vec<u16> = if silent { "Chrome_WidgetWin_1" } else { "CuaTestPad" }
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     unsafe {
         let hinstance = GetModuleHandleW(PCWSTR::null()).unwrap_or_default();
         let wc = WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
             lpfnWndProc: Some(wndproc),
             hInstance: windows::Win32::Foundation::HINSTANCE(hinstance.0),
-            lpszClassName: w!("CuaTestPad"),
+            lpszClassName: PCWSTR(main_class.as_mut_ptr()),
             ..Default::default()
         };
         RegisterClassW(&wc);
@@ -300,7 +325,7 @@ fn main() -> anyhow::Result<()> {
         title_w.push(0);
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
-            w!("CuaTestPad"),
+            PCWSTR(main_class.as_ptr()),
             PCWSTR(title_w.as_ptr()),
             WS_OVERLAPPEDWINDOW | WINDOW_STYLE(WS_VISIBLE.0),
             CW_USEDEFAULT, CW_USEDEFAULT, 660, 520,

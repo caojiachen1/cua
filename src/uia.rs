@@ -1379,6 +1379,54 @@ fn click_element_rect(el: &UIElement, top: HWND, double: bool, right: bool) -> R
     ))
 }
 
+/// Background pixel click: resolve the UIA element under the screen point and
+/// invoke a left-single semantic pattern. The hit must belong to the requested
+/// top-level window; a hit on an occluder or a raw node without a runtime id
+/// returns `Ok(None)` so the caller can try the system-queue pen rung or
+/// PostMessage. A pattern that exists but fails is an error: silently falling
+/// through could click the same point twice.
+pub fn click_at_point_background(hwnd: HWND, x: i32, y: i32) -> Result<Option<String>> {
+    let hit = element_at_point(x, y)?;
+    let root = crate::win::root_window(hwnd);
+    if hit.root_hwnd == 0 || hit.root_hwnd != root.0 as isize || hit.rid.is_empty() {
+        return Ok(None);
+    }
+    let Ok(el) = find_by_rid(hwnd, &hit.rid) else {
+        return Ok(None);
+    };
+    let label = if hit.name.trim().is_empty() { hit.ctype.as_str() } else { hit.name.as_str() };
+    if let Ok(p) = el.get_pattern::<UIInvokePattern>() {
+        p.invoke()
+            .map_err(|e| anyhow!("UIA pixel Invoke failed for '{}': {e}", label))?;
+        return Ok(Some(format!(
+            "invoked '{label}' at ({x},{y}) via UIA pixel hit-test (background; no focus change)"
+        )));
+    }
+    if let Ok(p) = el.get_pattern::<UITogglePattern>() {
+        p.toggle()
+            .map_err(|e| anyhow!("UIA pixel Toggle failed for '{}': {e}", label))?;
+        let state = toggle_state(&el).unwrap_or_else(|| "?".into());
+        return Ok(Some(format!(
+            "toggled '{label}' at ({x},{y}) via UIA pixel hit-test (now {state}; background)"
+        )));
+    }
+    if let Ok(p) = el.get_pattern::<UISelectionItemPattern>() {
+        p.select()
+            .map_err(|e| anyhow!("UIA pixel Select failed for '{}': {e}", label))?;
+        return Ok(Some(format!(
+            "selected '{label}' at ({x},{y}) via UIA pixel hit-test (background)"
+        )));
+    }
+    if let Ok(p) = el.get_pattern::<UILegacyIAccessiblePattern>() {
+        if p.do_default_action().is_ok() {
+            return Ok(Some(format!(
+                "invoked '{label}' at ({x},{y}) via LegacyIAccessible pixel hit-test (background)"
+            )));
+        }
+    }
+    Ok(None)
+}
+
 /// Background click (`--background --index`): a11y patterns never move focus, and when
 /// the element has none the gesture degrades to *message-level* input at the element's
 /// rectangle instead of the real pointer a foreground click would steal.

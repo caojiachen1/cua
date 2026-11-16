@@ -2,15 +2,15 @@
 
 Rust CLI for driving Windows desktop apps: UIA accessibility tree + screenshots, a11y-first
 actions, real `SendInput`, message-level background input, a hidden-desktop sandbox for true
-background control, browser control bridged to UBB, screen recording, and JSON action
-receipts with safety guards.
+background control, a Windows Child Session backend for real input in a second session, browser
+control bridged to UBB, screen recording, and JSON action receipts with safety guards.
 
 ## Install
 
 Needs Windows 10/11 x64, Rust (MSVC), CMake/C++ build tools (for the PaddleOCR native
-dependency), and PowerShell 5.1+. The first perception build downloads the ONNX Runtime
-native runtime. Browser tasks need the `ubb` CLI and its Edge extension connected
-(`cua browser status` → `extension: true`).
+dependency), PowerShell 5.1+, and the .NET SDK (builds the optional child-session host).
+The first perception build downloads the ONNX Runtime native runtime. Browser tasks need the
+`ubb` CLI and its Edge extension connected (`cua browser status` → `extension: true`).
 
 ```powershell
 git clone https://github.com/caojiachen1/cua.git
@@ -44,6 +44,17 @@ cua select-add --window App --index 4                   # multi-select: also sel
 cua ocr --window Notepad                                # local Windows OCR; also --screen/--file
 cua ocr --file "$env:TEMP\shot.png" --max-lines 50
 cua sandbox start --exe D:\app.exe                     # run and control on an invisible desktop
+cua session setup                                      # child session: one-time admin; sign out/in
+cua session start                                      # child session + startup isolation + read-only viewer
+cua session start --keep-startup                       # allow child-session startup apps
+cua session login                                      # optional: save Windows password for PIN/Hello logon
+cua session start --hide                               # background; no viewer
+cua session view                                       # reopen the viewer from the CLI (tray icon also works)
+cua session takeover                                   # user takes over the mouse/keyboard
+cua child state --window Notepad                       # any normal command inside the child session
+cua child edge https://example.com                      # independent CuaEdge profile in the child session
+cua child edge --automation                             # + --force-renderer-accessibility for UIA
+cua child edge --status                                 # Edge path, profile, lock holders
 cua launch --exe "C:\Windows\System32\msinfo32.exe" --cwd D:\    # env sanitized; opens in the background
 cua launch --exe app.exe --foreground                   # opt in to raising the new window
 cua launch --exe app.exe --minimized                    # start minimized, still no focus change
@@ -74,6 +85,79 @@ Core properties ride a UIA cache request bundled into the walk (~1.6× faster; `
 opts out). Every command accepts `--observation-id <id>` to resolve `--index` against that
 immutable snapshot — a wrong id fails instead of silently re-observing. Screenshots report a
 graded `status` (`captured` / `suspected_black` / `no_pixels` / `capture_failed`).
+
+## Child-session Edge (independent profile)
+
+The user's Edge profile can only be open in one Windows session at a time. For browser work
+inside the child session, use `cua child edge`: it launches a real Edge window in the child
+desktop with a separate, persistent **CuaEdge** profile
+(`%LOCALAPPDATA%\cua\browser\CuaEdge`), so the user's own Edge, tabs and focus stay untouched.
+
+```powershell
+cua child edge https://example.com        # launch / open a new window in the child session
+cua child edge --automation               # add --force-renderer-accessibility for a UIA-friendly tree
+cua child edge --cdp                      # opt-in dedicated CDP on a random 127.0.0.1 port
+cua child state --window "Microsoft Edge" # then drive it with the normal UIA commands
+cua child edge --status                   # Edge path, profile, lock holders (PID/session)
+cua child edge --fresh-profile            # throwaway profile under %TEMP% (testing)
+cua session edge --sign-in https://example.com  # main session: one-time CuaEdge login; waits for every CuaEdge Edge process to exit
+cua session edge --status                 # same status, from the main-session command family
+cua session edge --delete-profile --confirm     # delete CuaEdge cookies/passwords (must not be in use)
+```
+
+The one-time login must run in the user's main session (`cua session edge --sign-in`,
+not inside the child). It opens a local sign-in instruction page plus up to 8 URLs and waits
+until every Edge process using the profile has exited (default timeout 30 min, `--timeout-min`
+up to 180). On timeout it reports the holder PIDs/sessions and never kills them. The profile is
+then reused by `cua child edge`.
+
+The profile is one-desktop-only. If Edge in another session already holds it, the command
+refuses with the holder PID/session instead of silently doing nothing; cua never kills that
+Edge. Repeated launches in the same session open a new window in the existing instance.
+`--profile <dir>` selects another profile. The CuaEdge profile is **not data-isolated**: Edge
+sync is allowed by default, and a new profile goes through Edge's normal first-run import
+(passwords, history, etc.) from the main profile where Edge offers it. CuaEdge may therefore
+contain the main Edge's local credentials and Microsoft account data; cua does not purge or
+block that data. In the 2026-11-16 test a new profile imported 462 saved logins (including all
+8 UJS entries) and 1,191 history rows; Edge did not import bookmarks or extensions, and only
+Bing/MSN account cookies, so "all data" means "whatever Edge imports or syncs", not a
+byte-for-byte clone. The independent user-data-dir exists only so Edge's single-profile-per-
+desktop lock does not block the main browser; use a separate Windows account or VM when real
+isolation is required. `--disable-background-mode` is still passed so no windowless browser
+holds the profile.
+
+Autofill: Edge's normal password autofill is available from imported or account-synced
+credentials. If a password is missing, let Edge save it in the CuaEdge sign-in window or import
+browser data via Edge settings. Windows Hello may still ask for verification. `cua browser`
+remains the UBB bridge to the user's own browser and is not used for the child Edge.
+
+**Sync note (measured 2026-11-16):** cloud sync does not upload a profile's local passwords by
+itself. The main Edge profile had ~453 local passwords while the Microsoft account had 0, and
+the main Edge preference `sync.keep_everything_synced` was false. To cloud-sync, open the main
+Edge Settings → Profiles → Sync, enable Sync and Passwords (or "keep everything synced"), wait
+for the upload, then enable sync in CuaEdge; it will download them. On one machine Edge's
+first-run import already copies the main profile's local passwords into CuaEdge, so autofill
+works without cloud sync.
+
+The default `CuaEdge` profile is persistent: create it when missing and reuse it on later
+`cua edge`/`cua child edge` runs (`cua edge --status` shows the path). Do not delete a profile
+just because a test finished; use `--fresh-profile` for a deliberate from-zero run and
+`--delete-profile --confirm` only when the user asks to erase it.
+
+`--cdp` is opt-in and adds a dedicated DevTools endpoint on a random `127.0.0.1` port (no
+Playwright dependency). The launch receipt and `cua edge --status` report `cdp.port`,
+`cdp.browser_ws`, the Edge version and the `/json/list` targets; the endpoint exists only while
+Edge runs and is never exposed to the LAN. CDP has no authentication: while it is open, any
+process running as the same Windows user can control this browser. Use it only on the CuaEdge
+profile and only when structured automation is actually needed; UIA remains the default.
+
+The child-session viewer integrates the same commands: its top bar has **子会话 Edge** (also in
+the tray menu), and **设置 → CuaEdge** shows the profile path, Edge version, lock holders and
+CDP endpoint, with buttons to open the child Edge, refresh, back up the profile, or delete it.
+The host merges the main-session and child-agent views, so a non-elevated viewer still sees the
+child session's holders; backup/delete refuse while any Edge is using the profile. A profile
+backup contains cookies and saved passwords and stays under the same user data directory, so
+treat it like the profile itself.
 
 ## Perception (PaddleOCR + OmniParser visuals)
 

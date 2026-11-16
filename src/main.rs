@@ -4,12 +4,16 @@
 // ZCode (a11y-first, strategy auto|a11y|event, action receipts, background observation),
 // + sandbox hidden-desktop executor for true background control.
 mod action;
+mod agent;
+mod background;
 mod capture;
+mod edge;
 mod input;
 mod ocr;
 mod perception;
 mod rec;
 mod sandbox;
+mod session;
 mod ubb;
 mod uia;
 mod util;
@@ -19,7 +23,7 @@ use anyhow::{anyhow, bail, Result};
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 
-use action::{ActionOutcome, ActionRequest, InputMode};
+use action::{ActionOutcome, ActionRefusal, ActionReport, ActionRequest, Delivery, InputMode};
 use util::{Receipt, SafetyConfig};
 use win::{resolve_window, WinInfo};
 
@@ -144,10 +148,109 @@ struct Cli {
     observation_id: Option<String>,
 }
 
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum PolicyMode {
+    /// Deny list enforced (default)
+    Standard,
+    /// Every application is allowed; the deny list is not enforced
+    Full,
+}
+
+impl PolicyMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            PolicyMode::Standard => "standard",
+            PolicyMode::Full => "full",
+        }
+    }
+}
+
+#[derive(Subcommand)]
+pub(crate) enum SessionOp {
+    /// One-time administrator setup: enable Windows Child Sessions.
+    /// Sign out of Windows and sign back in afterwards.
+    Setup {
+        /// Also turn on the Remote Desktop host (security-relevant; explicit opt-in).
+        #[arg(long)]
+        enable_rdp: bool,
+    },
+    /// Start a child session (same user, files and account).
+    Start {
+        /// Kept for compatibility; the read-only viewer now opens by default.
+        #[arg(long, hide = true)]
+        view: bool,
+        /// Do not open the viewer; keep the session in the background.
+        #[arg(long)]
+        hide: bool,
+        /// Open the viewer with keyboard/mouse enabled (no read-only mask).
+        #[arg(long)]
+        interactive: bool,
+        /// Keep the current user's startup apps enabled in the child session.
+        #[arg(long)]
+        keep_startup: bool,
+        #[arg(long)]
+        width: Option<u32>,
+        #[arg(long)]
+        height: Option<u32>,
+    },
+    /// Save the Windows password used for child-session automatic logon.
+    /// Stored in Windows Credential Manager, never in cua state or logs.
+    Login,
+    /// Delete the saved child-session password.
+    Logout,
+    /// Stop the child session and sign it out (closes its apps).
+    Stop,
+    /// Show host/session/agent/viewer state.
+    Status,
+    /// CuaEdge browser (independent profile): one-time sign-in in the main session,
+    /// status, or delete. Not available inside the child session.
+    Edge {
+        /// Open the CuaEdge profile in the main session for a one-time sign-in;
+        /// waits until every Edge process using it has exited
+        #[arg(long)]
+        sign_in: bool,
+        /// Show Edge path, profile, lockfile and holder processes
+        #[arg(long)]
+        status: bool,
+        /// Delete the CuaEdge profile (requires --confirm; must not be in use)
+        #[arg(long)]
+        delete_profile: bool,
+        /// Required with --delete-profile
+        #[arg(long)]
+        confirm: bool,
+        /// Extra URL tabs to open next to the sign-in instructions (max 8)
+        #[arg(value_name = "URL")]
+        urls: Vec<String>,
+        /// Timeout for --sign-in in minutes
+        #[arg(long, default_value_t = 30)]
+        timeout_min: u64,
+    },
+    /// Show the read-only viewer (mask + Take over button).
+    View {
+        #[arg(long, help = "show with keyboard/mouse enabled (no mask)")]
+        interactive: bool,
+    },
+    /// Hide the viewer; the child session keeps running.
+    Hide,
+    /// Give the user keyboard/mouse control (hides the mask).
+    Takeover,
+    /// Return to read-only observation (shows the mask).
+    Release,
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Health & permission probe (Trae check_permissions)
     Check,
+    /// Show or switch the automation policy mode
+    Mode {
+        /// omit to print the current mode
+        #[arg(value_enum)]
+        mode: Option<PolicyMode>,
+        /// required to switch to full
+        #[arg(long)]
+        confirm: bool,
+    },
     /// List top-level windows/apps (Qoder list_apps / Trae list_apps / ZCode listApps)
     Apps {
         #[arg(long)]
@@ -261,6 +364,10 @@ enum Cmd {
         strategy: String,
         #[arg(long, help = "deliver via window messages instead of real input (no focus change)")]
         background: bool,
+        #[arg(long, help = "auto|background|foreground; background never moves focus/cursor and refuses with background_unavailable when no safe route exists")]
+        delivery: Option<String>,
+        #[arg(long, help = "consume the shot_id after a successful coordinate action (one-use capture)")]
+        consume_shot: bool,
         #[arg(long)]
         record: Option<String>,
         #[arg(long)]
@@ -668,11 +775,47 @@ enum Cmd {
         #[command(subcommand)]
         op: SandboxOp,
     },
+    /// Windows Child Session: a second real session (same files/account, own input)
+    Session {
+        #[command(subcommand)]
+        op: SessionOp,
+    },
+    /// Internal: child-session agent (named pipe server inside the child)
+    #[command(name = "__agent", hide = true)]
+    Agent {
+        #[arg(long)]
+        data_dir: Option<String>,
+    },
     /// Browser control bridged to UBB (the user's own Edge/Chrome); `browser help` lists tools
     Browser {
         /// ubb tool name + JSON params, e.g. `tab.create {"url":"example.com"}`
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         rest: Vec<String>,
+    },
+    /// Independent Edge for this Windows session (CuaEdge profile). In the child
+    /// session use `cua child edge`; the user's own Edge profile is never touched.
+    Edge {
+        /// New-window URL (max 8; Chromium switches are not accepted here)
+        #[arg(value_name = "URL")]
+        urls: Vec<String>,
+        /// Use a throwaway profile under %TEMP% instead of the persistent CuaEdge profile
+        #[arg(long, conflicts_with = "profile")]
+        fresh_profile: bool,
+        /// Override the CuaEdge profile directory
+        #[arg(long)]
+        profile: Option<String>,
+        /// Add --force-renderer-accessibility for a more stable first UIA pass
+        #[arg(long)]
+        automation: bool,
+        /// Enable a dedicated CDP endpoint on a random 127.0.0.1 port
+        #[arg(long)]
+        cdp: bool,
+        /// Show Edge/profile/lock state without launching
+        #[arg(long)]
+        status: bool,
+        /// Wait this long for the launched Edge to take the profile (0 = do not wait)
+        #[arg(long, default_value_t = 10000)]
+        wait_ms: u64,
     },
     /// Screen recording (JPEG frames -> mp4, or an HTML player when ffmpeg is missing)
     Rec {
@@ -1065,6 +1208,12 @@ fn main() {
         .name("cua-main".into())
         .stack_size(16 * 1024 * 1024)
         .spawn(|| {
+            // `cua child ...` / `cua --child ...` is a proxy, so it must not be
+            // parsed by the main-session CLI. Everything else keeps its old shape.
+            let raw: Vec<String> = std::env::args().collect();
+            if let Some(code) = session::maybe_child(&raw) {
+                return code;
+            }
             let cli = Cli::parse();
             if let Some(id) = &cli.observation_id {
                 util::set_observation_override(id);
@@ -1078,8 +1227,13 @@ fn main() {
 
 fn dispatch(cmd: Cmd) -> i32 {
     let r: Result<i32> = (|| {
+        let head_cfg = util::load_config();
+        if head_cfg.full_mode {
+            eprintln!("warning: cua full mode is active — the application deny list is NOT enforced");
+        }
         match cmd {
             Cmd::Check => cmd_check(),
+            Cmd::Mode { mode, confirm } => cmd_mode(mode, confirm),
             Cmd::Apps { all } => cmd_apps(all),
             Cmd::State { window, depth, no_shot, out, diff, redact, patterns, raw, perception, detail, ocr_profile, deadline_ms, stream } => {
                 if perception.is_some() || detail.is_some() || ocr_profile.is_some() || stream || deadline_ms.is_some() {
@@ -1115,8 +1269,8 @@ fn dispatch(cmd: Cmd) -> i32 {
             Cmd::Hover { window, index, x, y, shot_id, background, record } => {
                 cmd_hover(window, index, x, y, shot_id, background, record)
             }
-            Cmd::Click { window, index, x, y, shot_id, right, double, strategy, background, record, sandbox } => {
-                cmd_click(window, index, x, y, shot_id, right, double, &strategy, background, record, sandbox)
+            Cmd::Click { window, index, x, y, shot_id, right, double, strategy, background, delivery, consume_shot, record, sandbox } => {
+                cmd_click(window, index, x, y, shot_id, right, double, &strategy, background, delivery, consume_shot, record, sandbox)
             }
             Cmd::Type { text, window, index, background, record, sandbox } => {
                 cmd_type(&text, window, index, background, record, sandbox)
@@ -1208,7 +1362,20 @@ fn dispatch(cmd: Cmd) -> i32 {
             Cmd::Batch { file, continue_on_error } => cmd_batch(&file, continue_on_error),
             Cmd::Replay { name, verify } => cmd_replay(&name, verify),
             Cmd::Sandbox { op } => sandbox::dispatch(op),
+            Cmd::Session { op } => session::dispatch(op),
+            Cmd::Agent { data_dir } => agent::run(data_dir),
             Cmd::Browser { rest } => ubb::cmd_browser(&rest),
+            Cmd::Edge { urls, fresh_profile, profile, automation, cdp, status, wait_ms } => {
+                edge::cmd_edge(edge::EdgeOptions {
+                    urls,
+                    fresh_profile,
+                    profile,
+                    automation,
+                    cdp,
+                    status,
+                    wait_ms,
+                })
+            }
             Cmd::Rec { op } => match op {
                 RecOp::Start { window, fps, out, max_seconds } => rec::cmd_start(window, fps, out, max_seconds),
                 RecOp::Stop { out, keep_frames } => rec::cmd_stop(out, keep_frames),
@@ -1318,17 +1485,20 @@ where
 
 /// Typed variant: the input mode is an explicit part of the request instead of a
 /// pair of booleans/strings interpreted differently by each command.
-fn guarded_action_req<F>(
+fn guarded_action_req<F, R>(
     req: ActionRequest,
     target_of: impl Fn() -> Result<Target>,
     pre: impl Fn(&SafetyConfig, &Target) -> Result<(), String>,
     f: F,
 ) -> Result<i32>
 where
-    F: FnOnce(&Target) -> Result<(String, Option<String>)>,
+    F: FnOnce(&Target) -> Result<R>,
+    R: Into<ActionReport>,
 {
     let started = std::time::Instant::now();
     let cfg = util::load_config();
+    let mut report: Option<ActionReport> = None;
+    let mut refusal: Option<ActionRefusal> = None;
     let (target, outcome) = match target_of() {
         Err(e) => (Value::Null, ActionOutcome::failed(format!("{e}"))),
         Ok(t) => {
@@ -1337,8 +1507,20 @@ where
                 (tj, ActionOutcome::refused(reason))
             } else {
                 match f(&t) {
-                    Ok((detail, sid)) => (tj, ActionOutcome::ok(detail, sid)),
-                    Err(e) => (tj, ActionOutcome::failed(format!("{e:#}"))),
+                    Ok(result) => {
+                        let r = result.into();
+                        let outcome = ActionOutcome::ok(r.detail.clone(), r.state_id.clone());
+                        report = Some(r);
+                        (tj, outcome)
+                    }
+                    Err(e) => match e.downcast_ref::<ActionRefusal>() {
+                        Some(r) => {
+                            let outcome = ActionOutcome::refused(r.detail.clone());
+                            refusal = Some(r.clone());
+                            (tj, outcome)
+                        }
+                        None => (tj, ActionOutcome::failed(format!("{e:#}"))),
+                    },
                 }
             }
         }
@@ -1346,7 +1528,38 @@ where
     let mut receipt = Receipt::new(&req.cmd);
     receipt.target = target;
     receipt.input_mode = Some(req.input_mode.as_str().to_string());
+    receipt.delivery = Some(req.delivery.as_str().to_string());
+    let inferred_delivery = if req.input_mode.is_background() {
+        "background"
+    } else if req.input_mode.is_a11y_only() {
+        "a11y"
+    } else if req.delivery.is_background() {
+        "background"
+    } else {
+        "foreground"
+    };
+    receipt.actual_delivery = report
+        .as_ref()
+        .and_then(|r| r.actual_delivery.clone())
+        .or_else(|| refusal.as_ref().map(|_| inferred_delivery.to_string()))
+        .or_else(|| Some(inferred_delivery.to_string()));
+    receipt.route = report
+        .as_ref()
+        .and_then(|r| r.route.clone())
+        .or_else(|| refusal.as_ref().and_then(|r| r.route.clone()));
+    receipt.effect = report.as_ref().and_then(|r| r.effect.clone());
+    receipt.code = refusal
+        .as_ref()
+        .map(|r| r.code.clone())
+        .or_else(|| report.as_ref().and_then(|r| r.code.clone()));
+    receipt.suggestion = refusal
+        .as_ref()
+        .and_then(|r| r.suggestion.clone())
+        .or_else(|| report.as_ref().and_then(|r| r.suggestion.clone()));
     outcome.apply(&mut receipt);
+    if receipt.status == "ok" && req.consume_shot {
+        util::consume_last_state();
+    }
     receipt.elapsed_ms = Some(started.elapsed().as_millis());
     let sig_after = if receipt.status == "ok" {
         receipt
@@ -1406,6 +1619,51 @@ fn sandbox_recorded(code: i32, cmd: &str, record: &Option<String>) -> Result<i32
 
 // ---------------- observation commands ----------------
 
+fn mode_status(cfg: &SafetyConfig, changed: Option<bool>) -> Value {
+    let mode = if cfg.full_mode { PolicyMode::Full } else { PolicyMode::Standard };
+    let mut out = json!({
+        "tool": "cua",
+        "cmd": "mode",
+        "mode": mode.as_str(),
+        "full_mode": cfg.full_mode,
+        "deny_processes_enforced": !cfg.full_mode,
+        "deny_processes": cfg.deny_processes,
+        "config_path": util::config_path().to_string_lossy(),
+    });
+    if let Some(c) = changed {
+        out["changed"] = json!(c);
+    }
+    if cfg.full_mode {
+        out["warning"] = json!("every application is allowed; coordinate-shot, close/alt+f4 confirm and Windows-key guards still apply");
+    }
+    out
+}
+
+fn cmd_mode(mode: Option<PolicyMode>, confirm: bool) -> Result<i32> {
+    let current = util::load_config();
+    let Some(target) = mode else {
+        println!("{}", serde_json::to_string_pretty(&mode_status(&current, None))?);
+        return Ok(0);
+    };
+    let enable = matches!(target, PolicyMode::Full);
+    if enable && !confirm {
+        let out = json!({
+            "tool": "cua",
+            "cmd": "mode",
+            "status": "refused",
+            "mode": "standard",
+            "detail": "switching to full mode requires --confirm: cua mode full --confirm",
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(2);
+    }
+    let changed = current.full_mode != enable;
+    util::set_full_mode(enable)?;
+    let cfg = util::load_config();
+    println!("{}", serde_json::to_string_pretty(&mode_status(&cfg, Some(changed)))?);
+    Ok(0)
+}
+
 fn cmd_check() -> Result<i32> {
     let (vx, vy, vw, vh, pw, ph) = win::screen_metrics();
     let elevated = win::is_elevated();
@@ -1427,6 +1685,9 @@ fn cmd_check() -> Result<i32> {
         "sandbox": sandbox::status(),
         "browser": {"backend": "ubb", "cli": ubb_cli},
         "safety": {
+            "mode": if cfg.full_mode { "full" } else { "standard" },
+            "full_mode": cfg.full_mode,
+            "deny_processes_enforced": !cfg.full_mode,
             "deny_processes": cfg.deny_processes,
             "require_shot_id_for_coords": cfg.require_shot_id_for_coords,
             "levels": cfg.levels,
@@ -2271,7 +2532,8 @@ fn cmd_hover(
     let argv = record_argv(&record);
     let mode = InputMode::from_background(background);
     guarded_action_req(
-        ActionRequest::new("hover", argv, &record, mode),
+        ActionRequest::new("hover", argv, &record, mode)
+            .with_delivery(if background { Delivery::Background } else { Delivery::Auto }),
         || {
             if let Some(sel) = &window {
                 return resolve_target(sel);
@@ -2333,17 +2595,51 @@ fn cmd_click(
     double: bool,
     strategy: &str,
     background: bool,
+    delivery: Option<String>,
+    consume_shot: bool,
     record: Option<String>,
     sandbox: bool,
 ) -> Result<i32> {
-    let mode = InputMode::parse(strategy, background)?;
+    let requested = delivery.as_deref().map(Delivery::parse).transpose()?;
     if sandbox {
+        if requested.is_some() {
+            bail!("--delivery applies to the active desktop; --sandbox uses its own message-level/UIA contract");
+        }
         let code = sandbox::cmd_click(window, index, x, y, shot_id, right, double)?;
         return sandbox_recorded(code, "click", &record);
     }
+    if background && requested.is_some_and(|d| d != Delivery::Background) {
+        bail!("--background conflicts with --delivery {}", requested.unwrap().as_str());
+    }
+    let delivery = requested.unwrap_or(if background { Delivery::Background } else { Delivery::Auto });
+    // The new UIA-pixel/pen ladder is opt-in: legacy --background keeps its
+    // message-level contract, while --delivery background requests the stronger
+    // background guarantee and its structured refusals.
+    let use_background_ladder = requested == Some(Delivery::Background);
+    let mode = if requested.is_none() {
+        InputMode::parse(strategy, background)?
+    } else {
+        match delivery {
+            Delivery::Auto => InputMode::parse(strategy, background)?,
+            Delivery::Background => match strategy.to_ascii_lowercase().as_str() {
+                "a11y" => InputMode::BackgroundA11y,
+                "event" => bail!(
+                    "--delivery background conflicts with strategy=event (event means real input); use --delivery foreground or strategy=auto"
+                ),
+                _ => InputMode::Background,
+            },
+            Delivery::Foreground => match strategy.to_ascii_lowercase().as_str() {
+                "a11y" => InputMode::A11y,
+                _ => InputMode::Event,
+            },
+        }
+    };
+    let consume_shot = consume_shot && index.is_none();
     let argv = record_argv(&record);
     guarded_action_req(
-        ActionRequest::new("click", argv, &record, mode),
+        ActionRequest::new("click", argv, &record, mode)
+            .with_delivery(delivery)
+            .with_consume_shot(consume_shot),
         || {
             if let Some(sel) = &window {
                 return resolve_target(sel);
@@ -2379,7 +2675,9 @@ fn cmd_click(
                             InputMode::Event => uia::click_element_event(t.hwnd, &rid, double, right)?,
                             InputMode::Auto => uia::click_element(t.hwnd, &rid, double, right)?,
                         };
-                        Ok((d, Some(util::new_state_id())))
+                        Ok(ActionReport::new(d, Some(util::new_state_id()))
+                            .with_route("uia")
+                            .with_effect("unverifiable"))
                     }
                     ElementTarget::Rect { rect, ctype, name } => {
                         if mode.is_a11y_only() {
@@ -2389,11 +2687,23 @@ fn cmd_click(
                         if mode.is_background() {
                             let root = win::root_window(t.hwnd);
                             input::post_click(root, cx, cy, right, double)?;
-                            Ok((format!("no runtime id; {via}, clicked ({cx},{cy}) via message-level input"), Some(util::new_state_id())))
+                            Ok(ActionReport::new(
+                                format!("no runtime id; {via}, clicked ({cx},{cy}) via message-level input"),
+                                Some(util::new_state_id()),
+                            )
+                            .with_delivery("background")
+                            .with_route("post_message")
+                            .with_effect("unverifiable"))
                         } else {
                             win::ensure_point_hits(t.hwnd, cx, cy)?;
                             input::click(cx, cy, right, double)?;
-                            Ok((format!("no runtime id; {via}, clicked ({cx},{cy})"), Some(util::new_state_id())))
+                            Ok(ActionReport::new(
+                                format!("no runtime id; {via}, clicked ({cx},{cy})"),
+                                Some(util::new_state_id()),
+                            )
+                            .with_delivery("foreground")
+                            .with_route("send_input")
+                            .with_effect("unverifiable"))
                         }
                     }
                 }
@@ -2403,20 +2713,104 @@ fn cmd_click(
                 }
                 let (x, y) = (x.ok_or_else(|| anyhow!("--index or --x/--y required"))?, y.ok_or_else(|| anyhow!("--y required"))?);
                 if mode.is_background() {
-                    let root = win::root_window(t.hwnd);
-                    input::post_click(root, x, y, right, double)?;
-                    Ok((
-                        format!("clicked ({x},{y}) via message-level input (background; focus untouched)"),
-                        Some(util::new_state_id()),
-                    ))
+                    background_click_coordinate(t, x, y, right, double, use_background_ladder)
                 } else {
                     win::ensure_point_hits(t.hwnd, x, y)?;
                     input::click(x, y, right, double)?;
-                    Ok((format!("clicked ({x},{y}) via event strategy"), Some(util::new_state_id())))
+                    Ok(ActionReport::new(
+                        format!("clicked ({x},{y}) via event strategy"),
+                        Some(util::new_state_id()),
+                    )
+                    .with_delivery("foreground")
+                    .with_route("send_input")
+                    .with_effect("unverifiable"))
                 }
             }
         },
     )
+}
+
+/// Coordinate background click. The explicit `--delivery background` contract
+/// tries a UIA pixel hit-test, then a system-queue pen injection for classes
+/// that silently drop posted input, and otherwise uses window messages. Legacy
+/// `--background` keeps the message-level path unchanged.
+fn background_click_coordinate(
+    t: &Target,
+    x: i32,
+    y: i32,
+    right: bool,
+    double: bool,
+    use_ladder: bool,
+) -> Result<ActionReport> {
+    let root = win::root_window(t.hwnd);
+    if !use_ladder {
+        input::post_click(root, x, y, right, double)?;
+        return Ok(ActionReport::new(
+            format!("clicked ({x},{y}) via message-level input (background; focus untouched)"),
+            Some(util::new_state_id()),
+        )
+        .with_delivery("background")
+        .with_route("post_message")
+        .with_effect("unverifiable"));
+    }
+
+    let class = background::target_class(root);
+
+    // a11y-first: a pixel click on an invokable control should use its pattern,
+    // not a synthetic pointer. Right/double have no pattern semantics.
+    if !right && !double {
+        match uia::click_at_point_background(root, x, y) {
+            Ok(Some(detail)) => {
+                return Ok(ActionReport::new(detail, Some(util::new_state_id()))
+                    .with_delivery("background")
+                    .with_route("uia_pixel")
+                    .with_effect("unverifiable"));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return Err(anyhow!(ActionRefusal::new(
+                    "background_unavailable",
+                    format!(
+                        "UIA pixel hit-test at ({x},{y}) failed for class '{class}': {e}"
+                    )
+                )
+                .with_route("uia_pixel")
+                .with_suggestion(
+                    "retry with --delivery foreground after confirming the target is visible"
+                )));
+            }
+        }
+    }
+
+    if background::would_be_silently_dropped(root, background::EventKind::MouseClick) {
+        return match background::inject_click(root, x, y, right, double) {
+            Ok(detail) => Ok(ActionReport::new(detail, Some(util::new_state_id()))
+                .with_delivery("background")
+                .with_route("pen")
+                .with_effect("unverifiable")),
+            Err(e) => Err(anyhow!(ActionRefusal::new(
+                "background_unavailable",
+                format!(
+                    "class '{class}' drops posted mouse input; synthetic pen injection at ({x},{y}) failed: {e}"
+                )
+            )
+            .with_route("pen")
+            .with_suggestion(
+                "retry with --delivery foreground; if the target is elevated, run cua elevated"
+            ))),
+        };
+    }
+
+    input::post_click(root, x, y, right, double)?;
+    Ok(ActionReport::new(
+        format!(
+            "clicked ({x},{y}) via message-level input (background; focus untouched; class '{class}')"
+        ),
+        Some(util::new_state_id()),
+    )
+    .with_delivery("background")
+    .with_route("post_message")
+    .with_effect("unverifiable"))
 }
 
 /// What a cached element index can be re-resolved to. Some providers (QQ Music's
@@ -2541,7 +2935,8 @@ fn cmd_type(
     }
     let mode = InputMode::from_background(background);
     guarded_action_req(
-        ActionRequest::new("type", argv, &record, mode),
+        ActionRequest::new("type", argv, &record, mode)
+            .with_delivery(if background { Delivery::Background } else { Delivery::Auto }),
         || match &window {
             Some(sel) => resolve_target(sel),
             None => {
@@ -2609,7 +3004,8 @@ fn cmd_key(
     let keys = keys.to_string();
     let mode = InputMode::from_background(background);
     guarded_action_req(
-        ActionRequest::new("key", argv, &record, mode),
+        ActionRequest::new("key", argv, &record, mode)
+            .with_delivery(if background { Delivery::Background } else { Delivery::Auto }),
         || match &window {
             Some(sel) => resolve_target(sel),
             None => {
@@ -2680,7 +3076,8 @@ fn cmd_scroll(
     let argv = record_argv(&record);
     let mode = InputMode::from_background(background);
     guarded_action_req(
-        ActionRequest::new("scroll", argv, &record, mode),
+        ActionRequest::new("scroll", argv, &record, mode)
+            .with_delivery(if background { Delivery::Background } else { Delivery::Auto }),
         || {
             let t = match &window {
                 Some(sel) => Some(resolve_target(sel)?),
@@ -2768,7 +3165,8 @@ fn cmd_drag(x1: i32, y1: i32, x2: i32, y2: i32, shot_id: Option<String>, backgro
     let argv = record_argv(&record);
     let mode = InputMode::from_background(background);
     guarded_action_req(
-        ActionRequest::new("drag", argv, &record, mode),
+        ActionRequest::new("drag", argv, &record, mode)
+            .with_delivery(if background { Delivery::Background } else { Delivery::Auto }),
         || {
             // target = window under start point
             let h = window_from_point(x1, y1)?;
@@ -3291,6 +3689,11 @@ fn cmd_launch(
     sandbox: bool,
 ) -> Result<i32> {
     if sandbox {
+        if let Some(reason) = crate::edge::child_launch_guard(exe) {
+            let r = Receipt::new("launch").refused(json!({ "exe": exe }), &reason);
+            r.print();
+            return Ok(r.exit_code());
+        }
         let code = sandbox::cmd_launch(exe, args)?;
         return sandbox_recorded(code, "launch", &record);
     }
@@ -3317,6 +3720,9 @@ fn cmd_launch(
                     "refused by safety policy: launching '{}' is on the no-negotiable deny list (matched '{d}')",
                     t.info.process
                 ));
+            }
+            if let Some(reason) = crate::edge::child_launch_guard(&t.info.process) {
+                return Err(reason);
             }
             Ok(())
         },

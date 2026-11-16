@@ -5,7 +5,7 @@ $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
 if (-not $root) { $root = Split-Path -Parent $MyInvocation.MyCommand.Path }
 
-Write-Host "== [1/4] cargo build --release" -ForegroundColor Cyan
+Write-Host "== [1/5] cargo build --release" -ForegroundColor Cyan
 # A resident perception service locks the old binary on Windows; stop it first.
 if (Test-Path "$root\bin\cua.exe") { & "$root\bin\cua.exe" perception serve --stop 2>$null | Out-Null }
 # GPU choices come from the agent's install-time question (SKILL.md "Installing
@@ -30,17 +30,38 @@ if ($features.Count -gt 0) {
 if ($LASTEXITCODE -ne 0) { Pop-Location; throw "cargo build failed" }
 Pop-Location
 
-Write-Host "== [2/4] copy binaries to bin\" -ForegroundColor Cyan
+Write-Host "== [2/5] build child-session host" -ForegroundColor Cyan
+$hostProj = Join-Path $root "tools\session-host\CuaSessionHost.csproj"
+if (Test-Path $hostProj) {
+    if (Get-Command dotnet -ErrorAction SilentlyContinue) {
+        & dotnet build $hostProj -c Release -o (Join-Path $root "target\session-host") | Out-Host
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "   warning: child-session host build failed; `cua session` will be unavailable" -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "   warning: dotnet SDK not found; `cua session` will be unavailable" -ForegroundColor Yellow
+    }
+} else {
+    Write-Host "   warning: tools\session-host missing; `cua session` will be unavailable" -ForegroundColor Yellow
+}
+
+Write-Host "== [3/5] copy binaries to bin\" -ForegroundColor Cyan
 New-Item -ItemType Directory -Force -Path "$root\bin" | Out-Null
 Copy-Item "$root\target\release\cua.exe" "$root\bin\cua.exe" -Force
 Copy-Item "$root\target\release\testpad.exe" "$root\bin\testpad.exe" -Force
+$sessionHost = Join-Path $root "target\session-host\cua-session-host.exe"
+if (Test-Path $sessionHost) {
+    Copy-Item $sessionHost "$root\bin\cua-session-host.exe" -Force
+    $sessionHostConfig = Join-Path $root "target\session-host\cua-session-host.exe.config"
+    if (Test-Path $sessionHostConfig) { Copy-Item $sessionHostConfig "$root\bin\cua-session-host.exe.config" -Force }
+}
 # ONNX Runtime DirectML (Florence GPU path) and any runtime DLL copied by ort.
 foreach ($dll in @("DirectML.dll", "onnxruntime.dll")) {
     $src = Join-Path "$root\target\release" $dll
     if (Test-Path $src) { Copy-Item $src (Join-Path "$root\bin" $dll) -Force }
 }
 
-Write-Host "== [3/4] install skill to ~\.agents\skills\cua" -ForegroundColor Cyan
+Write-Host "== [4/5] install skill to ~\.agents\skills\cua" -ForegroundColor Cyan
 $skillDir = Join-Path $env:USERPROFILE ".agents\skills\cua"
 New-Item -ItemType Directory -Force -Path $skillDir | Out-Null
 Copy-Item "$root\SKILL.md" "$skillDir\SKILL.md" -Force
@@ -51,7 +72,7 @@ if ($userPath -notlike "*$root\bin*") {
     Write-Host "   added '$root\bin' to user PATH (reopen shells to take effect)"
 }
 
-Write-Host "== [4/4] smoke test" -ForegroundColor Cyan
+Write-Host "== [5/5] smoke test" -ForegroundColor Cyan
 $ver = & "$root\bin\cua.exe" check | ConvertFrom-Json
 if ($ver.uia -ne "ok") { throw "UIA unavailable: $($ver | ConvertTo-Json -Compress)" }
 Write-Host ("   cua {0} ok — UIA ok, screen {1}x{2}" -f $ver.version, $ver.screen.primary[0], $ver.screen.primary[1]) -ForegroundColor Green
@@ -60,4 +81,6 @@ Write-Host ""
 Write-Host "Installed:" -ForegroundColor Green
 Write-Host "  CLI      : $root\bin\cua.exe"
 Write-Host "  Skill    : $skillDir\SKILL.md"
+Write-Host "  Session  : $root\bin\cua-session-host.exe"
 Write-Host "  Try      : cua apps | cua state --window Notepad | cua sandbox start --exe notepad"
+Write-Host "  Child    : cua session setup (admin once) -> sign out/in -> cua session start"

@@ -1,5 +1,5 @@
 // util.rs — receipts, cache/state-ids, safety policy (fusion of ZCode receipt schema + Qoder confirmation policy + Trae approval)
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -72,6 +72,27 @@ pub struct Receipt {
     /// auto | a11y | event | background | background-a11y (when the action has a mode)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_mode: Option<String>,
+    /// auto | background | foreground (requested delivery contract)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<String>,
+    /// background | foreground | a11y (what actually delivered the action)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actual_delivery: Option<String>,
+    /// uia_pixel | uia | pen | post_message | send_input | none
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+    /// verified | unverifiable
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effect: Option<String>,
+    /// machine-readable refusal code (e.g. background_unavailable)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// concrete next step for a refusal
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggestion: Option<String>,
+    /// standard | full; full records that the application deny list was not enforced
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safety_mode: Option<String>,
 }
 
 fn verification_default() -> String {
@@ -137,6 +158,13 @@ impl Receipt {
             verification: "not_requested".into(),
             evidence: "complete".into(),
             input_mode: None,
+            delivery: None,
+            actual_delivery: None,
+            route: None,
+            effect: None,
+            code: None,
+            suggestion: None,
+            safety_mode: Some(if load_config().full_mode { "full".into() } else { "standard".into() }),
         }
     }
     pub fn ok(mut self, target: serde_json::Value, detail: &str) -> Self {
@@ -216,6 +244,16 @@ pub fn save_last_state(state_id: &str, hwnd: isize, tree_sig: &str) {
 pub fn load_last_state() -> Option<serde_json::Value> {
     let p = ensure_data_dir().join("cache").join(scoped("last-state", "json"));
     std::fs::read(p).ok().and_then(|b| serde_json::from_slice(&b).ok())
+}
+
+/// Invalidate the freshness token after a successful coordinate action. The
+/// window is kept so the next observation can still be scoped; only the
+/// state_id that authorizes coordinates is cleared.
+pub fn consume_last_state() {
+    let hwnd = load_last_state()
+        .and_then(|v| v["hwnd"].as_i64())
+        .unwrap_or(0);
+    save_last_state("", hwnd as isize, "");
 }
 
 pub fn save_elements(hwnd: isize, elements: &serde_json::Value) -> std::path::PathBuf {
@@ -428,11 +466,15 @@ fn prune_observations_in(dir: &std::path::Path, keep: usize) {
 // ---------------- safety (Qoder no-negotiables + confirmation levels) ----------------
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
 pub struct SafetyConfig {
     pub deny_processes: Vec<String>,
     pub deny_key_modifiers: Vec<String>,
     pub require_shot_id_for_coords: bool,
     pub levels: std::collections::BTreeMap<String, String>, // action -> handoff|confirm|preapprove|none
+    /// Opt-in escape hatch: stop enforcing `deny_processes` for every command.
+    /// Coordinate-shot, Always-Confirm and Windows-key guards stay in force.
+    pub full_mode: bool,
 }
 
 impl Default for SafetyConfig {
@@ -461,6 +503,7 @@ impl Default for SafetyConfig {
             ]
             .into_iter()
             .collect(),
+            full_mode: false,
         }
     }
 }
@@ -486,6 +529,33 @@ pub fn load_config_json() -> serde_json::Value {
             serde_json::from_slice(&b).ok()
         })
         .unwrap_or_else(|| serde_json::json!({}))
+}
+
+pub fn config_path() -> std::path::PathBuf {
+    ensure_data_dir().join("config.json")
+}
+
+/// Toggle full mode while preserving every other key in config.json.
+/// A malformed or non-object config is never overwritten.
+pub fn set_full_mode(enabled: bool) -> Result<std::path::PathBuf> {
+    let p = config_path();
+    let mut raw: serde_json::Value = match std::fs::read(&p) {
+        Ok(b) => {
+            let b = b.strip_prefix(b"\xEF\xBB\xBF".as_slice()).unwrap_or(&b);
+            serde_json::from_slice(b).with_context(|| {
+                format!("{} is not valid JSON; refusing to overwrite it", p.display())
+            })?
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(anyhow::Error::new(e).context(format!("read {}", p.display()))),
+    };
+    raw.as_object_mut()
+        .with_context(|| format!("{} must contain a JSON object", p.display()))?
+        .insert("full_mode".into(), serde_json::Value::Bool(enabled));
+    let mut bytes = serde_json::to_vec_pretty(&raw)?;
+    bytes.push(b'\n');
+    std::fs::write(&p, bytes).with_context(|| format!("write {}", p.display()))?;
+    Ok(p)
 }
 
 pub fn process_image_name(pid: u32) -> Option<String> {
@@ -536,6 +606,9 @@ pub fn stripped_env_keys() -> Vec<String> {
 /// Covers bare names, file names, `.exe` stems and URI schemes (`ms-settings:display`),
 /// which is how Settings and other protected surfaces are actually opened.
 pub fn denied_token(cfg: &SafetyConfig, raw: &str) -> Option<String> {
+    if cfg.full_mode {
+        return None;
+    }
     let low = raw.to_ascii_lowercase();
     let mut tokens: Vec<String> = Vec::new();
     if let Some(pos) = low.find(':') {
@@ -565,6 +638,9 @@ pub fn denied_token(cfg: &SafetyConfig, raw: &str) -> Option<String> {
 
 /// Qoder no-negotiables: refuse automation of terminals / password managers / security settings.
 pub fn check_target_allowed(cfg: &SafetyConfig, pid: u32, hwnd: isize) -> Result<(), String> {
+    if cfg.full_mode {
+        return Ok(());
+    }
     if let Some(name) = process_image_name(pid) {
         let stem = name.trim_end_matches(".exe");
         for d in &cfg.deny_processes {
@@ -642,6 +718,32 @@ mod tests {
         assert!(ok.dispatched);
         assert_eq!(ok.verification, "not_requested");
         assert_eq!(ok.evidence, "complete");
+    }
+}
+
+#[cfg(test)]
+mod safety_tests {
+    use super::*;
+
+    #[test]
+    fn full_mode_bypasses_the_application_deny_list() {
+        let standard = SafetyConfig::default();
+        assert_eq!(denied_token(&standard, "control.exe").as_deref(), Some("control"));
+        assert_eq!(denied_token(&standard, "ms-settings:display").as_deref(), Some("ms-settings"));
+        assert_eq!(denied_token(&standard, "rundll32.exe").as_deref(), None);
+
+        let full = SafetyConfig { full_mode: true, ..SafetyConfig::default() };
+        assert!(denied_token(&full, "control.exe").is_none());
+        assert!(denied_token(&full, "ms-settings:display").is_none());
+        assert!(denied_token(&full, "C:\\Windows\\System32\\cmd.exe").is_none());
+    }
+
+    #[test]
+    fn partial_config_inherits_defaults() {
+        let cfg: SafetyConfig = serde_json::from_str(r#"{"full_mode":true}"#).unwrap();
+        assert!(cfg.full_mode);
+        assert!(cfg.deny_processes.len() >= 10);
+        assert!(cfg.require_shot_id_for_coords);
     }
 }
 
