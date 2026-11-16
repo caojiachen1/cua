@@ -59,9 +59,10 @@ namespace CuaSessionHost
             int x = Math.Max(0, (e.ToolStrip.Width - size.Width) / 2);
             // centre on the item row itself: TextRectangle is the text box, not
             // the row, and using it left the labels ~7px high.
-            // -2: the glyph box TextRenderer reports sits slightly low in the
-            // row (measured 8px above / 5px below); nudge so both gaps match.
-            int y = e.Item.Bounds.Y + Math.Max(0, (e.Item.Bounds.Height - size.Height) / 2) - 2;
+            // Item-local: the renderer's origin is this item's top-left, so
+            // Bounds.Y would push every row below the first one out of view.
+            // -2: TextRenderer's glyph box sits slightly low (measured 8/5).
+            int y = Math.Max(0, (e.Item.Height - size.Height) / 2) - 2;
             TextRenderer.DrawText(e.Graphics, e.Text, font, new Point(x, y), color,
                 TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding);
         }
