@@ -25,7 +25,6 @@ namespace CuaSessionHost
         private readonly FluentButton _mode;
         private readonly FluentButton _takeover;
         private readonly FluentButton _release;
-        private readonly FluentButton _hide;
         private readonly FluentButton _settings;
         private readonly FluentButton _edge;
         private readonly FluentButton _minimize;
@@ -132,7 +131,6 @@ namespace CuaSessionHost
 
             _takeover = new FluentButton { Text = "接管控制", Accent = true };
             _release = new FluentButton { Text = "释放控制", Accent = false, Visible = false };
-            _hide = new FluentButton { Text = "隐藏", Accent = false };
             _settings = new FluentButton { Text = "设置", Accent = false };
             _edge = new FluentButton { Text = "浏览器", Accent = false };
             _mode = new FluentButton { Text = "观察模式", Accent = false };
@@ -141,21 +139,21 @@ namespace CuaSessionHost
             {
                 Text = "\uE921",
                 Font = Theme.Icon(8f),
-                CornerRadius = 0,
+                CornerRadius = 8,
                 Ghost = true
             };
             _maximize = new FluentButton
             {
                 Text = "\uE922",
                 Font = Theme.Icon(8f),
-                CornerRadius = 0,
+                CornerRadius = 8,
                 Ghost = true
             };
             _close = new FluentButton
             {
                 Text = "\uE8BB",
                 Font = Theme.Icon(8f),
-                CornerRadius = 0,
+                CornerRadius = 8,
                 Ghost = true,
                 Danger = true
             };
@@ -163,14 +161,13 @@ namespace CuaSessionHost
             _tips.SetToolTip(_minimize, "最小化到任务栏");
             _tips.SetToolTip(_maximize, "最大化 / 还原");
             _tips.SetToolTip(_close, "隐藏到托盘（子会话继续运行）");
-            _tips.SetToolTip(_hide, "隐藏到托盘");
             _tips.SetToolTip(_settings, "子会话设置");
             _tips.SetToolTip(_edge, "在子会话中打开独立浏览器（CuaEdge / CuaChrome）");
             _tips.SetToolTip(_mode, "在 RDP（老式直连）与 VNC（自研抓屏）观察模式间切换");
 
             // 统一紧凑尺寸：同宽同高、小一号字体、圆角收紧
             // 尺寸统一交给 LayoutBar（规避 DPI 自动缩放不一致）；这里只设字体
-            foreach (var b in new FluentButton[] { _takeover, _release, _hide, _settings, _edge, _mode })
+            foreach (var b in new FluentButton[] { _takeover, _release, _settings, _edge, _mode })
             {
                 b.Font = Theme.Ui(8f);
             }
@@ -182,7 +179,6 @@ namespace CuaSessionHost
 
             _takeover.Click += delegate { SetViewOnly(false); };
             _release.Click += delegate { SetViewOnly(true); };
-            _hide.Click += delegate { HideViewer(); };
             _settings.Click += delegate { OpenSettings(); };
             _edge.Click += delegate { OpenChildEdge(); };
             _minimize.Click += delegate { MinimizeViewer(); };
@@ -197,7 +193,6 @@ namespace CuaSessionHost
             _bar.Controls.Add(_mode);
             _bar.Controls.Add(_takeover);
             _bar.Controls.Add(_release);
-            _bar.Controls.Add(_hide);
             _bar.Controls.Add(_minimize);
             _bar.Controls.Add(_maximize);
             _bar.Controls.Add(_close);
@@ -284,7 +279,6 @@ namespace CuaSessionHost
             int buttonHeight = Math.Max(30, (int)Math.Round(34 * _uiScale));
             _takeover.Size = new Size(Math.Max(96, (int)Math.Round(120 * _uiScale)), buttonHeight);
             _release.Size = _takeover.Size;
-            _hide.Size = new Size(Math.Max(60, (int)Math.Round(72 * _uiScale)), buttonHeight);
             _settings.Size = new Size(Math.Max(56, (int)Math.Round(68 * _uiScale)), buttonHeight);
             int iconWidth = Math.Max(32, (int)Math.Round(38 * _uiScale));
             _minimize.Size = new Size(iconWidth, buttonHeight);
@@ -347,13 +341,13 @@ namespace CuaSessionHost
             // 统一尺寸必须在布局时强制覆写：控件在构造期设置的 Size 会被
             // WinForms 按 DPI 逐个自动缩放，加入父容器的时机不同导致高低不一。
             int ubw = 0;
-            foreach (var b in new FluentButton[] { _takeover, _release, _hide, _settings, _edge, _mode })
+            foreach (var b in new FluentButton[] { _takeover, _release, _settings, _edge, _mode })
             {
                 ubw = Math.Max(ubw, TextRenderer.MeasureText(b.Text, b.Font).Width + 14);
             }
             int ubh = (int)Math.Round(25 * _uiScale);
             int wbw = (int)Math.Round(ubh * 1.15); // 左右钮（窗口控制）更窄
-            foreach (var b in new FluentButton[] { _takeover, _release, _hide, _settings, _edge, _mode })
+            foreach (var b in new FluentButton[] { _takeover, _release, _settings, _edge, _mode })
             {
                 b.Size = new Size(ubw, ubh);
             }
@@ -374,8 +368,6 @@ namespace CuaSessionHost
             right = _maximize.Left - gap;
             _minimize.Left = right - _minimize.Width;
             right = _minimize.Left - gap;
-            _hide.Left = right - _hide.Width;
-            right = _hide.Left - gap;
             _mode.Left = right - _mode.Width;
             right = _mode.Left - gap;
             FluentButton action = _viewOnly ? _takeover : _release;
@@ -389,7 +381,6 @@ namespace CuaSessionHost
             _close.Top = buttonTop;
             _maximize.Top = buttonTop;
             _minimize.Top = buttonTop;
-            _hide.Top = buttonTop;
             _mode.Top = buttonTop;
             _settings.Top = buttonTop;
             _edge.Top = buttonTop;
