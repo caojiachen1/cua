@@ -1018,6 +1018,28 @@ namespace CuaSessionHost
         }
 
         /// 设置对话框改动后同步托盘菜单的勾选状态
+        /// 子会话是否在运行（供设置对话框动态文案/立即生效用）
+        public bool IsChildRunning
+        {
+            get { return _childId.HasValue; }
+        }
+
+        /// 关闭子会话内的主会话 VNC 视图（tvnviewer）
+        public void CloseMainVnc()
+        {
+            try
+            {
+                foreach (var p in System.Diagnostics.Process.GetProcessesByName("tvnviewer"))
+                {
+                    if (_childId.HasValue && p.SessionId == _childId.Value)
+                    {
+                        p.Kill();
+                    }
+                }
+            }
+            catch { }
+        }
+
         public void SyncTrayToggleStates()
         {
             if (_menuAutoVnc != null)
@@ -1077,7 +1099,7 @@ namespace CuaSessionHost
             }
         }
 
-        private void StartMainVnc()
+        public void StartMainVnc()
         {
             try
             {
@@ -1215,6 +1237,12 @@ namespace CuaSessionHost
                 : "启动子会话";
             _menuStart.Enabled = !running;
             _menuRestart.Enabled = running;
+            if (_menuAutoVnc != null)
+            {
+                _menuAutoVnc.Text = running
+                    ? "立即打开主会话 VNC 视图（子会话已启动）"
+                    : "子会话启动时自动 VNC 到主会话";
+            }
         }
 
         private void UpdateMeta()

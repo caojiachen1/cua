@@ -108,6 +108,12 @@ namespace CuaSessionHost
             {
                 VncHelper.AutoStartOnChildStart = _chkAutoVnc.Checked;
                 _owner.SyncTrayToggleStates();
+                // 会话已启动时勾选/取消立即生效：开 = 立即打开视图，关 = 关闭视图
+                if (_owner.IsChildRunning)
+                {
+                    if (_chkAutoVnc.Checked) { _owner.StartMainVnc(); }
+                    else { _owner.CloseMainVnc(); }
+                }
             };
             _chkHeadless = new System.Windows.Forms.CheckBox
             {
@@ -179,8 +185,8 @@ namespace CuaSessionHost
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
-            // 标题栏用带蓝调的深色，与窗体背景(32,32,32)区分开
-            var c = Color.FromArgb(28, 36, 48);
+            // 标题栏与窗体背景同色（一体化外观）
+            var c = Color.FromArgb(32, 32, 32);
             int colorRef = (c.B << 16) | (c.G << 8) | c.R;
             Native.SetCaptionColor(Handle, colorRef);
         }
@@ -242,6 +248,10 @@ namespace CuaSessionHost
             _restart.Visible = _owner.SessionConnected;
             _logoff.Enabled = _owner.SessionConnected;
             _exit.Enabled = _owner.SessionConnected;
+            // AutoVNC 文案随会话状态变化：未启动=下次启动生效；已启动=立即生效
+            _chkAutoVnc.Text = _owner.SessionConnected
+                ? "子会话已启动：勾选立即在子会话打开主会话的 VNC 视图，取消则关闭"
+                : "子会话启动时，自动在子会话打开主会话的 VNC 视图";
         }
 
         private void RefreshEdgeInfo()
