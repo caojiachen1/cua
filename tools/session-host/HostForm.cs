@@ -169,8 +169,13 @@ namespace CuaSessionHost
             _tips.SetToolTip(_mode, "在 RDP（老式直连）与 VNC（自研抓屏）观察模式间切换");
 
             // 统一紧凑尺寸：同宽同高、小一号字体、圆角收紧
-            // 所有按钮（动作钮 + 窗口控制钮）完全同尺寸
-            int bw = Math.Max(48, (int)Math.Round(50 * _uiScale));
+            // 所有按钮（动作钮 + 窗口控制钮）完全同尺寸；
+            // 宽度按最长文字实测，任何 DPI 下都不截断
+            int bw = 0;
+            foreach (var b in new FluentButton[] { _takeover, _release, _hide, _settings, _edge, _mode })
+            {
+                bw = Math.Max(bw, TextRenderer.MeasureText(b.Text, b.Font).Width + 16);
+            }
             int bh = Math.Max(20, (int)Math.Round(21 * _uiScale));
             foreach (var b in new FluentButton[] { _takeover, _release, _hide, _settings, _edge, _mode, _minimize, _maximize, _close })
             {
