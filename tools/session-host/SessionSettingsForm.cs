@@ -207,7 +207,7 @@ namespace CuaSessionHost
             int S(int value) { return (int)Math.Round(value * _scale); }
             int capH = S(40); // 自绘标题条高度：所有内容坐标统一内联下移（幂等）
 
-            ClientSize = new Size(S(640), S(620) + capH);
+            ClientSize = new Size(S(640), S(572) + capH);
             _heading.Location = new Point(S(24), S(20) + capH);
             _hint.Location = new Point(S(24), S(58) + capH);
             _hint.Size = new Size(S(592), S(52));
@@ -243,7 +243,7 @@ namespace CuaSessionHost
             _close.Location = new Point(S(416), S(418) + capH);
             _deleteEdge.Location = new Point(S(24), S(478) + capH);
             _exit.Location = new Point(S(288), S(478) + capH);
-            _chkHeadless.Location = new Point(S(24), S(576) + capH);
+            _chkHeadless.Location = new Point(S(24), S(528) + capH);
 
             // 标题条按钮贴最右上角（不含边距）
             _capClose.Location = new Point(ClientSize.Width - _capClose.Width, 0);
