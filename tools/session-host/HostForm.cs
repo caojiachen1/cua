@@ -146,7 +146,7 @@ namespace CuaSessionHost
 
         // 画中画：画面贴边，没有外框留白；只有四个角是可缩放热区
         private Rectangle _pipBounds = Rectangle.Empty;
-        private int _grip = 14;   // 四角缩放热区的边长
+        private int _grip = 24;   // 四角缩放热区边长（吸附范围）
         private double _aspect = 16.0 / 9.0;
         private PipGesture _gesture;
         private PipZone _gestureZone;
@@ -241,7 +241,7 @@ namespace CuaSessionHost
             _tips.SetToolTip(_settings, "子会话设置");
             _tips.SetToolTip(_edge, "在子会话中打开独立浏览器（CuaEdge / CuaChrome）");
             _tips.SetToolTip(_mode, "在 RDP（老式直连）与 VNC（自研抓屏）观察模式间切换");
-            _tips.SetToolTip(_statusPill, "画中画：任意位置拖动移动小窗，拖四角等比缩放（Shift 自由缩放），双击画面最大化");
+            _tips.SetToolTip(_statusPill, "画中画：任意位置拖动移动小窗，拖四角自由缩放（Shift 锁比例），双击画面最大化");
 
             // 无边框窗口：按住标题栏空白处拖动 = 原生移动（含 Aero 贴边）；
             // 双击标题栏 = 最大化/还原。原生拖动会吃掉第二次点击，所以双击
@@ -433,7 +433,7 @@ namespace CuaSessionHost
             if (dpi <= 0) dpi = 96;
             _uiScale = Math.Max(1f, dpi / 96f);
             _scalePercent = Math.Max(100, Math.Min(500, (int)Math.Round(dpi * 100.0 / 96.0)));
-            _grip = Math.Max(12, (int)Math.Round(14 * _uiScale));
+            _grip = Math.Max(20, (int)Math.Round(24 * _uiScale));
             ApplyChrome();
 
             int buttonHeight = Math.Max(30, (int)Math.Round(34 * _uiScale));
@@ -1409,13 +1409,9 @@ namespace CuaSessionHost
         /// <summary>默认画中画：右下角一块按子会话比例的小窗（画面贴边，无外框）。</summary>
         private Rectangle DefaultPipBounds(Rectangle work)
         {
-            double aspect = _aspect > 0 ? _aspect : 16.0 / 9.0;
-            int barHeight = _bar != null
-                ? _bar.Height
-                : Math.Max(30, (int)Math.Round(34 * _uiScale));
             int width = (int)Math.Round(work.Width * 0.28);
             width = Math.Max(MinPipWidth(), Math.Min(work.Width - 16, width));
-            int height = barHeight + Math.Max(1, (int)Math.Round(width / aspect));
+            int height = HeightForWidth(width);
             int margin = Math.Max(12, (int)Math.Round(24 * _uiScale));
             return new Rectangle(
                 Math.Max(work.Left + margin, work.Right - width - margin),
@@ -1488,6 +1484,7 @@ namespace CuaSessionHost
         /// </summary>
         private PipZone ZoneOf(Point p)
         {
+            if (OverBarButton(p)) return PipZone.None;   // 标题栏按钮优先，别被角热区吃掉
             int grip = _grip;
             bool left = p.X < grip;
             bool right = p.X >= ClientSize.Width - grip;
@@ -1498,6 +1495,24 @@ namespace CuaSessionHost
             if (left && bottom) return PipZone.Left | PipZone.Bottom;
             if (right && bottom) return PipZone.Right | PipZone.Bottom;
             return PipZone.None;
+        }
+
+        /// <summary>该点是否落在标题栏某个可见按钮上（坐标已是窗口客户区）。</summary>
+        private bool OverBarButton(Point p)
+        {
+            if (_bar == null) return false;
+            foreach (var b in new FluentButton[]
+            {
+                _close, _maximize, _minimize, _mode,
+                _viewOnly ? _takeover : _release, _settings, _edge
+            })
+            {
+                if (!b.Visible) continue;
+                Rectangle r = b.Bounds;
+                r.Offset(_bar.Left, _bar.Top);
+                if (r.Contains(p)) return true;
+            }
+            return false;
         }
 
         private bool InContent(Point p)
@@ -1637,7 +1652,11 @@ namespace CuaSessionHost
             Bounds = ClampToScreen(b);
         }
 
-        /// <summary>等比缩放：宽度是唯一自由度，高度由子会话比例推出。</summary>
+        /// <summary>
+        /// 四角缩放：默认两个方向都跟着鼠标走（窗口完全跟手），画面按子会话比例
+        /// 居中、多出来的部分留黑边。按住 Shift 才锁比例——用最小二乘把光标位移
+        /// 投影到等比对角线上，角点尽量贴着光标，不会有"跳一下"的错位感。
+        /// </summary>
         private void ResizeTo(Point cursor)
         {
             Rectangle s = _gestureStart;
@@ -1645,44 +1664,41 @@ namespace CuaSessionHost
             bool hasLeft = (zone & PipZone.Left) != 0;
             bool hasRight = (zone & PipZone.Right) != 0;
             bool hasTop = (zone & PipZone.Top) != 0;
-            bool hasBottom = (zone & PipZone.Bottom) != 0;
 
             int dx = cursor.X - _gestureCursor.X;
             int dy = cursor.Y - _gestureCursor.Y;
+            // 统一成"变大为正"的方向，左下/右上角也复用同一套锚点算法
             int stepX = hasLeft ? -dx : hasRight ? dx : 0;
-            int stepY = hasTop ? -dy : hasBottom ? dy : 0;
+            int stepY = hasTop ? -dy : dy;
 
-            double aspect = _aspect > 0 ? _aspect : 16.0 / 9.0;
             int chromeH = _bar.Height;
             int minW = MinPipWidth();
             int minH = chromeH + 120;
-            int maxW = Math.Max(minW, Math.Min(SystemInformation.VirtualScreen.Width,
-                (int)Math.Round((SystemInformation.VirtualScreen.Height - chromeH) * aspect)));
+            int maxW = Math.Max(minW, SystemInformation.VirtualScreen.Width);
             int maxH = Math.Max(minH, SystemInformation.VirtualScreen.Height);
 
             int width;
             int height;
             if ((Control.ModifierKeys & Keys.Shift) != 0)
             {
-                // Shift：自由缩放，画面按比例居中、多出来的部分留黑边
-                width = Math.Max(minW, Math.Min(maxW, s.Width + stepX));
-                height = Math.Max(minH, Math.Min(maxH, s.Height + stepY));
+                double aspect = _aspect > 0 ? _aspect : 16.0 / 9.0;
+                // 等比：s 为宽度增量，角点偏移 (s, s/aspect)，取离光标最近的 s
+                double sx = stepX;
+                double sy = stepY;
+                double grow = (sx + sy / aspect) / (1.0 + 1.0 / (aspect * aspect));
+                width = s.Width + (int)Math.Round(grow);
+                width = Math.Max(minW, Math.Min(maxW, width));
+                height = Math.Max(minH, chromeH + (int)Math.Round((width) / aspect));
+                height = Math.Min(height, maxH);
             }
             else
             {
-                if (stepX != 0 && (stepY == 0 || Math.Abs(stepX) >= Math.Abs((int)Math.Round(stepY * aspect))))
-                    width = s.Width + stepX;                       // 横向拖动主导
-                else
-                    width = (int)Math.Round((s.Height + stepY - chromeH) * aspect);
-                width = Math.Max(minW, Math.Min(maxW, width));
-                height = HeightForWidth(width);
+                width = Math.Max(minW, Math.Min(maxW, s.Width + stepX));
+                height = Math.Max(minH, Math.Min(maxH, s.Height + stepY));
             }
 
-            int x = hasLeft ? s.Right - width
-                : hasRight ? s.Left
-                : s.Left + (s.Width - width) / 2;   // 纯上下拖动：水平居中
-            int y = hasTop ? s.Bottom - height
-                : s.Top;                            // 左右拖动时标题栏不跟着上下跳
+            int x = hasLeft ? s.Right - width : s.Left;
+            int y = hasTop ? s.Bottom - height : s.Top;
             Bounds = new Rectangle(x, y, width, height);
         }
 
