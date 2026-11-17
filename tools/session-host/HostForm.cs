@@ -21,6 +21,11 @@ namespace CuaSessionHost
         private const int WmLButtonUp = 0x0202;
         private const int WmLButtonDblClk = 0x0203;
         private const int WmNcLButtonDblClk = 0x00A3;
+        private const int WmSizing = 0x0214;
+        private const int HtTopLeft = 13;
+        private const int HtTopRight = 14;
+        private const int HtBottomLeft = 16;
+        private const int HtBottomRight = 17;
         private const int WmSetCursor = 0x0020;
         private const int HtCaption = 2;
 
@@ -32,12 +37,6 @@ namespace CuaSessionHost
             Right = 2,
             Top = 4,
             Bottom = 8
-        }
-
-        private enum PipGesture
-        {
-            None,
-            Resize
         }
 
         /// <summary>
@@ -81,24 +80,6 @@ namespace CuaSessionHost
             }
         }
 
-        /// <summary>
-        /// 画中画里 RDP 控件的点击会先经过本线程的消息泵；在这里截获鼠标，
-        /// 观察（只读）状态下把画面变成可拖动/可双击的窗口，接管状态下放行。
-        /// </summary>
-        private sealed class PipFilter : IMessageFilter
-        {
-            private readonly HostForm _form;
-
-            internal PipFilter(HostForm form)
-            {
-                _form = form;
-            }
-
-            public bool PreFilterMessage(ref Message m)
-            {
-                return _form.FilterMessage(ref m);
-            }
-        }
 
         private readonly Options _opt;
         private readonly PipSurface _bar;
@@ -117,7 +98,6 @@ namespace CuaSessionHost
         private readonly FluentButton _close;
         private readonly System.Windows.Forms.Timer _poll;
         private readonly DateTime _started = DateTime.UtcNow;
-        private readonly PipFilter _filter;
         private readonly System.Windows.Forms.Timer _pipWatch;
         private bool _watchDown;
 
@@ -169,10 +149,6 @@ namespace CuaSessionHost
         private Rectangle _pipBounds = Rectangle.Empty;
         private int _grip = 24;   // 四角缩放热区边长（吸附范围）
         private double _aspect = 16.0 / 9.0;
-        private PipGesture _gesture;
-        private PipZone _gestureZone;
-        private Rectangle _gestureStart;
-        private Point _gestureCursor;
         private DateTime _lastDownAt = DateTime.MinValue;
         private Point _lastDownPos = Point.Empty;
         private DateTime _lastCaptionDown = DateTime.MinValue;
@@ -200,7 +176,6 @@ namespace CuaSessionHost
 
             _bar = new PipSurface
             {
-                Owner = this,
                 BackColor = Theme.Bar,
                 Height = 56
             };
@@ -272,6 +247,8 @@ namespace CuaSessionHost
                 c.MouseDown += (sdr, ev) =>
                 {
                     if (ev.Button != MouseButtons.Left) return;
+                    // 四角归缩放：别在这里抢成原生移动
+                    if (ZoneOf(PointToClient(Cursor.Position)) != PipZone.None) return;
                     if (_lastCaptionDown != DateTime.MinValue &&
                         (DateTime.UtcNow - _lastCaptionDown).TotalMilliseconds <=
                         SystemInformation.DoubleClickTime)
@@ -387,33 +364,7 @@ namespace CuaSessionHost
             // 边框热区的缩放光标在 WndProc 的 WM_SETCURSOR 里给：只改当前光标，
             // 不改 Form.Cursor 属性——否则子控件会继承成拖拽光标，进画面还粘着。
             FormClosing += OnFormClosing;
-            _filter = new PipFilter(this);
-            PipLog("ctor filter registered debug=" + PipDebug);
-            Application.AddMessageFilter(_filter);
             UpdateButtons();
-        }
-
-        protected override void Dispose(bool disposing)
-        {
-            if (disposing && _filter != null)
-            {
-                try { Application.RemoveMessageFilter(_filter); } catch { }
-            }
-            base.Dispose(disposing);
-        }
-
-        protected override void OnMouseCaptureChanged(EventArgs e)
-        {
-            base.OnMouseCaptureChanged(e);
-            if (_gesture == PipGesture.None || Capture) return;
-            // 按钮还按着就只是被别人短暂抢走捕获 → 抢回来，别把拖动作废；
-            // 按钮已经松开才是真的结束（Alt+Tab、点在别的窗口上等）。
-            if ((Control.MouseButtons & MouseButtons.Left) != 0)
-            {
-                try { Capture = true; } catch { }
-                return;
-            }
-            EndGesture();
         }
 
         protected override void WndProc(ref Message m)
@@ -425,18 +376,18 @@ namespace CuaSessionHost
                 ToggleMaximize();
                 return;
             }
+            if (m.Msg == WmSizing)
+            {
+                ApplySizingRules(m);
+                return;
+            }
             // 只有边框热区需要拖拽光标；画面内部一律交回子控件的默认光标
             if (m.Msg == WmSetCursor && m.WParam == Handle)
             {
-                Cursor target;
-                if (_gesture != PipGesture.None)
-                    target = GestureCursor(_gesture, _gestureZone);
-                else
-                {
-                    PipZone zone = ZoneOf(PointToClient(Cursor.Position));
-                    target = zone == PipZone.None ? Cursors.Default : GestureCursor(PipGesture.Resize, zone);
-                }
-                Cursor.Current = target;
+                PipZone zone = ZoneOf(PointToClient(Cursor.Position));
+                Cursor.Current = zone == PipZone.None
+                    ? Cursors.Default
+                    : GestureCursor(zone);
                 m.Result = (IntPtr)1;
                 return;
             }
@@ -476,10 +427,9 @@ namespace CuaSessionHost
         /// <summary>角落热区：给斜向缩放光标并吞掉 WM_SETCURSOR，其余交还原控件。</summary>
         internal bool RelayCursor()
         {
-            if (_gesture != PipGesture.None) return false;
             PipZone zone = ZoneOf(PointToClient(Cursor.Position));
             if (zone == PipZone.None) return false;
-            Cursor.Current = GestureCursor(PipGesture.Resize, zone);
+            Cursor.Current = GestureCursor(zone);
             return true;
         }
 
@@ -540,6 +490,18 @@ namespace CuaSessionHost
                 g.DrawLine(pen, 0, _bar.Height - 1, _bar.Width, _bar.Height - 1);
         }
 
+        /// <summary>
+        /// 摆放子控件按**屏幕坐标**比较：窗口从左/下边缩放时右边缘不动，按钮屏幕位置
+        /// 其实没变，但客户区坐标变了；照旧赋值会让每个按钮都重排重画一次。
+        /// </summary>
+        private bool Place(Control control, int left, int top)
+        {
+            Point want = _bar.PointToScreen(new Point(left, top));
+            if (control.PointToScreen(Point.Empty) == want) return false;
+            control.Location = new Point(left, top);
+            return true;
+        }
+
         private void LayoutBar()
         {
             if (_bar == null || _title == null) return;
@@ -576,6 +538,7 @@ namespace CuaSessionHost
             _settings.Visible = !pip && barWidth >= (int)Math.Round(700 * _uiScale);
             _statusPill.Visible = barWidth >= (int)Math.Round(430 * _uiScale);
 
+            bool moved = false;
             int buttonTop = Math.Max(0, (_bar.Height - _takeover.Height) / 2);
             int right = barWidth - pad;
             var stack = new FluentButton[]
@@ -586,9 +549,9 @@ namespace CuaSessionHost
             foreach (var b in stack)
             {
                 if (!b.Visible) continue;
-                b.Left = right - b.Width;
-                b.Top = buttonTop;
-                right = b.Left - gap;
+                int want = right - b.Width;
+                if (Place(b, want, buttonTop)) moved = true;
+                right = want - gap;
             }
 
             int left = pad;
@@ -599,14 +562,12 @@ namespace CuaSessionHost
                 _statusPill.Visible = false;
             if (_title.Visible)
             {
-                _title.Left = left;
-                _title.Top = titleTop;
+                if (Place(_title, left, titleTop)) moved = true;
                 left = _title.Right + gap;
             }
             if (_statusPill.Visible)
             {
-                _statusPill.Left = left;
-                _statusPill.Top = pillTop;
+                if (Place(_statusPill, left, pillTop)) moved = true;
                 left = _statusPill.Right + gap;
             }
             if (_meta.Visible)
@@ -615,6 +576,14 @@ namespace CuaSessionHost
                 _meta.Top = titleTop;
                 _meta.Height = _title.Height;
                 _meta.Width = Math.Max(0, right - left);
+            }
+
+            // 子控件挪过位置就把标题栏立刻重画一次：否则旧位置要等下一帧才被
+            // 擦掉，缩放时能看到按钮"变宽/拖影"一闪。
+            if (moved)
+            {
+                _bar.Invalidate();
+                _bar.Update();
             }
         }
 
@@ -1566,112 +1535,6 @@ namespace CuaSessionHost
         }
 
         /// <summary>
-        /// 在消息分发前处理画中画手势。返回 true = 消息已被吞掉。
-        /// 只读观察时整个窗口都是抓手：任意位置拖动 = 移动，双击 = 最大化，
-        /// 四角 = 等比缩放。接管控制时全部放行给子会话。
-        /// </summary>
-        internal bool FilterMessage(ref Message m)
-        {
-            int msg = m.Msg;
-            if (msg != WmLButtonDown && msg != WmLButtonDblClk &&
-                msg != WmLButtonUp && msg != WmMouseMove) return false;
-            if (_stopping || IsDisposed) return false;
-            if (!Visible || !Enabled || !IsHandleCreated)
-            {
-                if (msg != WmMouseMove) PipLog("skip state visible=" + Visible + " enabled=" + Enabled + " msg=" + msg);
-                return false;
-            }
-            if (m.HWnd != Handle && !Native.IsChild(Handle, m.HWnd))
-            {
-                if (msg != WmMouseMove) PipLog("skip foreign hwnd=" + m.HWnd + " handle=" + Handle);
-                return false;
-            }
-            if (msg != WmMouseMove) PipLog("msg=" + msg + " hwnd=" + m.HWnd + " self=" + (m.HWnd == Handle));
-
-            Point cursor = Cursor.Position;
-            Point p = PointToClient(cursor);
-            if (msg != WmMouseMove)
-                PipLog("p=" + p.X + "," + p.Y + " content=" + InContent(p) +
-                       " zone=" + ZoneOf(p) + " viewOnly=" + _viewOnly + " max=" + _isMaximized);
-
-            if (msg == WmLButtonDown || msg == WmLButtonDblClk)
-            {
-                if (_gesture != PipGesture.None) return false;
-                PipZone zone = ZoneOf(p);
-                if (zone != PipZone.None)
-                {
-                    _lastDownAt = DateTime.MinValue;
-                    BeginGesture(PipGesture.Resize, zone, cursor);
-                    return true;
-                }
-                if (InContent(p))
-                {
-                    if (_viewOnly)
-                    {
-                        if (IsDoubleClick(cursor))
-                        {
-                            ToggleMaximize();
-                            return true;
-                        }
-                        return false;
-                    }
-                    // 接管控制：点击前再启用一次 RDP 输入窗口，防止窗口缩放后点击落空
-                    ReassertInput();
-                }
-                return false;
-            }
-
-            if (msg == WmMouseMove)
-            {
-                if (_gesture == PipGesture.Resize)
-                {
-                    ResizeTo(cursor);
-                    return true;
-                }
-                return false;
-            }
-
-            if (_gesture != PipGesture.None)
-            {
-                EndGesture();
-                return true;
-            }
-            return false;
-        }
-
-        private void BeginGesture(PipGesture gesture, PipZone zone, Point cursor)
-        {
-            PipLog("begin " + gesture + " zone=" + zone + " cursor=" + cursor + " bounds=" + Bounds);
-            _gesture = gesture;
-            _gestureZone = zone;
-            _gestureStart = Bounds;
-            _gestureCursor = cursor;
-            Cursor.Current = GestureCursor(gesture, zone);
-            try { Capture = true; } catch { }
-        }
-
-        private void EndGesture()
-        {
-            if (_gesture == PipGesture.None) return;
-            _gesture = PipGesture.None;
-            _gestureZone = PipZone.None;
-            try { Capture = false; } catch { }
-            Cursor.Current = Cursors.Default;
-            PipLog("end bounds=" + Bounds);
-            if (!_isMaximized)
-            {
-                _pipBounds = Bounds;
-                SaveViewerBounds();
-                ReassertInput();      // 缩放后 mstscax 可能重建了输入窗口
-            }
-            WriteState();
-        }
-
-        /// <summary>
-        /// 只读观察时，画面上的左键按下要能拖动窗口。这条消息被 RDP 自己的线程吃掉了，
-        /// 所以用 GetAsyncKeyState 轮询补触发：一旦确认按下，立刻抢捕获，
-        /// 后面的移动/抬起就回到正常的手势路径上。
-        /// </summary>
         private void PollContentPress()
         {
             if (_stopping || IsDisposed || !Visible) return;
@@ -1683,11 +1546,21 @@ namespace CuaSessionHost
             }
             if (_watchDown) return;
             _watchDown = true;
-            // 接管控制时画面里的点击归子会话，别抢
-            if (!_viewOnly || _gesture != PipGesture.None) return;
 
             Point cursor = Cursor.Position;
             Point p = PointToClient(cursor);
+
+            // 四角：交给系统的缩放循环。画面（RDP 窗口）经常盖到角落，那些按下
+            // 落在别的线程上，过滤器收不到，只能靠这里拦。
+            PipZone zone = ZoneOf(p);
+            if (zone != PipZone.None)
+            {
+                StartSystemDrag(HitTestOf(zone), cursor);
+                return;
+            }
+
+            // 接管控制时画面里的点击归子会话，别抢
+            if (!_viewOnly) return;
             if (!InContent(p) || OverBarButton(p)) return;
 
             // 双击最大化/还原在最大化状态下也要能用（此时不做拖动）
@@ -1697,21 +1570,31 @@ namespace CuaSessionHost
                 return;
             }
             if (_isMaximized) return;
-            StartSystemMove(cursor);
+            StartSystemDrag(HtCaption, cursor);
+        }
+
+        private static int HitTestOf(PipZone zone)
+        {
+            bool left = (zone & PipZone.Left) != 0;
+            bool top = (zone & PipZone.Top) != 0;
+            if (left && top) return HtTopLeft;
+            if (!left && top) return HtTopRight;
+            if (left) return HtBottomLeft;
+            return HtBottomRight;
         }
 
         /// <summary>
-        /// 用系统原生移动（WM_NCLBUTTONDOWN + HTCAPTION）来搬窗口：窗口和所有子控件
-        /// 由窗口管理器整体搬运，按钮不会相对标题栏位移、也不会撕裂——自己逐帧
-        /// SetWindowPos 快拖时会出现"按钮偏移一帧"的观感。
+        /// 交给系统的移动/缩放循环（WM_NCLBUTTONDOWN + 命中码）。窗口和所有子控件
+        /// 由窗口管理器整体搬运：比逐帧 SetWindowPos 平滑，也不会有"按钮相对标题栏
+        /// 抖一下"的观感。
         /// </summary>
-        private void StartSystemMove(Point cursor)
+        private void StartSystemDrag(int hitTest, Point cursor)
         {
             try
             {
                 Native.ReleaseCapture();
                 int lparam = ((cursor.Y & 0xFFFF) << 16) | (cursor.X & 0xFFFF);
-                Native.SendMessage(Handle, 0xA1 /* WM_NCLBUTTONDOWN */, (IntPtr)HtCaption, (IntPtr)lparam);
+                Native.SendMessage(Handle, 0xA1 /* WM_NCLBUTTONDOWN */, (IntPtr)hitTest, (IntPtr)lparam);
             }
             catch { }
             if (!_isMaximized)
@@ -1720,56 +1603,47 @@ namespace CuaSessionHost
                 SaveViewerBounds();
             }
             WriteState();
+            ReassertInput();      // 缩放后 mstscax 可能重建了输入窗口
         }
 
         /// <summary>
-        /// 四角缩放：默认两个方向都跟着鼠标走（窗口完全跟手），画面按子会话比例
-        /// 居中、多出来的部分留黑边。按住 Shift 才锁比例——用最小二乘把光标位移
-        /// 投影到等比对角线上，角点尽量贴着光标，不会有"跳一下"的错位感。
+        /// 系统缩放循环里限制最小尺寸；按住 Shift 时锁子会话比例（画面不留黑边）。
         /// </summary>
-        private void ResizeTo(Point cursor)
+        private void ApplySizingRules(Message m)
         {
-            Rectangle s = _gestureStart;
-            PipZone zone = _gestureZone;
-            bool hasLeft = (zone & PipZone.Left) != 0;
-            bool hasRight = (zone & PipZone.Right) != 0;
-            bool hasTop = (zone & PipZone.Top) != 0;
-
-            int dx = cursor.X - _gestureCursor.X;
-            int dy = cursor.Y - _gestureCursor.Y;
-            // 统一成"变大为正"的方向，左下/右上角也复用同一套锚点算法
-            int stepX = hasLeft ? -dx : hasRight ? dx : 0;
-            int stepY = hasTop ? -dy : dy;
-
-            int chromeH = _bar.Height;
+            int edge = m.WParam.ToInt32();
+            Native.RECT r = (Native.RECT)System.Runtime.InteropServices.Marshal
+                .PtrToStructure(m.LParam, typeof(Native.RECT));
             int minW = MinPipWidth();
-            int minH = chromeH + 120;
-            int maxW = Math.Max(minW, SystemInformation.VirtualScreen.Width);
-            int maxH = Math.Max(minH, SystemInformation.VirtualScreen.Height);
-
-            int width;
-            int height;
-            if ((Control.ModifierKeys & Keys.Shift) != 0)
+            int minH = _bar.Height + 120;
+            bool anchorLeft = edge == 1 || edge == 4 || edge == 7;    // LEFT / TOPLEFT / BOTTOMLEFT
+            bool anchorTop = edge == 3 || edge == 4 || edge == 5;     // TOP / TOPLEFT / TOPRIGHT
+            int w = r.Right - r.Left;
+            int h = r.Bottom - r.Top;
+            if (w < minW)
+            {
+                if (anchorLeft) r.Left = r.Right - minW; else r.Right = r.Left + minW;
+                w = minW;
+            }
+            if (h < minH)
+            {
+                if (anchorTop) r.Top = r.Bottom - minH; else r.Bottom = r.Top + minH;
+                h = minH;
+            }
+            if ((Native.GetAsyncKeyState(0x10 /* VK_SHIFT */) & 0x8000) != 0)
             {
                 double aspect = _aspect > 0 ? _aspect : 16.0 / 9.0;
-                // 等比：s 为宽度增量，角点偏移 (s, s/aspect)，取离光标最近的 s
-                double sx = stepX;
-                double sy = stepY;
-                double grow = (sx + sy / aspect) / (1.0 + 1.0 / (aspect * aspect));
-                width = s.Width + (int)Math.Round(grow);
-                width = Math.Max(minW, Math.Min(maxW, width));
-                height = Math.Max(minH, chromeH + (int)Math.Round((width) / aspect));
-                height = Math.Min(height, maxH);
+                int wantH = _bar.Height + (int)Math.Round(w / aspect);
+                if (wantH < minH)
+                {
+                    wantH = minH;
+                    w = (int)Math.Round((wantH - _bar.Height) * aspect);
+                }
+                if (anchorTop) r.Top = r.Bottom - wantH; else r.Bottom = r.Top + wantH;
+                if (anchorLeft) r.Left = r.Right - w; else r.Right = r.Left + w;
             }
-            else
-            {
-                width = Math.Max(minW, Math.Min(maxW, s.Width + stepX));
-                height = Math.Max(minH, Math.Min(maxH, s.Height + stepY));
-            }
-
-            int x = hasLeft ? s.Right - width : s.Left;
-            int y = hasTop ? s.Bottom - height : s.Top;
-            Bounds = new Rectangle(x, y, width, height);
+            System.Runtime.InteropServices.Marshal.StructureToPtr(r, m.LParam, false);
+            m.Result = (IntPtr)1;
         }
 
         private static Rectangle ClampToScreen(Rectangle b)
@@ -1783,7 +1657,7 @@ namespace CuaSessionHost
             return b;
         }
 
-        private static Cursor GestureCursor(PipGesture gesture, PipZone zone)
+        private static Cursor GestureCursor(PipZone zone)
         {
             bool left = (zone & PipZone.Left) != 0;
             bool right = (zone & PipZone.Right) != 0;
