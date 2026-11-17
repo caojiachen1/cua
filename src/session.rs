@@ -415,10 +415,12 @@ fn cmd_start(
     view: bool,
     interactive: bool,
     keep_startup: bool,
-    routable: bool,
+    headless: bool,
     width: Option<u32>,
     height: Option<u32>,
 ) -> Result<i32> {
+    // 无头模式：CLI 显式指定，或托盘设置「自动关闭路由」开启。
+    let headless = headless || headless_auto_disable_setting();
 
     // A previous stop turns the system-wide child-sessions flag off (it steals
     // remote-desktop logons otherwise). Starting again must re-enable it, so
@@ -488,7 +490,7 @@ fn cmd_start(
             latest = Some(st.clone());
             if ready && st.agent_ready {
                 let mut st_val = serde_json::to_value(&st)?;
-                if routable {
+                if !headless {
                     // 远程协助模式：路由开关保持开启，远程软件落在子会话；
                     // 观察窗（RDP 老样子）持续可用。
                     st_val["child_sessions"] = json!({ "ok": true, "kept_routable": true });
@@ -525,6 +527,18 @@ fn cmd_start(
             );
         }
         std::thread::sleep(Duration::from_millis(150));
+    }
+}
+
+/// 托盘设置「启动后自动关闭路由（无头模式）」的持久化值。
+fn headless_auto_disable_setting() -> bool {
+    let out = Command::new("reg")
+        .args(["query", r"HKCU\Software\cua\Vnc", "/v", "HeadlessAutoDisable"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    match out {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).contains("0x1"),
+        Err(_) => false,
     }
 }
 
