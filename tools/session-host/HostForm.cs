@@ -22,6 +22,7 @@ namespace CuaSessionHost
         private readonly Label _title;
         private readonly Label _meta;
         private readonly StatusPill _statusPill;
+        private readonly FluentButton _mode;
         private readonly FluentButton _takeover;
         private readonly FluentButton _release;
         private readonly FluentButton _hide;
@@ -129,7 +130,8 @@ namespace CuaSessionHost
             _release = new FluentButton { Text = "释放控制", Accent = false, Visible = false };
             _hide = new FluentButton { Text = "隐藏", Accent = false };
             _settings = new FluentButton { Text = "设置", Accent = false };
-            _edge = new FluentButton { Text = "子会话浏览器", Accent = false };
+            _edge = new FluentButton { Text = "浏览器", Accent = false };
+            _mode = new FluentButton { Text = "观察模式：RDP", Accent = false };
 
             _minimize = new FluentButton
             {
@@ -157,6 +159,11 @@ namespace CuaSessionHost
             _tips.SetToolTip(_hide, "隐藏到托盘");
             _tips.SetToolTip(_settings, "子会话设置");
             _tips.SetToolTip(_edge, "在子会话中打开独立浏览器（CuaEdge / CuaChrome）");
+            _tips.SetToolTip(_mode, "在 RDP（老式直连）与 VNC（自研抓屏）观察模式间切换");
+            _mode.Click += delegate
+            {
+                SwitchViewMode(!_vncMode);
+            };
 
             _takeover.Click += delegate { SetViewOnly(false); };
             _release.Click += delegate { SetViewOnly(true); };
@@ -172,6 +179,7 @@ namespace CuaSessionHost
             _bar.Controls.Add(_meta);
             _bar.Controls.Add(_settings);
             _bar.Controls.Add(_edge);
+            _bar.Controls.Add(_mode);
             _bar.Controls.Add(_takeover);
             _bar.Controls.Add(_release);
             _bar.Controls.Add(_hide);
@@ -336,6 +344,8 @@ namespace CuaSessionHost
             right = _minimize.Left - gap;
             _hide.Left = right - _hide.Width;
             right = _hide.Left - gap;
+            _mode.Left = right - _mode.Width;
+            right = _mode.Left - gap;
             FluentButton action = _viewOnly ? _takeover : _release;
             action.Left = right - action.Width;
             right = action.Left - gap;
@@ -348,6 +358,7 @@ namespace CuaSessionHost
             _maximize.Top = buttonTop;
             _minimize.Top = buttonTop;
             _hide.Top = buttonTop;
+            _mode.Top = buttonTop;
             _settings.Top = buttonTop;
             _edge.Top = buttonTop;
             _takeover.Top = buttonTop;
@@ -969,6 +980,7 @@ namespace CuaSessionHost
                     _rdp.BringToFront();
                     _statusPill.SetState("观察模式：RDP", Theme.Accent);
                 }
+                _mode.Text = vnc ? "观察模式：VNC" : "观察模式：RDP";
                 UpdateMeta();
                 _lastError = null;
             }
