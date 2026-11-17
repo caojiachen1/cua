@@ -25,12 +25,10 @@ namespace CuaSessionHost
         private readonly FluentButton _logoff;
         private readonly FluentButton _exit;
         private readonly FluentButton _close;
-        private System.Windows.Forms.CheckBox _chkAutoVnc;
         private System.Windows.Forms.CheckBox _chkHeadless;
         private Panel _capStrip;
         private Label _capTitle;
         private FluentButton _capClose;
-        private FluentButton _capVnc;
         private float _scale = 1f;
         private bool _edgeLoading;
 
@@ -100,21 +98,6 @@ namespace CuaSessionHost
             _exit.Danger = true;
             _close = MakeButton("关闭窗口", false);
 
-            _chkAutoVnc = new System.Windows.Forms.CheckBox
-            {
-                Text = "子会话启动时，自动在子会话打开主会话的 VNC 视图",
-                ForeColor = Theme.Text,
-                BackColor = Theme.Window,
-                AutoSize = true
-            };
-            _chkAutoVnc.Checked = VncHelper.AutoStartOnChildStart;
-            _chkAutoVnc.Checked = VncHelper.AutoStartOnChildStart;
-            _chkAutoVnc.CheckedChanged += delegate
-            {
-                VncHelper.AutoStartOnChildStart = _chkAutoVnc.Checked;
-                _owner.SyncTrayToggleStates();
-                // 该选项只决定下次启动子会话时是否自动打开，不影响当前状态
-            };
             _chkHeadless = new System.Windows.Forms.CheckBox
             {
                 Text = "下次启动后自动关闭路由（无头模式：远程软件接管主会话）",
@@ -146,20 +129,11 @@ namespace CuaSessionHost
                 Location = new Point(14, 10)
             };
             _capClose = new FluentButton { Text = "\uE8BB", Font = Theme.Icon(8f), Ghost = true, Danger = true, CornerRadius = 0 };
-            _capClose.Size = new Size(44, 40);
+            _capClose.Size = new Size(36, 40);
             _capClose.Anchor = AnchorStyles.Top | AnchorStyles.Right;
-            _capClose.Location = new Point(Math.Max(0, ClientSize.Width - 44), 0);
+            _capClose.Location = new Point(Math.Max(0, ClientSize.Width - 36), 0);
             _capClose.Click += delegate { Close(); };
-            _capVnc = new FluentButton { Text = "启动 VNC 视图", Font = Theme.Ui(8.5f), Ghost = true, CornerRadius = 6 };
-            _capVnc.Size = new Size(120, 30);
-            _capVnc.Anchor = AnchorStyles.Top | AnchorStyles.Right;
-            _capVnc.Location = new Point(Math.Max(0, ClientSize.Width - 44 - 128), 5);
-            _capVnc.Click += delegate
-            {
-                if (_owner.IsMainVncRunning) { _owner.CloseMainVnc(); }
-                else { _owner.StartMainVnc(); }
-                UpdateCapVncText();
-            };
+
             foreach (var c in new Control[] { _capStrip, _capTitle })
             {
                 c.MouseDown += (sdr, ev) =>
@@ -173,7 +147,6 @@ namespace CuaSessionHost
             }
             Controls.Add(_capTitle);
             Controls.Add(_capClose);
-            Controls.Add(_capVnc);
             Controls.Add(_capStrip);
 
             _openEdge.Click += delegate { _owner.OpenChildEdgeFromSettings(); RefreshState(); };
@@ -207,7 +180,6 @@ namespace CuaSessionHost
             Controls.Add(_logoff);
             Controls.Add(_exit);
             Controls.Add(_close);
-            Controls.Add(_chkAutoVnc);
             Controls.Add(_chkHeadless);
 
             Load += delegate
@@ -227,14 +199,6 @@ namespace CuaSessionHost
                 Accent = accent,
                 Size = new Size(200, 38)
             };
-        }
-
-        private void UpdateCapVncText()
-        {
-            if (_capVnc != null)
-            {
-                _capVnc.Text = _owner.IsMainVncRunning ? "关闭 VNC 视图" : "启动 VNC 视图";
-            }
         }
 
         private void ApplyScale()
@@ -278,19 +242,15 @@ namespace CuaSessionHost
             _close.Location = new Point(S(416), S(418));
             _deleteEdge.Location = new Point(S(24), S(478));
             _exit.Location = new Point(S(288), S(478));
-            _chkAutoVnc.Location = new Point(S(24), S(540));
             _chkHeadless.Location = new Point(S(24), S(576));
             // 标题条按钮贴最右上角（ClientSize 变更后显式重定位）
             _capClose.Location = new Point(ClientSize.Width - _capClose.Width, 0);
-            _capVnc.Location = new Point(ClientSize.Width - _capClose.Width - _capVnc.Width - S(6), S(5));
             // 内容整体下移自绘标题条的高度
             int capH = S(40);
             foreach (System.Windows.Forms.Control c in Controls)
             {
-                if (c == _capStrip || c == _capTitle || c == _capClose || c == _capVnc) continue;
                 c.Top += capH;
             }
-            _capClose.Location = new Point(ClientSize.Width - S(44), 0);
             CenterToScreen();
         }
 
@@ -305,7 +265,6 @@ namespace CuaSessionHost
             _restart.Visible = _owner.SessionConnected;
             _logoff.Enabled = _owner.SessionConnected;
             _exit.Enabled = _owner.SessionConnected;
-            UpdateCapVncText();
         }
 
         private void RefreshEdgeInfo()

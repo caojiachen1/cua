@@ -57,13 +57,11 @@ namespace CuaSessionHost
         private bool _viewerInitialized;
         private DateTime _reconnectAt = DateTime.MinValue;
         private bool _vncAutoDone;
-        private System.Windows.Forms.ToolStripMenuItem _menuAutoVnc;
         private uint? _lastChildId;
         private int _reconnectAttempts;
         private bool _plainTried;
         private RfbClientControl _rfbCtl;
         private bool _vncMode;
-        private Label _vncNotice;
         private System.Windows.Forms.ContextMenuStrip _modeMenu;
         private System.Windows.Forms.ToolStripMenuItem _modeRdpItem;
         private System.Windows.Forms.ToolStripMenuItem _modeVncItem;
@@ -430,29 +428,8 @@ namespace CuaSessionHost
             _trayMenu.Items.Add(MenuItem("打开观察窗", delegate { ShowViewer(!_viewOnly); }));
             _trayMenu.Items.Add(MenuItem("子会话设置…", OpenSettings));
             _trayMenu.Items.Add(MenuItem("在子会话打开浏览器", OpenChildEdge));
-            _trayMenu.Items.Add(MenuItem("远程到主会话 (VNC)", delegate { StartMainVnc(); }));
             _trayMenu.Items.Add(MenuItem("观察模式：RDP (子会话)", delegate { SwitchViewMode(false); }));
             _trayMenu.Items.Add(MenuItem("观察模式：VNC (子会话)", delegate { SwitchViewMode(true); }));
-            _menuAutoVnc = new System.Windows.Forms.ToolStripMenuItem("点击切换：启动时不自动打开 VNC 视图");
-            _menuAutoVnc.Click += delegate
-            {
-                // 动作项：点击即反转设置；文案在 SyncTrayTexts 中更新为切换后的目标状态
-                VncHelper.AutoStartOnChildStart = !VncHelper.AutoStartOnChildStart;
-                SyncTrayTexts();
-                if (_childId.HasValue)
-                {
-                    if (VncHelper.AutoStartOnChildStart) { StartMainVnc(); }
-                    else { CloseMainVnc(); }
-                }
-            };
-            _trayMenu.Items.Add(_menuAutoVnc);
-            _menuHeadless = new System.Windows.Forms.ToolStripMenuItem("下次启动后自动关闭路由（无头模式）");
-            _menuHeadless.Checked = VncHelper.HeadlessAutoDisable;
-            _menuHeadless.Click += delegate
-            {
-                VncHelper.HeadlessAutoDisable = !_menuHeadless.Checked;
-                _menuHeadless.Checked = VncHelper.HeadlessAutoDisable;
-            };
             _trayMenu.Items.Add(_menuHeadless);
             _trayMenu.Items.Add(new ToolStripSeparator());
             _menuTakeover = MenuItem("接管控制", delegate { ShowViewer(false); });
@@ -866,13 +843,6 @@ namespace CuaSessionHost
                     if (_agentReady)
                     {
                         _lastError = null;
-                        if (!_vncAutoDone && VncHelper.AutoStartOnChildStart)
-                        {
-                            _vncAutoDone = true;
-                            // 远程协助模式：远程用户落在子会话，自动为其打开
-                            // 主会话的 VNC 视图（tvnserver 主会话 + tvnviewer 子会话）。
-                            StartMainVnc();
-                        }
                     }
                     else if (_agentAttempts < 6)
                     {
@@ -1026,80 +996,12 @@ namespace CuaSessionHost
         /// 设置对话框改动后同步托盘菜单的勾选状态
         /// 子会话是否在运行（供设置对话框动态文案/立即生效用）
         /// 主会话 VNC 视图（子会话内的 tvnviewer）是否在运行
-        /// VNC 视图开启期间，观察窗显示占位提示（替代隐藏窗口）：
-        /// 主屏不再渲染子会话画面，tvnserver 捕获的主屏中不含观察窗内容，
-        /// 递归链被打断；RDP 连接保持，关闭视图后自动恢复观察。
-        private void ShowVncNotice(bool on)
-        {
-            try
-            {
-                if (on)
-                {
-                    if (_vncNotice == null)
-                    {
-                        _vncNotice = new Label
-                        {
-                            Text = "VNC 视图已开启\n远程用户正在通过子会话控制主会话\n关闭 VNC 视图后此处恢复子会话观察",
-                            ForeColor = Theme.Muted,
-                            BackColor = Theme.Window,
-            
-                            Font = Theme.Ui(11f),
-                            TextAlign = ContentAlignment.MiddleCenter,
-                            Dock = DockStyle.Fill
-                        };
-                        _content.Controls.Add(_vncNotice);
-                    }
-                    _vncNotice.BringToFront();
-                    _vncNotice.Visible = true;
-                }
-                else if (_vncNotice != null)
-                {
-                    _vncNotice.Visible = false;
-                }
-            }
-            catch { }
-        }
-
-        public bool IsMainVncRunning
-        {
-            get
-            {
-                try
-                {
-                    foreach (var p in System.Diagnostics.Process.GetProcessesByName("tvnviewer"))
-                    {
-                        if (_childId.HasValue && p.SessionId == _childId.Value)
-                        {
-                            return true;
-                        }
-                    }
-                }
-                catch { }
-                return false;
-            }
-        }
-
         public bool IsChildRunning
         {
             get { return _childId.HasValue; }
         }
 
         /// 关闭子会话内的主会话 VNC 视图（tvnviewer）
-        public void CloseMainVnc()
-        {
-            try
-            {
-                foreach (var p in System.Diagnostics.Process.GetProcessesByName("tvnviewer"))
-                {
-                    if (_childId.HasValue && p.SessionId == _childId.Value)
-                    {
-                        p.Kill();
-                    }
-                }
-            }
-            catch { }
-            ShowVncNotice(false);
-        }
 
         public void SyncTrayToggleStates()
         {
@@ -1153,26 +1055,6 @@ namespace CuaSessionHost
             catch (Exception ex)
             {
                 SetError("切换观察模式: " + ex.GetBaseException().Message);
-            }
-        }
-
-        public void StartMainVnc()
-        {
-            try
-            {
-                VncHelper.EnsureServer();
-                if (_childId.HasValue)
-                {
-                    VncHelper.LaunchViewerInChild(_childId.Value);
-                    // 观察窗切换为占位提示：打断"观察窗⊃子会话⊃viewer⊃主屏"递归链，
-                    // RDP 连接保持存活（子会话显示器不丢失），关闭视图后自动恢复
-                    ShowVncNotice(true);
-                }
-                _lastError = null;
-            }
-            catch (Exception ex)
-            {
-                SetError("vnc: " + ex.GetBaseException().Message);
             }
         }
 
@@ -1297,15 +1179,7 @@ namespace CuaSessionHost
                 : "启动子会话";
             _menuStart.Enabled = !running;
             _menuRestart.Enabled = running;
-            if (_menuAutoVnc != null)
-            {
-                // 托盘为动作项：文案显示"点击后将变成的状态"
-                bool auto = VncHelper.AutoStartOnChildStart;
-                _menuAutoVnc.Text = auto
-                    ? "点击切换：启动时不自动打开 VNC 视图"
-                    : "点击切换：启动时自动打开 VNC 视图";
-                _menuAutoVnc.Checked = false;
-            }
+
         }
 
         private void UpdateMeta()
@@ -1863,9 +1737,6 @@ namespace CuaSessionHost
                         break;
                     case "vnc.child":
                         SwitchViewMode(true);
-                        break;
-                    case "vnc.main":
-                        StartMainVnc();
                         break;
                     case "stop":
                         {

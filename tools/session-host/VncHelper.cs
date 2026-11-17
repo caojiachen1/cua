@@ -146,18 +146,5 @@ namespace CuaSessionHost
         }
 
         private const string SettingsKey = @"Software\cua\Vnc";
-        public static bool AutoStartOnChildStart
-        {
-            get
-            {
-                using (var k = Registry.CurrentUser.OpenSubKey(SettingsKey))
-                    return k != null && (k.GetValue("AutoStart") as int? == 1);
-            }
-            set
-            {
-                using (var k = Registry.CurrentUser.CreateSubKey(SettingsKey))
-                    k.SetValue("AutoStart", value ? 1 : 0, RegistryValueKind.DWord);
-            }
-        }
     }
 }
