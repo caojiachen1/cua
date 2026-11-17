@@ -152,6 +152,8 @@ namespace CuaSessionHost
         private DateTime _lastDownAt = DateTime.MinValue;
         private Point _lastDownPos = Point.Empty;
         private DateTime _lastCaptionDown = DateTime.MinValue;
+        private bool _inSizeMove;      // 正在系统的移动/缩放循环里
+        private PipZone _sizeZone;     // 从哪个角按下的（普通移动为 None）
 
         public HostForm(Options opt)
         {
@@ -176,6 +178,7 @@ namespace CuaSessionHost
 
             _bar = new PipSurface
             {
+                Owner = this,
                 BackColor = Theme.Bar,
                 Height = 56
             };
@@ -384,6 +387,12 @@ namespace CuaSessionHost
             // 只有边框热区需要拖拽光标；画面内部一律交回子控件的默认光标
             if (m.Msg == WmSetCursor && m.WParam == Handle)
             {
+                if (_inSizeMove && _sizeZone != PipZone.None)
+                {
+                    Cursor.Current = GestureCursor(_sizeZone);
+                    m.Result = (IntPtr)1;
+                    return;
+                }
                 PipZone zone = ZoneOf(PointToClient(Cursor.Position));
                 Cursor.Current = zone == PipZone.None
                     ? Cursors.Default
@@ -427,6 +436,13 @@ namespace CuaSessionHost
         /// <summary>角落热区：给斜向缩放光标并吞掉 WM_SETCURSOR，其余交还原控件。</summary>
         internal bool RelayCursor()
         {
+            // 缩放循环里指针早就离开热区了，但光标要一直是斜向的
+            if (_inSizeMove)
+            {
+                if (_sizeZone == PipZone.None) return false;
+                Cursor.Current = GestureCursor(_sizeZone);
+                return true;
+            }
             PipZone zone = ZoneOf(PointToClient(Cursor.Position));
             if (zone == PipZone.None) return false;
             Cursor.Current = GestureCursor(zone);
@@ -1394,20 +1410,6 @@ namespace CuaSessionHost
 
         // ---------------- 画中画：默认几何 / 手势 ----------------
 
-        private static readonly bool PipDebug =
-            Environment.GetEnvironmentVariable("CUA_PIP_DEBUG") == "1";
-
-        private void PipLog(string text)
-        {
-            if (!PipDebug) return;
-            try
-            {
-                File.AppendAllText(Path.Combine(_opt.DataDir, "pip-debug.log"),
-                    DateTime.Now.ToString("HH:mm:ss.fff") + " " + text + Environment.NewLine);
-            }
-            catch { }
-        }
-
         /// <summary>默认画中画：右下角一块按子会话比例的小窗（画面贴边，无外框）。</summary>
         private Rectangle DefaultPipBounds(Rectangle work)
         {
@@ -1573,6 +1575,18 @@ namespace CuaSessionHost
             StartSystemDrag(HtCaption, cursor);
         }
 
+        private static PipZone ZoneOfHitTest(int hitTest)
+        {
+            switch (hitTest)
+            {
+                case HtTopLeft: return PipZone.Left | PipZone.Top;
+                case HtTopRight: return PipZone.Right | PipZone.Top;
+                case HtBottomLeft: return PipZone.Left | PipZone.Bottom;
+                case HtBottomRight: return PipZone.Right | PipZone.Bottom;
+                default: return PipZone.None;
+            }
+        }
+
         private static int HitTestOf(PipZone zone)
         {
             bool left = (zone & PipZone.Left) != 0;
@@ -1590,6 +1604,8 @@ namespace CuaSessionHost
         /// </summary>
         private void StartSystemDrag(int hitTest, Point cursor)
         {
+            _sizeZone = ZoneOfHitTest(hitTest);
+            _inSizeMove = true;
             try
             {
                 Native.ReleaseCapture();
@@ -1597,6 +1613,12 @@ namespace CuaSessionHost
                 Native.SendMessage(Handle, 0xA1 /* WM_NCLBUTTONDOWN */, (IntPtr)hitTest, (IntPtr)lparam);
             }
             catch { }
+            finally
+            {
+                _inSizeMove = false;
+                _sizeZone = PipZone.None;
+                Cursor.Current = Cursors.Default;
+            }
             if (!_isMaximized)
             {
                 _pipBounds = Bounds;
