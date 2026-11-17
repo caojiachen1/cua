@@ -101,24 +101,22 @@ namespace CuaSessionHost
 
             _chkAutoVnc = new System.Windows.Forms.CheckBox
             {
-                Text = "子会话启动时，自动在子会话打开主会话的 VNC 视图（tvnviewer）",
+                Text = "子会话启动时，自动在子会话打开主会话的 VNC 视图",
                 ForeColor = Theme.Text,
                 BackColor = Theme.Window,
                 AutoSize = true
             };
             _chkAutoVnc.Checked = VncHelper.AutoStartOnChildStart;
-            _chkAutoVnc.Checked = !VncHelper.AutoStartOnChildStart; // 勾选=不自动
+            _chkAutoVnc.Checked = VncHelper.AutoStartOnChildStart;
             _chkAutoVnc.CheckedChanged += delegate
             {
-                bool noAuto = _chkAutoVnc.Checked;
-                VncHelper.AutoStartOnChildStart = !noAuto;
+                VncHelper.AutoStartOnChildStart = _chkAutoVnc.Checked;
                 _owner.SyncTrayToggleStates();
-                UpdateAutoVncText();
-                // 会话已启动时立即生效：勾选(不自动)=关闭视图，取消=打开视图
+                // 会话已启动时勾选/取消立即生效：勾选=打开视图，取消=关闭视图
                 if (_owner.IsChildRunning)
                 {
-                    if (noAuto) { _owner.CloseMainVnc(); }
-                    else { _owner.StartMainVnc(); }
+                    if (_chkAutoVnc.Checked) { _owner.StartMainVnc(); }
+                    else { _owner.CloseMainVnc(); }
                 }
             };
             _chkHeadless = new System.Windows.Forms.CheckBox
@@ -277,14 +275,6 @@ namespace CuaSessionHost
             CenterToScreen();
         }
 
-        private void UpdateAutoVncText()
-        {
-            bool auto = VncHelper.AutoStartOnChildStart;
-            _chkAutoVnc.Text = auto
-                ? "子会话启动时，自动在子会话打开主会话的 VNC 视图"
-                : "子会话启动时，不自动打开主会话的 VNC 视图（需要时从托盘手动打开）";
-        }
-
         private void RefreshState()
         {
             _info.Text = _owner.SessionSummary + Environment.NewLine + _owner.CredentialSummary;
@@ -296,7 +286,6 @@ namespace CuaSessionHost
             _restart.Visible = _owner.SessionConnected;
             _logoff.Enabled = _owner.SessionConnected;
             _exit.Enabled = _owner.SessionConnected;
-            UpdateAutoVncText();
         }
 
         private void RefreshEdgeInfo()

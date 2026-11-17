@@ -432,12 +432,17 @@ namespace CuaSessionHost
             _trayMenu.Items.Add(MenuItem("远程到主会话 (VNC)", delegate { StartMainVnc(); }));
             _trayMenu.Items.Add(MenuItem("观察模式：RDP (子会话)", delegate { SwitchViewMode(false); }));
             _trayMenu.Items.Add(MenuItem("观察模式：VNC (子会话)", delegate { SwitchViewMode(true); }));
-            _menuAutoVnc = new System.Windows.Forms.ToolStripMenuItem("子会话启动时自动 VNC 到主会话");
-            _menuAutoVnc.Checked = VncHelper.AutoStartOnChildStart;
+            _menuAutoVnc = new System.Windows.Forms.ToolStripMenuItem("点击切换：启动时不自动打开 VNC 视图");
             _menuAutoVnc.Click += delegate
             {
-                VncHelper.AutoStartOnChildStart = !_menuAutoVnc.Checked;
-                _menuAutoVnc.Checked = VncHelper.AutoStartOnChildStart;
+                // 动作项：点击即反转设置；文案在 SyncTrayTexts 中更新为切换后的目标状态
+                VncHelper.AutoStartOnChildStart = !VncHelper.AutoStartOnChildStart;
+                SyncTrayTexts();
+                if (_childId.HasValue)
+                {
+                    if (VncHelper.AutoStartOnChildStart) { StartMainVnc(); }
+                    else { CloseMainVnc(); }
+                }
             };
             _trayMenu.Items.Add(_menuAutoVnc);
             _menuHeadless = new System.Windows.Forms.ToolStripMenuItem("下次启动后自动关闭路由（无头模式）");
@@ -1042,10 +1047,6 @@ namespace CuaSessionHost
 
         public void SyncTrayToggleStates()
         {
-            if (_menuAutoVnc != null)
-            {
-                _menuAutoVnc.Checked = VncHelper.AutoStartOnChildStart;
-            }
             if (_menuHeadless != null)
             {
                 _menuHeadless.Checked = VncHelper.HeadlessAutoDisable;
@@ -1239,11 +1240,12 @@ namespace CuaSessionHost
             _menuRestart.Enabled = running;
             if (_menuAutoVnc != null)
             {
+                // 托盘为动作项：文案显示"点击后将变成的状态"
                 bool auto = VncHelper.AutoStartOnChildStart;
                 _menuAutoVnc.Text = auto
-                    ? "子会话启动时自动 VNC 到主会话"
-                    : "子会话启动时不自动打开 VNC 视图";
-                _menuAutoVnc.Checked = auto;
+                    ? "点击切换：启动时不自动打开 VNC 视图"
+                    : "点击切换：启动时自动打开 VNC 视图";
+                _menuAutoVnc.Checked = false;
             }
         }
 
