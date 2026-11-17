@@ -83,6 +83,9 @@ namespace CuaSessionHost
         [DllImport("user32.dll")]
         public static extern IntPtr SendMessage(IntPtr window, int msg, IntPtr wParam, IntPtr lParam);
 
+        [DllImport("user32.dll")]
+        public static extern short GetAsyncKeyState(int key);
+
         [DllImport("dwmapi.dll")]
         private static extern int DwmSetWindowAttribute(IntPtr window, int attribute, ref int value, int size);
 

@@ -119,6 +119,8 @@ namespace CuaSessionHost
         private readonly System.Windows.Forms.Timer _poll;
         private readonly DateTime _started = DateTime.UtcNow;
         private readonly PipFilter _filter;
+        private readonly System.Windows.Forms.Timer _pipWatch;
+        private bool _watchDown;
 
         private NotifyIcon _tray;
         private ContextMenuStrip _trayMenu;
@@ -329,6 +331,11 @@ namespace CuaSessionHost
 
             _poll = new System.Windows.Forms.Timer { Interval = 300 };
             _poll.Tick += delegate { Poll(); };
+
+            // RDP 的画面窗口跑在另一个线程上（mstscax 自己起线程），它的鼠标消息
+            // 根本不进本线程的消息泵，只能轮询左键状态补一次"按下"。
+            _pipWatch = new System.Windows.Forms.Timer { Interval = 15 };
+            _pipWatch.Tick += delegate { PollContentPress(); };
 
             Load += delegate
             {
@@ -1287,6 +1294,7 @@ namespace CuaSessionHost
                 Activate();
                 SetViewOnly(viewOnly);
                 _viewerShown = true;
+                if (_viewOnly) _pipWatch.Start();
                 WriteState();
             }
             catch (Exception ex)
@@ -1305,6 +1313,7 @@ namespace CuaSessionHost
             Hide();
             ShowInTaskbar = false;
             _viewerShown = false;
+            _pipWatch.Stop();
             ApplyTopMost();
             WriteState();
             if (!_trayTipShown && _tray != null)
@@ -1387,6 +1396,11 @@ namespace CuaSessionHost
                     Activate();
                     ReassertInput();
                 }
+            }
+            if (_pipWatch != null)
+            {
+                if (viewOnly && _viewerShown) _pipWatch.Start();
+                else _pipWatch.Stop();
             }
             UpdateButtons();
             LayoutBar();
@@ -1662,6 +1676,39 @@ namespace CuaSessionHost
                 ReassertInput();      // 缩放后 mstscax 可能重建了输入窗口
             }
             WriteState();
+        }
+
+        /// <summary>
+        /// 只读观察时，画面上的左键按下要能拖动窗口。这条消息被 RDP 自己的线程吃掉了，
+        /// 所以用 GetAsyncKeyState 轮询补触发：一旦确认按下，立刻抢捕获，
+        /// 后面的移动/抬起就回到正常的手势路径上。
+        /// </summary>
+        private void PollContentPress()
+        {
+            if (_stopping || IsDisposed || !Visible) return;
+            bool down = (Native.GetAsyncKeyState(0x01) & 0x8000) != 0;
+            if (!down)
+            {
+                _watchDown = false;
+                return;
+            }
+            if (_watchDown) return;
+            _watchDown = true;
+            // 接管控制时画面里的点击归子会话，别抢
+            if (!_viewOnly || _gesture != PipGesture.None) return;
+
+            Point cursor = Cursor.Position;
+            Point p = PointToClient(cursor);
+            if (!InContent(p) || OverBarButton(p)) return;
+
+            // 双击最大化/还原在最大化状态下也要能用（此时不做拖动）
+            if (IsDoubleClick(cursor))
+            {
+                ToggleMaximize();
+                return;
+            }
+            if (_isMaximized) return;
+            BeginGesture(PipGesture.Move, PipZone.None, cursor);
         }
 
         private void DragTo(Point cursor)
