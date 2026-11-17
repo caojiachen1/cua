@@ -1205,6 +1205,18 @@ namespace CuaSessionHost
             UpdateTrayText();
         }
 
+        /// 托盘菜单文案随会话状态动态变化
+        private void SyncTrayTexts()
+        {
+            if (_menuStart == null) return;
+            bool running = _childId.HasValue;
+            _menuStart.Text = running
+                ? "子会话运行中（session " + _childId.Value + "）"
+                : "启动子会话";
+            _menuStart.Enabled = !running;
+            _menuRestart.Enabled = running;
+        }
+
         private void UpdateMeta()
         {
             string id = _childId.HasValue ? _childId.Value.ToString() : "—";
@@ -1214,6 +1226,7 @@ namespace CuaSessionHost
                          "  ·  " + _scalePercent + "%" + cred + startup;
             LayoutBar();
             UpdateTrayText();
+            SyncTrayTexts();
         }
 
         internal bool SessionConnected

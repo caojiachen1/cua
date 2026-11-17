@@ -176,6 +176,15 @@ namespace CuaSessionHost
             };
         }
 
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            // 标题栏用带蓝调的深色，与窗体背景(32,32,32)区分开
+            var c = Color.FromArgb(28, 36, 48);
+            int colorRef = (c.B << 16) | (c.G << 8) | c.R;
+            Native.SetCaptionColor(Handle, colorRef);
+        }
+
         private void ApplyScale()
         {
             _scale = Math.Max(1f, Native.GetDpiForWindow(Handle) / 96f);

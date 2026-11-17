@@ -86,6 +86,13 @@ namespace CuaSessionHost
         [DllImport("dwmapi.dll")]
         private static extern int DwmSetWindowAttribute(IntPtr window, int attribute, ref int value, int size);
 
+        /// Windows 11：设置标题栏颜色（COLORREF = 0x00BBGGRR）；Win10 静默忽略
+        public static void SetCaptionColor(IntPtr window, int colorRef)
+        {
+            if (window == IntPtr.Zero) return;
+            TryDwm(window, 35 /* DWMWA_CAPTION_COLOR */, ref colorRef);
+        }
+
         public static void ApplyDarkWindow(IntPtr window)
         {
             if (window == IntPtr.Zero) return;
