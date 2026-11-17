@@ -56,6 +56,7 @@ namespace CuaSessionHost
         private bool _viewerShown;
         private bool _viewerInitialized;
         private DateTime _reconnectAt = DateTime.MinValue;
+        private uint? _lastChildId;
         private bool _readyStatus;
         private bool _stopping;
         private bool _trayTipShown;
@@ -607,6 +608,7 @@ namespace CuaSessionHost
                 if (_connected)
                 {
                     uint? lastSession = _childId;
+                    _lastChildId = lastSession ?? _lastChildId;
                     _connected = false;
                     _childId = null;
                     _agentPipe = null;
@@ -634,8 +636,9 @@ namespace CuaSessionHost
                 // viewer link is down. Reconnect to it (RDP resumes the
                 // disconnected same-user session) and let the normal flow re-attach
                 // the agent.
+                uint? healId = _lastChildId ?? ChildSessionApi.TryGetId();
                 if (!_opt.Preview && DateTime.UtcNow >= _reconnectAt &&
-                    ChildSessionApi.TryGetId() is uint healId && ChildSessionApi.SessionExists(healId))
+                    healId.HasValue && ChildSessionApi.SessionExists(healId.Value))
                 {
                     _reconnectAt = DateTime.UtcNow.AddSeconds(15);
                     _statusPill.SetState("重连子会话", Theme.Accent);
@@ -675,7 +678,9 @@ namespace CuaSessionHost
             // child session id. Keep polling instead of dereferencing a null id.
             if (!_childId.HasValue)
             {
-                _childId = ChildSessionApi.TryGetId();
+                // 路由开关关闭后 WTSGetChildSessionId 不再返回子会话 id，
+                // 因此重连时优先使用断开前记住的 id。
+                _childId = _lastChildId ?? ChildSessionApi.TryGetId();
                 if (!_childId.HasValue)
                 {
                     _statusPill.SetState("已连接 · 等待子会话", Theme.Accent);
