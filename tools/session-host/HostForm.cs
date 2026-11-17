@@ -42,21 +42,18 @@ namespace CuaSessionHost
         }
 
         /// <summary>
-        /// 画面贴边后边框热区被 _bar/_content/RDP 控件盖住，它们的 WM_SETCURSOR
-        /// 才是唯一能改光标的地方（Form 自己的 WndProc 收不到）。
+        /// 角落热区落在 _bar/_content 上，只有这两个窗口自己的 WM_SETCURSOR 能稳定
+        /// 改光标（Form 的 WndProc 收不到）。所以直接子类化它们——用 AssignHandle
+        /// 挂 NativeWindow 会在控件重建句柄后失效。**不**碰 RDP 控件：那里的光标
+        /// 是 mstscax 画的远端光标，抢过来只会被它顶回去、闪一下。
         /// </summary>
-        private sealed class CursorRelay : NativeWindow
+        private sealed class PipSurface : Panel
         {
-            private readonly HostForm _form;
-
-            internal CursorRelay(HostForm form)
-            {
-                _form = form;
-            }
+            internal HostForm Owner;
 
             protected override void WndProc(ref Message m)
             {
-                if (m.Msg == WmSetCursor && _form.RelayCursor(m.HWnd))
+                if (m.Msg == WmSetCursor && Owner != null && Owner.RelayCursor())
                 {
                     m.Result = (IntPtr)1;
                     return;
@@ -85,8 +82,8 @@ namespace CuaSessionHost
         }
 
         private readonly Options _opt;
-        private readonly Panel _bar;
-        private readonly Panel _content;
+        private readonly PipSurface _bar;
+        private readonly PipSurface _content;
         private readonly SessionRdp _rdp;
         private readonly Label _title;
         private readonly Label _meta;
@@ -102,8 +99,6 @@ namespace CuaSessionHost
         private readonly System.Windows.Forms.Timer _poll;
         private readonly DateTime _started = DateTime.UtcNow;
         private readonly PipFilter _filter;
-        private readonly System.Collections.Generic.List<CursorRelay> _relays =
-            new System.Collections.Generic.List<CursorRelay>();
 
         private NotifyIcon _tray;
         private ContextMenuStrip _trayMenu;
@@ -149,15 +144,14 @@ namespace CuaSessionHost
         private int _scalePercent = 100;
         private float _uiScale = 1f;
 
-        // 画中画：画面贴边，没有外框留白；靠边缘几像素的透明热区缩放
+        // 画中画：画面贴边，没有外框留白；只有四个角是可缩放热区
         private Rectangle _pipBounds = Rectangle.Empty;
-        private int _grip = 6;
+        private int _grip = 14;   // 四角缩放热区的边长
         private double _aspect = 16.0 / 9.0;
         private PipGesture _gesture;
         private PipZone _gestureZone;
         private Rectangle _gestureStart;
         private Point _gestureCursor;
-        private PipZone _cursorZone;
         private DateTime _lastDownAt = DateTime.MinValue;
         private Point _lastDownPos = Point.Empty;
         private DateTime _lastCaptionDown = DateTime.MinValue;
@@ -183,8 +177,9 @@ namespace CuaSessionHost
             Bounds = work;
             WindowState = FormWindowState.Normal;
 
-            _bar = new Panel
+            _bar = new PipSurface
             {
+                Owner = this,
                 BackColor = Theme.Bar,
                 Height = 56
             };
@@ -246,7 +241,7 @@ namespace CuaSessionHost
             _tips.SetToolTip(_settings, "子会话设置");
             _tips.SetToolTip(_edge, "在子会话中打开独立浏览器（CuaEdge / CuaChrome）");
             _tips.SetToolTip(_mode, "在 RDP（老式直连）与 VNC（自研抓屏）观察模式间切换");
-            _tips.SetToolTip(_statusPill, "画中画：拖动画面移动小窗，拖动四周边缘等比缩放（Shift 自由缩放），双击画面最大化");
+            _tips.SetToolTip(_statusPill, "画中画：任意位置拖动移动小窗，拖四角等比缩放（Shift 自由缩放），双击画面最大化");
 
             // 无边框窗口：按住标题栏空白处拖动 = 原生移动（含 Aero 贴边）；
             // 双击标题栏 = 最大化/还原。原生拖动会吃掉第二次点击，所以双击
@@ -305,7 +300,7 @@ namespace CuaSessionHost
             _bar.Controls.Add(_close);
             _bar.Resize += delegate { LayoutBar(); };
 
-            _content = new Panel { BackColor = Color.Black };
+            _content = new PipSurface { Owner = this, BackColor = Color.Black };
             _rdp = new SessionRdp();
             _rdp.Dock = DockStyle.None;
             _content.Controls.Add(_rdp);
@@ -318,7 +313,6 @@ namespace CuaSessionHost
             Load += delegate
             {
                 ApplyDpi();
-                AttachCursorRelays();
                 Rectangle? saved = LoadViewerBounds();
                 if (saved.HasValue) _pipBounds = saved.Value;
                 if (_pipBounds.IsEmpty) _pipBounds = DefaultPipBounds(Screen.PrimaryScreen.WorkingArea);
@@ -385,8 +379,15 @@ namespace CuaSessionHost
         protected override void OnMouseCaptureChanged(EventArgs e)
         {
             base.OnMouseCaptureChanged(e);
-            // Alt+Tab 等抢走捕获时不要让手势卡住
-            if (_gesture != PipGesture.None && !Capture) EndGesture();
+            if (_gesture == PipGesture.None || Capture) return;
+            // 按钮还按着就只是被别人短暂抢走捕获 → 抢回来，别把拖动作废；
+            // 按钮已经松开才是真的结束（Alt+Tab、点在别的窗口上等）。
+            if ((Control.MouseButtons & MouseButtons.Left) != 0)
+            {
+                try { Capture = true; } catch { }
+                return;
+            }
+            EndGesture();
         }
 
         protected override void WndProc(ref Message m)
@@ -432,7 +433,7 @@ namespace CuaSessionHost
             if (dpi <= 0) dpi = 96;
             _uiScale = Math.Max(1f, dpi / 96f);
             _scalePercent = Math.Max(100, Math.Min(500, (int)Math.Round(dpi * 100.0 / 96.0)));
-            _grip = Math.Max(5, (int)Math.Round(6 * _uiScale));
+            _grip = Math.Max(12, (int)Math.Round(14 * _uiScale));
             ApplyChrome();
 
             int buttonHeight = Math.Max(30, (int)Math.Round(34 * _uiScale));
@@ -446,25 +447,14 @@ namespace CuaSessionHost
             Native.ApplyDarkWindow(Handle);
         }
 
-        /// <summary>给盖住边框热区的子窗口挂光标中继（句柄重建后要重挂）。</summary>
-        private void AttachCursorRelays()
+        /// <summary>角落热区：给斜向缩放光标并吞掉 WM_SETCURSOR，其余交还原控件。</summary>
+        internal bool RelayCursor()
         {
-            if (_relays.Count > 0) return;
-            foreach (Control c in new Control[] { _bar, _content, _rdp })
-                AttachCursorRelay(c);
-        }
-
-        private void AttachCursorRelay(Control control)
-        {
-            if (control == null) return;
-            try
-            {
-                if (!control.IsHandleCreated) { IntPtr force = control.Handle; GC.KeepAlive(force); }
-                var relay = new CursorRelay(this);
-                relay.AssignHandle(control.Handle);
-                _relays.Add(relay);
-            }
-            catch { }
+            if (_gesture != PipGesture.None) return false;
+            PipZone zone = ZoneOf(PointToClient(Cursor.Position));
+            if (zone == PipZone.None) return false;
+            Cursor.Current = GestureCursor(PipGesture.Resize, zone);
+            return true;
         }
 
         private void ApplyChrome()
@@ -1226,7 +1216,6 @@ namespace CuaSessionHost
                     {
                         _rfbCtl = new RfbClientControl();
                         _content.Controls.Add(_rfbCtl);
-                        AttachCursorRelay(_rfbCtl);   // 贴边后边框热区落在它身上
                     }
                     _rfbCtl.Bounds = _rdp.Bounds;
                     _rfbCtl.Visible = true;
@@ -1494,16 +1483,21 @@ namespace CuaSessionHost
             return chromeH + Math.Max(1, (int)Math.Round(contentWidth / aspect));
         }
 
-        /// <summary>边缘/角落拖拽手势带：整个内容外侧的边框。</summary>
+        /// <summary>
+        /// 只有四个角可以缩放（斜着拖），四边不做缩放——边缘留给"拖动移动窗口"。
+        /// </summary>
         private PipZone ZoneOf(Point p)
         {
-            int grip = Math.Max(4, _grip);
-            PipZone zone = PipZone.None;
-            if (p.X < grip) zone |= PipZone.Left;
-            else if (p.X >= ClientSize.Width - grip) zone |= PipZone.Right;
-            if (p.Y < grip) zone |= PipZone.Top;
-            else if (p.Y >= ClientSize.Height - grip) zone |= PipZone.Bottom;
-            return zone;
+            int grip = _grip;
+            bool left = p.X < grip;
+            bool right = p.X >= ClientSize.Width - grip;
+            bool top = p.Y < grip;
+            bool bottom = p.Y >= ClientSize.Height - grip;
+            if (left && top) return PipZone.Left | PipZone.Top;
+            if (right && top) return PipZone.Right | PipZone.Top;
+            if (left && bottom) return PipZone.Left | PipZone.Bottom;
+            if (right && bottom) return PipZone.Right | PipZone.Bottom;
+            return PipZone.None;
         }
 
         private bool InContent(Point p)
@@ -1525,8 +1519,8 @@ namespace CuaSessionHost
 
         /// <summary>
         /// 在消息分发前处理画中画手势。返回 true = 消息已被吞掉。
-        /// 只读观察时画面就是窗口：中心拖动 = 移动，双击 = 最大化；
-        /// 边框带任意角落 = 等比缩放。接管控制时全部放行给子会话。
+        /// 只读观察时整个窗口都是抓手：任意位置拖动 = 移动，双击 = 最大化，
+        /// 四角 = 等比缩放。接管控制时全部放行给子会话。
         /// </summary>
         internal bool FilterMessage(ref Message m)
         {
@@ -1596,7 +1590,6 @@ namespace CuaSessionHost
                     ResizeTo(cursor);
                     return true;
                 }
-                UpdateEdgeCursor(p);
                 return false;
             }
 
@@ -1608,39 +1601,13 @@ namespace CuaSessionHost
             return false;
         }
 
-        /// <summary>子控件的 WM_SETCURSOR 转过来：热区给缩放光标，其余返回 false 交还原控件。</summary>
-        internal bool RelayCursor(IntPtr hwnd)
-        {
-            if (_gesture != PipGesture.None) return false;
-            PipZone zone = ZoneOf(PointToClient(Cursor.Position));
-            if (zone == PipZone.None) return false;
-            Cursor.Current = GestureCursor(PipGesture.Resize, zone);
-            return true;
-        }
-
-        /// <summary>
-        /// 边框热区光标：只在进出热区时改一次 Cursor.Current，画面内部立刻还回
-        /// 默认箭头（不改 Form.Cursor 属性，子控件才不会继承成拖拽光标）。
-        /// </summary>
-        private void UpdateEdgeCursor(Point p)
-        {
-            PipZone zone = ZoneOf(p);
-            if (zone == _cursorZone) return;
-            bool wasEdge = _cursorZone != PipZone.None;
-            _cursorZone = zone;
-            if (zone != PipZone.None) Cursor.Current = GestureCursor(PipGesture.Resize, zone);
-            else if (wasEdge) Cursor.Current = Cursors.Default;
-        }
-
         private void BeginGesture(PipGesture gesture, PipZone zone, Point cursor)
         {
             PipLog("begin " + gesture + " zone=" + zone + " cursor=" + cursor + " bounds=" + Bounds);
-            try { if (!Focused) Activate(); } catch { }
             _gesture = gesture;
             _gestureZone = zone;
             _gestureStart = Bounds;
             _gestureCursor = cursor;
-            _cursorZone = zone;
             Cursor.Current = GestureCursor(gesture, zone);
             try { Capture = true; } catch { }
         }
@@ -1650,7 +1617,6 @@ namespace CuaSessionHost
             if (_gesture == PipGesture.None) return;
             _gesture = PipGesture.None;
             _gestureZone = PipZone.None;
-            _cursorZone = PipZone.None;
             try { Capture = false; } catch { }
             Cursor.Current = Cursors.Default;
             PipLog("end bounds=" + Bounds);
