@@ -27,6 +27,9 @@ namespace CuaSessionHost
         private readonly FluentButton _close;
         private System.Windows.Forms.CheckBox _chkAutoVnc;
         private System.Windows.Forms.CheckBox _chkHeadless;
+        private Panel _capStrip;
+        private Label _capTitle;
+        private FluentButton _capClose;
         private float _scale = 1f;
         private bool _edgeLoading;
 
@@ -35,7 +38,7 @@ namespace CuaSessionHost
             _owner = owner;
             Text = "cua · 子会话设置";
             Icon = Theme.AppIcon(false);
-            FormBorderStyle = FormBorderStyle.FixedDialog;
+            FormBorderStyle = FormBorderStyle.None;
             StartPosition = FormStartPosition.CenterParent;
             MaximizeBox = false;
             MinimizeBox = false;
@@ -104,15 +107,18 @@ namespace CuaSessionHost
                 AutoSize = true
             };
             _chkAutoVnc.Checked = VncHelper.AutoStartOnChildStart;
+            _chkAutoVnc.Checked = !VncHelper.AutoStartOnChildStart; // 勾选=不自动
             _chkAutoVnc.CheckedChanged += delegate
             {
-                VncHelper.AutoStartOnChildStart = _chkAutoVnc.Checked;
+                bool noAuto = _chkAutoVnc.Checked;
+                VncHelper.AutoStartOnChildStart = !noAuto;
                 _owner.SyncTrayToggleStates();
-                // 会话已启动时勾选/取消立即生效：开 = 立即打开视图，关 = 关闭视图
+                UpdateAutoVncText();
+                // 会话已启动时立即生效：勾选(不自动)=关闭视图，取消=打开视图
                 if (_owner.IsChildRunning)
                 {
-                    if (_chkAutoVnc.Checked) { _owner.StartMainVnc(); }
-                    else { _owner.CloseMainVnc(); }
+                    if (noAuto) { _owner.CloseMainVnc(); }
+                    else { _owner.StartMainVnc(); }
                 }
             };
             _chkHeadless = new System.Windows.Forms.CheckBox
@@ -128,6 +134,41 @@ namespace CuaSessionHost
                 VncHelper.HeadlessAutoDisable = _chkHeadless.Checked;
                 _owner.SyncTrayToggleStates();
             };
+
+            // 自绘标题条：颜色精确 32,32,32，可拖拽，右上关闭
+            _capStrip = new Panel
+            {
+                BackColor = Color.FromArgb(32, 32, 32),
+                Dock = DockStyle.Top,
+                Height = 40
+            };
+            _capTitle = new Label
+            {
+                Text = "cua · 子会话设置",
+                Font = Theme.Ui(9.5f),
+                ForeColor = Theme.Text,
+                BackColor = Color.FromArgb(32, 32, 32),
+                AutoSize = true,
+                Location = new Point(14, 10)
+            };
+            _capClose = new FluentButton { Text = "\uE8BB", Font = Theme.Icon(8f), Ghost = true, Danger = true, CornerRadius = 0 };
+            _capClose.Size = new Size(44, 40);
+            _capClose.Location = new Point(Math.Max(0, ClientSize.Width - 44), 0);
+            _capClose.Click += delegate { Close(); };
+            foreach (var c in new Control[] { _capStrip, _capTitle })
+            {
+                c.MouseDown += (sdr, ev) =>
+                {
+                    if (ev.Button == MouseButtons.Left)
+                    {
+                        Native.ReleaseCapture();
+                        Native.SendMessage(Handle, 0xA1 /* WM_NCLBUTTONDOWN */, (IntPtr)2 /* HTCAPTION */, IntPtr.Zero);
+                    }
+                };
+            }
+            Controls.Add(_capTitle);
+            Controls.Add(_capClose);
+            Controls.Add(_capStrip);
 
             _openEdge.Click += delegate { _owner.OpenChildEdgeFromSettings(); RefreshState(); };
             _refreshEdge.Click += delegate { RefreshState(); };
@@ -182,21 +223,12 @@ namespace CuaSessionHost
             };
         }
 
-        protected override void OnHandleCreated(EventArgs e)
-        {
-            base.OnHandleCreated(e);
-            // 标题栏与窗体背景同色（一体化外观）
-            var c = Color.FromArgb(32, 32, 32);
-            int colorRef = (c.B << 16) | (c.G << 8) | c.R;
-            Native.SetCaptionColor(Handle, colorRef);
-        }
-
         private void ApplyScale()
         {
             _scale = Math.Max(1f, Native.GetDpiForWindow(Handle) / 96f);
             int S(int value) { return (int)Math.Round(value * _scale); }
 
-            ClientSize = new Size(S(640), S(648));
+            ClientSize = new Size(S(640), S(648) + S(40));
             _heading.Location = new Point(S(24), S(20));
             _hint.Location = new Point(S(24), S(58));
             _hint.Size = new Size(S(592), S(52));
@@ -234,7 +266,23 @@ namespace CuaSessionHost
             _exit.Location = new Point(S(288), S(478));
             _chkAutoVnc.Location = new Point(S(24), S(540));
             _chkHeadless.Location = new Point(S(24), S(576));
+            // 内容整体下移自绘标题条的高度
+            int capH = S(40);
+            foreach (System.Windows.Forms.Control c in Controls)
+            {
+                if (c == _capStrip || c == _capTitle || c == _capClose) continue;
+                c.Top += capH;
+            }
+            _capClose.Location = new Point(ClientSize.Width - S(44), 0);
             CenterToScreen();
+        }
+
+        private void UpdateAutoVncText()
+        {
+            bool auto = VncHelper.AutoStartOnChildStart;
+            _chkAutoVnc.Text = auto
+                ? "子会话启动时，自动在子会话打开主会话的 VNC 视图"
+                : "子会话启动时，不自动打开主会话的 VNC 视图（需要时从托盘手动打开）";
         }
 
         private void RefreshState()
@@ -248,10 +296,7 @@ namespace CuaSessionHost
             _restart.Visible = _owner.SessionConnected;
             _logoff.Enabled = _owner.SessionConnected;
             _exit.Enabled = _owner.SessionConnected;
-            // AutoVNC 文案随会话状态变化：未启动=下次启动生效；已启动=立即生效
-            _chkAutoVnc.Text = _owner.SessionConnected
-                ? "子会话已启动：勾选立即在子会话打开主会话的 VNC 视图，取消则关闭"
-                : "子会话启动时，自动在子会话打开主会话的 VNC 视图";
+            UpdateAutoVncText();
         }
 
         private void RefreshEdgeInfo()

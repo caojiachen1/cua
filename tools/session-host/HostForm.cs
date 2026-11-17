@@ -1239,9 +1239,11 @@ namespace CuaSessionHost
             _menuRestart.Enabled = running;
             if (_menuAutoVnc != null)
             {
-                _menuAutoVnc.Text = running
-                    ? "立即打开主会话 VNC 视图（子会话已启动）"
-                    : "子会话启动时自动 VNC 到主会话";
+                bool auto = VncHelper.AutoStartOnChildStart;
+                _menuAutoVnc.Text = auto
+                    ? "子会话启动时自动 VNC 到主会话"
+                    : "子会话启动时不自动打开 VNC 视图";
+                _menuAutoVnc.Checked = auto;
             }
         }
 
