@@ -26,10 +26,16 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 pub fn cmd_rfb_server(port: u16) -> Result<i32> {
     let listener = TcpListener::bind(("127.0.0.1", port))
         .with_context(|| format!("bind 127.0.0.1:{port}"))?;
-    println!(
-        "{}",
-        serde_json::json!({ "ok": true, "listening": format!("127.0.0.1:{port}") })
-    );
+    // 计划任务拉起时没有控制台，println 会 panic 导致进程退出——落文件日志
+    {
+        let dir = std::env::var("CUA_DATA_DIR").unwrap_or_else(|_| ".".into());
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(std::path::Path::new(&dir).join("rfb-server.log"))
+            .and_then(|mut f| std::io::Write::write_all(&mut f, format!("listening 127.0.0.1:{port}
+").as_bytes()));
+    }
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
@@ -151,6 +157,11 @@ fn serve_client(mut stream: TcpStream) -> Result<()> {
                 }
                 let mut skip = vec![0u8; len];
                 stream.read_exact(&mut skip)?;
+            }
+            _ => {
+                // 其余类型（1 FixColourMapEntries 等）按未知长度跳过不安全，
+                // 直接断开让客户端重连
+                bail!("unsupported client message {}", buf[0]);
             }
         }
     }
