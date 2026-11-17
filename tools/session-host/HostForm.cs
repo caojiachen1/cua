@@ -349,9 +349,9 @@ namespace CuaSessionHost
             int ubw = 0;
             foreach (var b in new FluentButton[] { _takeover, _release, _hide, _settings, _edge, _mode })
             {
-                ubw = Math.Max(ubw, TextRenderer.MeasureText(b.Text, b.Font).Width + 10);
+                ubw = Math.Max(ubw, TextRenderer.MeasureText(b.Text, b.Font).Width + 14);
             }
-            int ubh = (int)Math.Round(22 * _uiScale);
+            int ubh = (int)Math.Round(25 * _uiScale);
             int wbw = (int)Math.Round(ubh * 1.15); // 左右钮（窗口控制）更窄
             foreach (var b in new FluentButton[] { _takeover, _release, _hide, _settings, _edge, _mode })
             {
