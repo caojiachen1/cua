@@ -189,9 +189,10 @@ pub(crate) enum SessionOp {
         /// Keep the current user's startup apps enabled in the child session.
         #[arg(long)]
         keep_startup: bool,
-        /// 路由开关保持开启：远程软件落在子会话（远程协助模式，观察窗可用）
+        /// 无头模式：启动后自动关闭路由开关——远程软件接管主会话，
+        /// 子会话任务继续跑但无画面（OS 限制）。默认关闭（老样子）。
         #[arg(long)]
-        routable: bool,
+        headless: bool,
         #[arg(long)]
         width: Option<u32>,
         #[arg(long)]

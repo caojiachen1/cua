@@ -226,8 +226,8 @@ fn host_call(state: &SessionState, op: &str, extra: Value) -> Result<Value> {
 pub fn dispatch(op: SessionOp) -> Result<i32> {
     match op {
         SessionOp::Setup { enable_rdp } => cmd_setup(enable_rdp),
-        SessionOp::Start { view: _, hide, interactive, keep_startup, routable, width, height } => {
-            cmd_start(!hide, interactive, keep_startup, routable, width, height)
+        SessionOp::Start { view: _, hide, interactive, keep_startup, headless, width, height } => {
+            cmd_start(!hide, interactive, keep_startup, headless, width, height)
         }
         SessionOp::Login => cmd_credentials(true),
         SessionOp::Logout => cmd_credentials(false),
