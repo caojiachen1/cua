@@ -343,6 +343,13 @@ fn cmd_start(
     width: Option<u32>,
     height: Option<u32>,
 ) -> Result<i32> {
+    // A previous stop turns the system-wide child-sessions flag off (it steals
+    // remote-desktop logons otherwise). Starting again must re-enable it, so
+    // run the elevated setup helper here instead of failing later.
+    if !wts_enabled().unwrap_or(true) {
+        cmd_setup(false)?;
+    }
+
     if let Some(st) = load_state() {
         if host_alive(&st) {
             if view || interactive {

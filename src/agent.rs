@@ -24,10 +24,27 @@ use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const MAX_MESSAGE: usize = 32 * 1024 * 1024;
 
+fn alog(m: &str) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let line = format!("[t+{}s] {}
+", ts, m);
+    if let Ok(dir) = std::env::var("TEMP") {
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(std::path::Path::new(&dir).join("cua-child-agent.log"))
+            .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+    }
+}
+
 pub fn run(data_dir: Option<String>) -> Result<i32> {
     unsafe {
         let _ = FreeConsole();
     }
+    alog("agent run start");
 
     let mut session_id = 0u32;
     unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session_id) }
@@ -68,16 +85,24 @@ pub fn run(data_dir: Option<String>) -> Result<i32> {
             }
         }
 
+        alog("loop: ConnectNamedPipe pending / reading");
         let response = match read_message(handle, &mut buffer) {
-            Ok(0) => None,
+            Ok(0) => {
+                alog("read: client closed (0 bytes)");
+                None
+            }
             Ok(n) => {
+                alog(&format!("read: {} bytes", n));
                 let text = String::from_utf8_lossy(&buffer[..n]).to_string();
                 let request: Value = serde_json::from_str(&text).unwrap_or_else(|e| {
                     json!({ "op": "error", "error": format!("bad JSON: {e}") })
                 });
                 Some(handle_request(&request, session_id, &session_tag, data_dir.as_deref()))
             }
-            Err(e) => Some(json!({ "ok": false, "error": e.to_string(), "code": 1 })),
+            Err(e) => {
+                alog(&format!("read error: {e}"));
+                Some(json!({ "ok": false, "error": e.to_string(), "code": 1 }))
+            }
         };
 
         if let Some(value) = response {
@@ -89,6 +114,7 @@ pub fn run(data_dir: Option<String>) -> Result<i32> {
         unsafe {
             let _ = DisconnectNamedPipe(handle);
         }
+        alog("loop: disconnected, next client");
     }
 
     unsafe {
@@ -153,19 +179,27 @@ fn run_command(
         .stderr(Stdio::piped())
         .creation_flags(CREATE_NO_WINDOW);
 
+    alog(&format!("exec: spawning {:?}", argv));
     let start = Instant::now();
     let mut child = cmd.spawn().with_context(|| format!("spawn {}", exe.display()))?;
+    alog("exec: spawned");
     let mut out = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
     let mut err = child.stderr.take().ok_or_else(|| anyhow!("no stderr"))?;
+    // Collect output through a channel with a short post-exit deadline: a
+    // grandchild process (e.g. a viewer spawned by `main view`) may inherit
+    // the stdout write handle, so read_to_end would never see EOF and the
+    // pipe loop would wedge forever waiting for join().
+    let (out_tx, out_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let err_tx = out_tx.clone();
     let out_thread = std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = out.read_to_end(&mut buf);
-        buf
+        let _ = out_tx.send(buf);
     });
     let err_thread = std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = err.read_to_end(&mut buf);
-        buf
+        let _ = err_tx.send(buf);
     });
 
     let deadline = start + Duration::from_millis(timeout_ms);
@@ -182,8 +216,17 @@ fn run_command(
         std::thread::sleep(Duration::from_millis(50));
     };
 
-    let stdout = out_thread.join().unwrap_or_default();
-    let stderr = err_thread.join().unwrap_or_default();
+    alog(&format!("exec: child exited (timed_out={timed_out})"));
+    let collect_deadline = Duration::from_secs(2);
+    let stdout = out_rx
+        .recv_timeout(collect_deadline)
+        .unwrap_or_else(|_| {
+            alog("exec: stdout reader still open (inherited handle) — returning partial");
+            Vec::new()
+        });
+    let stderr = out_rx
+        .recv_timeout(collect_deadline)
+        .unwrap_or_default();
     let mut stderr_text = String::from_utf8_lossy(&stderr).to_string();
     if timed_out {
         if !stderr_text.is_empty() && !stderr_text.ends_with('\n') {
