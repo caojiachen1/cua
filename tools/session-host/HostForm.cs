@@ -37,7 +37,6 @@ namespace CuaSessionHost
         private enum PipGesture
         {
             None,
-            Move,
             Resize
         }
 
@@ -1614,11 +1613,6 @@ namespace CuaSessionHost
                             ToggleMaximize();
                             return true;
                         }
-                        if (!_isMaximized)
-                        {
-                            BeginGesture(PipGesture.Move, PipZone.None, cursor);
-                            return true;
-                        }
                         return false;
                     }
                     // 接管控制：点击前再启用一次 RDP 输入窗口，防止窗口缩放后点击落空
@@ -1629,11 +1623,6 @@ namespace CuaSessionHost
 
             if (msg == WmMouseMove)
             {
-                if (_gesture == PipGesture.Move)
-                {
-                    DragTo(cursor);
-                    return true;
-                }
                 if (_gesture == PipGesture.Resize)
                 {
                     ResizeTo(cursor);
@@ -1708,15 +1697,29 @@ namespace CuaSessionHost
                 return;
             }
             if (_isMaximized) return;
-            BeginGesture(PipGesture.Move, PipZone.None, cursor);
+            StartSystemMove(cursor);
         }
 
-        private void DragTo(Point cursor)
+        /// <summary>
+        /// 用系统原生移动（WM_NCLBUTTONDOWN + HTCAPTION）来搬窗口：窗口和所有子控件
+        /// 由窗口管理器整体搬运，按钮不会相对标题栏位移、也不会撕裂——自己逐帧
+        /// SetWindowPos 快拖时会出现"按钮偏移一帧"的观感。
+        /// </summary>
+        private void StartSystemMove(Point cursor)
         {
-            Rectangle b = _gestureStart;
-            b.X += cursor.X - _gestureCursor.X;
-            b.Y += cursor.Y - _gestureCursor.Y;
-            Bounds = ClampToScreen(b);
+            try
+            {
+                Native.ReleaseCapture();
+                int lparam = ((cursor.Y & 0xFFFF) << 16) | (cursor.X & 0xFFFF);
+                Native.SendMessage(Handle, 0xA1 /* WM_NCLBUTTONDOWN */, (IntPtr)HtCaption, (IntPtr)lparam);
+            }
+            catch { }
+            if (!_isMaximized)
+            {
+                _pipBounds = Bounds;
+                SaveViewerBounds();
+            }
+            WriteState();
         }
 
         /// <summary>
@@ -1782,7 +1785,6 @@ namespace CuaSessionHost
 
         private static Cursor GestureCursor(PipGesture gesture, PipZone zone)
         {
-            if (gesture == PipGesture.Move) return Cursors.SizeAll;
             bool left = (zone & PipZone.Left) != 0;
             bool right = (zone & PipZone.Right) != 0;
             bool top = (zone & PipZone.Top) != 0;
