@@ -25,6 +25,8 @@ namespace CuaSessionHost
         private readonly FluentButton _logoff;
         private readonly FluentButton _exit;
         private readonly FluentButton _close;
+        private System.Windows.Forms.CheckBox _chkAutoVnc;
+        private System.Windows.Forms.CheckBox _chkHeadless;
         private float _scale = 1f;
         private bool _edgeLoading;
 
@@ -94,6 +96,33 @@ namespace CuaSessionHost
             _exit.Danger = true;
             _close = MakeButton("关闭窗口", false);
 
+            _chkAutoVnc = new System.Windows.Forms.CheckBox
+            {
+                Text = "子会话启动时，自动在子会话打开主会话的 VNC 视图（tvnviewer）",
+                ForeColor = Theme.Text,
+                BackColor = Theme.Window,
+                AutoSize = true
+            };
+            _chkAutoVnc.Checked = VncHelper.AutoStartOnChildStart;
+            _chkAutoVnc.CheckedChanged += delegate
+            {
+                VncHelper.AutoStartOnChildStart = _chkAutoVnc.Checked;
+                _owner.SyncTrayToggleStates();
+            };
+            _chkHeadless = new System.Windows.Forms.CheckBox
+            {
+                Text = "下次启动后自动关闭路由（无头模式：远程软件接管主会话）",
+                ForeColor = Theme.Text,
+                BackColor = Theme.Window,
+                AutoSize = true
+            };
+            _chkHeadless.Checked = VncHelper.HeadlessAutoDisable;
+            _chkHeadless.CheckedChanged += delegate
+            {
+                VncHelper.HeadlessAutoDisable = _chkHeadless.Checked;
+                _owner.SyncTrayToggleStates();
+            };
+
             _openEdge.Click += delegate { _owner.OpenChildEdgeFromSettings(); RefreshState(); };
             _refreshEdge.Click += delegate { RefreshState(); };
             _backupEdge.Click += delegate { _owner.BackupEdgeProfileFromSettings(); RefreshState(); };
@@ -125,6 +154,8 @@ namespace CuaSessionHost
             Controls.Add(_logoff);
             Controls.Add(_exit);
             Controls.Add(_close);
+            Controls.Add(_chkAutoVnc);
+            Controls.Add(_chkHeadless);
 
             Load += delegate
             {
@@ -150,7 +181,7 @@ namespace CuaSessionHost
             _scale = Math.Max(1f, Native.GetDpiForWindow(Handle) / 96f);
             int S(int value) { return (int)Math.Round(value * _scale); }
 
-            ClientSize = new Size(S(640), S(560));
+            ClientSize = new Size(S(640), S(648));
             _heading.Location = new Point(S(24), S(20));
             _hint.Location = new Point(S(24), S(58));
             _hint.Size = new Size(S(592), S(52));
@@ -186,6 +217,8 @@ namespace CuaSessionHost
             _close.Location = new Point(S(416), S(418));
             _deleteEdge.Location = new Point(S(24), S(478));
             _exit.Location = new Point(S(288), S(478));
+            _chkAutoVnc.Location = new Point(S(24), S(540));
+            _chkHeadless.Location = new Point(S(24), S(576));
             CenterToScreen();
         }
 

@@ -1017,6 +1017,19 @@ namespace CuaSessionHost
             _modeMenu.Items.Add(_modeVncItem);
         }
 
+        /// 设置对话框改动后同步托盘菜单的勾选状态
+        public void SyncTrayToggleStates()
+        {
+            if (_menuAutoVnc != null)
+            {
+                _menuAutoVnc.Checked = VncHelper.AutoStartOnChildStart;
+            }
+            if (_menuHeadless != null)
+            {
+                _menuHeadless.Checked = VncHelper.HeadlessAutoDisable;
+            }
+        }
+
         private void SwitchViewMode(bool vnc)
         {
             try
