@@ -468,35 +468,66 @@ fn cmd_simple(op: &str) -> Result<i32> {
 }
 
 fn cmd_stop() -> Result<i32> {
-    let Some(st) = load_state() else {
-        print_value(&json!({ "ok": true, "message": "no child session" }));
-        return Ok(0);
-    };
-    let result = host_call(&st, "stop", json!({}));
-    match result {
-        Ok(v) => {
-            print_value(&v);
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while state_path().exists() && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(100));
+    let mut receipt = serde_json::json!({});
+    match load_state() {
+        Some(st) => match host_call(&st, "stop", serde_json::json!({})) {
+            Ok(v) => {
+                receipt = serde_json::json!(v);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while state_path().exists() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
             }
-            let _ = std::fs::remove_file(state_path());
-            Ok(0)
-        }
-        Err(e) => {
-            let _ = std::fs::remove_file(state_path());
-            print_value(&json!({
-                "ok": true,
-                "host_alive": false,
-                "message": format!("host was not reachable; stale state removed ({e})")
-            }));
-            Ok(0)
+            Err(e) => {
+                receipt = serde_json::json!({
+                    "ok": true,
+                    "host_alive": false,
+                    "message": format!("host was not reachable; stale state removed ({e})")
+                });
+            }
+        },
+        None => {
+            receipt = serde_json::json!({ "ok": true, "message": "no child session" });
         }
     }
+    let _ = std::fs::remove_file(state_path());
+
+    // Child sessions steal incoming remote-desktop logons (ToDesk / UU / RDP
+    // land in the child session instead of the console), so a stop must also
+    // turn the system flag off and log off any stale child session. Both need
+    // elevation, hence the same UAC helper the setup path uses.
+    match wts_enabled() {
+        Ok(true) => {
+            let host = host_exe()?;
+            let dir = crate::util::ensure_data_dir();
+            let _ = std::fs::remove_file(setup_path());
+            let args = format!("--disable-child-sessions --data-dir \"{}\"", dir.display());
+            match runas_wait(&host, &args, &dir) {
+                Ok(_) => {
+                    receipt["child_sessions"] = load_json(&setup_path()).unwrap_or_else(|| {
+                        serde_json::json!({ "ok": false, "error": "helper wrote no result" })
+                    });
+                }
+                Err(e) => {
+                    receipt["child_sessions"] = serde_json::json!({
+                        "ok": false,
+                        "error": format!("elevation cancelled or failed: {e}"),
+                        "hint": "remote logons keep landing in the child session until disabled"
+                    });
+                }
+            }
+        }
+        Ok(false) => {
+            receipt["child_sessions"] = serde_json::json!({ "ok": true, "was_enabled": false });
+        }
+        Err(e) => {
+            receipt["child_sessions"] = serde_json::json!({ "ok": false, "error": e.to_string() });
+        }
+    }
+    print_value(&receipt);
+    Ok(0)
 }
 
-/// `cua child <args...>` and `cua --child <args...>` both route through here.
-/// Returns None when this is not a child invocation.
 pub fn maybe_child(raw: &[String]) -> Option<i32> {
     let mut rest: Vec<String> = raw.iter().skip(1).cloned().collect();
     let mut child = false;
@@ -523,6 +554,8 @@ pub fn maybe_child(raw: &[String]) -> Option<i32> {
         }
     }
 }
+
+
 
 fn exec_remote(args: &[String]) -> Result<i32> {
     let st = load_state().ok_or_else(|| anyhow!("no child session; run `cua session start`"))?;

@@ -15,6 +15,7 @@ namespace CuaSessionHost
         public bool Logout;
         public bool KeepStartup;
         public bool RestoreStartup;
+        public bool DisableChildSessions;
         public int Width;
         public int Height;
         public bool ExplicitSize;
@@ -46,6 +47,7 @@ namespace CuaSessionHost
                     case "--logout": o.Logout = true; break;
                     case "--keep-startup": o.KeepStartup = true; break;
                     case "--restore-startup": o.RestoreStartup = true; break;
+                    case "--disable-child-sessions": o.DisableChildSessions = true; break;
                     case "--width": o.Width = ParseInt(Next(args, ref i), o.Width); o.ExplicitSize = true; break;
                     case "--height": o.Height = ParseInt(Next(args, ref i), o.Height); o.ExplicitSize = true; break;
                     case "--cua-exe": o.CuaExe = Next(args, ref i); break;
@@ -82,6 +84,37 @@ namespace CuaSessionHost
 
     internal static class Program
     {
+        /// <summary>
+        /// Turn the system-wide child-sessions flag off and log off any stale
+        /// child session, so incoming remote-desktop logons (ToDesk / UU / RDP)
+        /// land back in the console session instead of being routed away.
+        /// Writes its result to session-setup.json for the CLI to read back.
+        /// </summary>
+        private static int DisableChildSessionsFlow(string dataDir)
+        {
+            var result = new System.Collections.Generic.Dictionary<string, object>();
+            try
+            {
+                uint? id = ChildSessionApi.TryGetId();
+                if (id.HasValue)
+                {
+                    try { ChildSessionApi.Logoff(id.Value); result["logged_off_session"] = id.Value; }
+                    catch (Exception ex) { result["logoff_error"] = ex.Message; }
+                }
+                ChildSessionApi.Disable();
+                result["ok"] = true;
+                result["disabled"] = true;
+            }
+            catch (Exception ex)
+            {
+                result["ok"] = false;
+                result["error"] = ex.Message;
+            }
+            File.WriteAllText(Path.Combine(dataDir, "session-setup.json"), Json.Serialize(result));
+            return result.ContainsKey("ok") && true == result["ok"] as bool? ? 0 : 1;
+        }
+
+
         [STAThread]
         private static int Main(string[] args)
         {
@@ -94,6 +127,7 @@ namespace CuaSessionHost
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
 
+                if (opt.DisableChildSessions) return DisableChildSessionsFlow(opt.DataDir);
                 if (opt.Login) return CredentialDialog.Run();
                 if (opt.Logout)
                 {

@@ -36,6 +36,12 @@ namespace CuaSessionHost
                 throw new Win32Exception(Marshal.GetLastWin32Error(), "WTSEnableChildSessions failed");
         }
 
+        public static void Disable()
+        {
+            if (!Native.WTSEnableChildSessions(false))
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "WTSEnableChildSessions failed");
+        }
+
         public static uint? TryGetId()
         {
             uint id;
