@@ -99,6 +99,38 @@ namespace CuaSessionHost
             }
         }
 
+        public static bool PortListening(int port)
+        {
+            try
+            {
+                var c = new System.Net.Sockets.TcpClient();
+                c.Connect("127.0.0.1", port);
+                c.Close();
+                return true;
+            }
+            catch { return false; }
+        }
+
+        /// 在子会话内确保 cua rfb-server --port 5901 在跑（TaskLauncher 直启）。
+        public static void EnsureChildRfbServer(uint sessionId, string cuaExe, string dataDir)
+        {
+            if (PortListening(5901)) return;
+            TaskLauncher.LaunchArgs(sessionId, cuaExe, "rfb-server --port 5901", dataDir);
+        }
+
+        /// 主会话内确保 cua rfb-server --port 5900 在跑。
+        public static void EnsureMainRfbServer(string cuaExe, string dataDir)
+        {
+            if (PortListening(5900)) return;
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(cuaExe)
+            {
+                Arguments = "rfb-server --port 5900",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WorkingDirectory = dataDir
+            });
+        }
+
         private const string SettingsKey = @"Software\cua\Vnc";
         public static bool AutoStartOnChildStart
         {

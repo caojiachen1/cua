@@ -3,6 +3,7 @@
 // confirmation levels), Trae (tool surface incl. batch/clipboard/grounding/verify steps),
 // ZCode (a11y-first, strategy auto|a11y|event, action receipts, background observation),
 // + sandbox hidden-desktop executor for true background control.
+mod rfb;
 mod action;
 mod agent;
 mod background;
@@ -1236,6 +1237,9 @@ fn main() {
                 return code;
             }
             if let Some(code) = session::maybe_vnc(&raw) {
+                return code;
+            }
+            if let Some(code) = rfb::maybe_rfb(&raw) {
                 return code;
             }
             let cli = Cli::parse();

@@ -60,6 +60,8 @@ namespace CuaSessionHost
         private System.Windows.Forms.ToolStripMenuItem _menuAutoVnc;
         private uint? _lastChildId;
         private int _reconnectAttempts;
+        private RfbClientControl _rfbCtl;
+        private bool _vncMode;
         private bool _readyStatus;
         private bool _stopping;
         private bool _trayTipShown;
@@ -299,6 +301,7 @@ namespace CuaSessionHost
                     area.Y + (area.Height - height) / 2,
                     width,
                     height);
+            if (_rfbCtl != null) _rfbCtl.Bounds = _rdp.Bounds;
             }
             else
             {
@@ -378,7 +381,8 @@ namespace CuaSessionHost
             _trayMenu.Items.Add(MenuItem("子会话设置…", OpenSettings));
             _trayMenu.Items.Add(MenuItem("在子会话打开浏览器", OpenChildEdge));
             _trayMenu.Items.Add(MenuItem("远程到主会话 (VNC)", delegate { StartMainVnc(); }));
-            _trayMenu.Items.Add(MenuItem("在主会话看子会话 (VNC)", delegate { StartChildServerAndMainViewer(); }));
+            _trayMenu.Items.Add(MenuItem("观察模式：RDP (老样子)", delegate { SwitchViewMode(false); }));
+            _trayMenu.Items.Add(MenuItem("观察模式：VNC (子会话)", delegate { SwitchViewMode(true); }));
             _menuAutoVnc = new System.Windows.Forms.ToolStripMenuItem("子会话启动时自动 VNC 到主会话");
             _menuAutoVnc.Checked = VncHelper.AutoStartOnChildStart;
             _menuAutoVnc.Click += delegate
@@ -663,8 +667,7 @@ namespace CuaSessionHost
                     if (_reconnectAttempts >= 3)
                     {
                         _reconnectAt = DateTime.MaxValue;
-                        _statusPill.SetState("子会话画面已切换到 VNC", Theme.Accent);
-                        try { StartChildServerAndMainViewer(); } catch { }
+                        SwitchViewMode(true);
                         return;
                     }
                     _reconnectAt = DateTime.UtcNow.AddSeconds(15);
@@ -782,7 +785,7 @@ namespace CuaSessionHost
                         if (!_vncAutoDone && VncHelper.AutoStartOnChildStart)
                         {
                             _vncAutoDone = true;
-                            StartChildServerAndMainViewer();
+                            SwitchViewMode(true);
                         }
                     }
                     else if (_agentAttempts < 6)
@@ -904,6 +907,50 @@ namespace CuaSessionHost
             catch (Exception ex)
             {
                 SetError("vnc: " + ex.GetBaseException().Message);
+            }
+        }
+
+        /// 观察窗模式切换：RDP（老样子）与 VNC（子会话 RFB）无缝切换。
+        /// VNC 模式不依赖路由开关，flag 关闭后的唯一可用观察方式。
+        private void SwitchViewMode(bool vnc)
+        {
+            try
+            {
+                _vncMode = vnc;
+                if (vnc)
+                {
+                    if (!_childId.HasValue)
+                    {
+                        SetError("VNC 模式需要先启动子会话");
+                        return;
+                    }
+                    VncHelper.EnsureChildRfbServer(_childId.Value, _opt.CuaExe, _opt.DataDir);
+                    if (_rfbCtl == null)
+                    {
+                        _rfbCtl = new RfbClientControl();
+                        _content.Controls.Add(_rfbCtl);
+                    }
+                    _rfbCtl.Bounds = _rdp.Bounds;
+                    _rfbCtl.Visible = true;
+                    _rfbCtl.BringToFront();
+                    _rfbCtl.Connect(5901);
+                    _rdp.Visible = false;
+                    _statusPill.SetState("观察模式：VNC (子会话)", Theme.Accent);
+                }
+                else
+                {
+                    _rfbCtl?.Disconnect();
+                    _rfbCtl.Visible = false;
+                    _rdp.Visible = true;
+                    _rdp.BringToFront();
+                    _statusPill.SetState("观察模式：RDP", Theme.Accent);
+                }
+                UpdateMeta();
+                _lastError = null;
+            }
+            catch (Exception ex)
+            {
+                SetError("切换观察模式: " + ex.GetBaseException().Message);
             }
         }
 
@@ -1590,7 +1637,7 @@ namespace CuaSessionHost
                         ShowViewer(true);
                         break;
                     case "vnc.child":
-                        StartChildServerAndMainViewer();
+                        SwitchViewMode(true);
                         break;
                     case "vnc.main":
                         StartMainVnc();
