@@ -205,14 +205,15 @@ namespace CuaSessionHost
         {
             _scale = Math.Max(1f, Native.GetDpiForWindow(Handle) / 96f);
             int S(int value) { return (int)Math.Round(value * _scale); }
+            int capH = S(40); // 自绘标题条高度：所有内容坐标统一内联下移（幂等）
 
-            ClientSize = new Size(S(640), S(648) + S(40));
-            _heading.Location = new Point(S(24), S(20));
-            _hint.Location = new Point(S(24), S(58));
+            ClientSize = new Size(S(640), S(620) + capH);
+            _heading.Location = new Point(S(24), S(20) + capH);
+            _hint.Location = new Point(S(24), S(58) + capH);
             _hint.Size = new Size(S(592), S(52));
-            _info.Location = new Point(S(24), S(122));
+            _info.Location = new Point(S(24), S(122) + capH);
             _info.Size = new Size(S(592), S(62));
-            _edgeInfo.Location = new Point(S(24), S(192));
+            _edgeInfo.Location = new Point(S(24), S(192) + capH);
             _edgeInfo.Size = new Size(S(592), S(112));
 
             _openEdge.Size = new Size(S(200), S(38));
@@ -229,28 +230,23 @@ namespace CuaSessionHost
             _exit.Size = new Size(S(240), S(38));
             _close.Size = new Size(S(160), S(38));
 
-            _openEdge.Location = new Point(S(24), S(318));
-            _refreshEdge.Location = new Point(S(240), S(318));
-            _backupEdge.Location = new Point(S(416), S(318));
-            _takeover.Location = new Point(S(24), S(368));
+            _openEdge.Location = new Point(S(24), S(318) + capH);
+            _refreshEdge.Location = new Point(S(240), S(318) + capH);
+            _backupEdge.Location = new Point(S(416), S(318) + capH);
+            _takeover.Location = new Point(S(24), S(368) + capH);
             _release.Location = _takeover.Location;
-            _hide.Location = new Point(S(240), S(368));
-            _credentials.Location = new Point(S(416), S(368));
-            _start.Location = new Point(S(24), S(418));
+            _hide.Location = new Point(S(240), S(368) + capH);
+            _credentials.Location = new Point(S(416), S(368) + capH);
+            _start.Location = new Point(S(24), S(418) + capH);
             _restart.Location = _start.Location;
-            _logoff.Location = new Point(S(240), S(418));
-            _close.Location = new Point(S(416), S(418));
-            _deleteEdge.Location = new Point(S(24), S(478));
-            _exit.Location = new Point(S(288), S(478));
-            _chkHeadless.Location = new Point(S(24), S(576));
-            // 标题条按钮贴最右上角（ClientSize 变更后显式重定位）
+            _logoff.Location = new Point(S(240), S(418) + capH);
+            _close.Location = new Point(S(416), S(418) + capH);
+            _deleteEdge.Location = new Point(S(24), S(478) + capH);
+            _exit.Location = new Point(S(288), S(478) + capH);
+            _chkHeadless.Location = new Point(S(24), S(576) + capH);
+
+            // 标题条按钮贴最右上角（不含边距）
             _capClose.Location = new Point(ClientSize.Width - _capClose.Width, 0);
-            // 内容整体下移自绘标题条的高度
-            int capH = S(40);
-            foreach (System.Windows.Forms.Control c in Controls)
-            {
-                c.Top += capH;
-            }
             CenterToScreen();
         }
 
