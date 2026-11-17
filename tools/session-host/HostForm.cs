@@ -63,6 +63,7 @@ namespace CuaSessionHost
         private bool _plainTried;
         private RfbClientControl _rfbCtl;
         private bool _vncMode;
+        private Label _vncNotice;
         private System.Windows.Forms.ContextMenuStrip _modeMenu;
         private System.Windows.Forms.ToolStripMenuItem _modeRdpItem;
         private System.Windows.Forms.ToolStripMenuItem _modeVncItem;
@@ -1025,6 +1026,40 @@ namespace CuaSessionHost
         /// 设置对话框改动后同步托盘菜单的勾选状态
         /// 子会话是否在运行（供设置对话框动态文案/立即生效用）
         /// 主会话 VNC 视图（子会话内的 tvnviewer）是否在运行
+        /// VNC 视图开启期间，观察窗显示占位提示（替代隐藏窗口）：
+        /// 主屏不再渲染子会话画面，tvnserver 捕获的主屏中不含观察窗内容，
+        /// 递归链被打断；RDP 连接保持，关闭视图后自动恢复观察。
+        private void ShowVncNotice(bool on)
+        {
+            try
+            {
+                if (on)
+                {
+                    if (_vncNotice == null)
+                    {
+                        _vncNotice = new Label
+                        {
+                            Text = "VNC 视图已开启\n远程用户正在通过子会话控制主会话\n关闭 VNC 视图后此处恢复子会话观察",
+                            ForeColor = Theme.Muted,
+                            BackColor = Theme.Window,
+            
+                            Font = Theme.Ui(11f),
+                            TextAlign = ContentAlignment.MiddleCenter,
+                            Dock = DockStyle.Fill
+                        };
+                        _content.Controls.Add(_vncNotice);
+                    }
+                    _vncNotice.BringToFront();
+                    _vncNotice.Visible = true;
+                }
+                else if (_vncNotice != null)
+                {
+                    _vncNotice.Visible = false;
+                }
+            }
+            catch { }
+        }
+
         public bool IsMainVncRunning
         {
             get
@@ -1063,6 +1098,7 @@ namespace CuaSessionHost
                 }
             }
             catch { }
+            ShowVncNotice(false);
         }
 
         public void SyncTrayToggleStates()
@@ -1128,8 +1164,9 @@ namespace CuaSessionHost
                 if (_childId.HasValue)
                 {
                     VncHelper.LaunchViewerInChild(_childId.Value);
-                    // 主屏上的观察窗会被 tvnserver 捕进画面形成镜中镜，启动后隐藏它
-                    HideViewer();
+                    // 观察窗切换为占位提示：打断"观察窗⊃子会话⊃viewer⊃主屏"递归链，
+                    // RDP 连接保持存活（子会话显示器不丢失），关闭视图后自动恢复
+                    ShowVncNotice(true);
                 }
                 _lastError = null;
             }

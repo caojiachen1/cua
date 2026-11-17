@@ -280,11 +280,14 @@ namespace CuaSessionHost
             _exit.Location = new Point(S(288), S(478));
             _chkAutoVnc.Location = new Point(S(24), S(540));
             _chkHeadless.Location = new Point(S(24), S(576));
+            // 标题条按钮贴最右上角（ClientSize 变更后显式重定位）
+            _capClose.Location = new Point(ClientSize.Width - _capClose.Width, 0);
+            _capVnc.Location = new Point(ClientSize.Width - _capClose.Width - _capVnc.Width - S(6), S(5));
             // 内容整体下移自绘标题条的高度
             int capH = S(40);
             foreach (System.Windows.Forms.Control c in Controls)
             {
-                if (c == _capStrip || c == _capTitle || c == _capClose) continue;
+                if (c == _capStrip || c == _capTitle || c == _capClose || c == _capVnc) continue;
                 c.Top += capH;
             }
             _capClose.Location = new Point(ClientSize.Width - S(44), 0);
