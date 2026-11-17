@@ -71,6 +71,11 @@ namespace CuaSessionHost
                     Handshake();
                     _handshaken = true;
                     SafeConnected();
+                    // RFB 的画面更新由客户端请求驱动：先全量请求，之后以 ~15fps
+                    // 发增量请求，服务端仅在画面变化时回帧。
+                    SendFramebufferRequest(false);
+                    var reqThread = new Thread(UpdateRequestLoop) { IsBackground = true, Name = "rfb-req" };
+                    reqThread.Start();
                     MessageLoop();
                 }
                 catch (Exception ex)
@@ -131,6 +136,33 @@ namespace CuaSessionHost
             {
                 _frame?.Dispose();
                 _frame = new Bitmap(_fw, _fh, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+            }
+        }
+
+        private void UpdateRequestLoop()
+        {
+            // 增量全屏请求，~15fps 上限；服务端画面未变化时返回空更新
+            while (_run)
+            {
+                SendFramebufferRequest(true);
+                Thread.Sleep(66);
+            }
+        }
+
+        private void SendFramebufferRequest(bool incremental)
+        {
+            lock (_ioLock)
+            {
+                var s = _s;
+                if (s == null || !_run) return;
+                var b = new byte[10];
+                b[0] = 3; // FramebufferUpdateRequest
+                b[1] = incremental ? (byte)1 : (byte)0;
+                // x/y/w/h = 0,0,65535,65535 → 服务端按帧缓冲全幅裁剪
+                b[4] = 0xFF; b[5] = 0xFF;
+                b[8] = 0xFF; b[9] = 0xFF;
+                s.Write(b, 0, 10);
+                s.Flush();
             }
         }
 

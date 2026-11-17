@@ -60,6 +60,7 @@ namespace CuaSessionHost
         private System.Windows.Forms.ToolStripMenuItem _menuAutoVnc;
         private uint? _lastChildId;
         private int _reconnectAttempts;
+        private bool _plainTried;
         private RfbClientControl _rfbCtl;
         private bool _vncMode;
         private bool _readyStatus;
@@ -664,10 +665,30 @@ namespace CuaSessionHost
                     _reconnectAttempts++;
                     // 路由开关关闭后 ConnectToChildSession 机制整体失效——重连不可
                     // 能成功。3 次失败后自动切到 VNC 观察方式并停止重试。
-                    if (_reconnectAttempts >= 3)
+                    if (_reconnectAttempts >= 3 && !_plainTried)
                     {
+                        // 标准 RDP（不带子会话属性）重连：恢复断开的同用户子会话
+                        // 显示器——RDP 优先恢复同用户断开会话，不影响控制台。
+                        _plainTried = true;
+                        _statusPill.SetState("标准 RDP 重连子会话", Theme.Accent);
+                        try
+                        {
+                            Size size = ChildSize();
+                            _opt.Width = size.Width;
+                            _opt.Height = size.Height;
+                            LayoutContent();
+                            _rdp.Connect(size, _scalePercent, _credential, false);
+                        }
+                        catch { }
+                        _reconnectAt = DateTime.UtcNow.AddSeconds(15);
+                        return;
+                    }
+                    if (_reconnectAttempts >= 3 && _plainTried)
+                    {
+                        // 标准 RDP 重连也会终结子会话（单会话策略）——
+                        // 无显示器状态下无画面可看；任务与自动化继续运行。
                         _reconnectAt = DateTime.MaxValue;
-                        SwitchViewMode(true);
+                        _statusPill.SetState("子会话已无显示器（无头运行）", Theme.Warn);
                         return;
                     }
                     _reconnectAt = DateTime.UtcNow.AddSeconds(15);
@@ -678,7 +699,7 @@ namespace CuaSessionHost
                         _opt.Width = size.Width;
                         _opt.Height = size.Height;
                         LayoutContent();
-                        _rdp.Connect(size, _scalePercent, _credential);
+                        _rdp.Connect(size, _scalePercent, _credential, !_plainTried);
                         _lastError = null;
                         WriteState();
                     }
@@ -696,6 +717,7 @@ namespace CuaSessionHost
                 _connected = true;
                 _reconnectAt = DateTime.MinValue;
                 _reconnectAttempts = 0;
+                _plainTried = false;
                 _childId = null;
                 _agentPipe = null;
                 _agentReady = false;
@@ -785,7 +807,9 @@ namespace CuaSessionHost
                         if (!_vncAutoDone && VncHelper.AutoStartOnChildStart)
                         {
                             _vncAutoDone = true;
-                            SwitchViewMode(true);
+                            // 远程协助模式：远程用户落在子会话，自动为其打开
+                            // 主会话的 VNC 视图（tvnserver 主会话 + tvnviewer 子会话）。
+                            StartMainVnc();
                         }
                     }
                     else if (_agentAttempts < 6)
@@ -958,13 +982,11 @@ namespace CuaSessionHost
         {
             try
             {
-                if (!_childId.HasValue)
-                {
-                    SetError("远程到主会话需要先启动子会话");
-                    return;
-                }
                 VncHelper.EnsureServer();
-                VncHelper.LaunchViewerInChild(_childId.Value);
+                if (_childId.HasValue)
+                {
+                    VncHelper.LaunchViewerInChild(_childId.Value);
+                }
                 _lastError = null;
             }
             catch (Exception ex)

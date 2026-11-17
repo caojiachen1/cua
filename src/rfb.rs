@@ -26,16 +26,7 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 pub fn cmd_rfb_server(port: u16) -> Result<i32> {
     let listener = TcpListener::bind(("127.0.0.1", port))
         .with_context(|| format!("bind 127.0.0.1:{port}"))?;
-    // 计划任务拉起时没有控制台，println 会 panic 导致进程退出——落文件日志
-    {
-        let dir = std::env::var("CUA_DATA_DIR").unwrap_or_else(|_| ".".into());
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(std::path::Path::new(&dir).join("rfb-server.log"))
-            .and_then(|mut f| std::io::Write::write_all(&mut f, format!("listening 127.0.0.1:{port}
-").as_bytes()));
-    }
+    log_line(&format!("listening 127.0.0.1:{port}"));
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
@@ -378,4 +369,19 @@ pub fn maybe_rfb(raw: &[String]) -> Option<i32> {
             Some(1)
         }
     }
+}
+
+fn log_line(m: &str) {
+    let dir = std::env::var("CUA_DATA_DIR").unwrap_or_else(|_| ".".into());
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::path::Path::new(&dir).join("rfb-server.log"))
+        .and_then(|mut f| {
+            std::io::Write::write_all(
+                &mut f,
+                format!("{} {}
+", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0), m).as_bytes(),
+            )
+        });
 }

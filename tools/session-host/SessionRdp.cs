@@ -47,7 +47,7 @@ namespace CuaSessionHost
             }
         }
 
-        public void Connect(Size size, int scalePercent, ChildCredential credential)
+        public void Connect(Size size, int scalePercent, ChildCredential credential, bool childSession = true)
         {
             object client = Ocx;
             if (client == null) throw new InvalidOperationException("RDP ActiveX did not initialize");
@@ -92,8 +92,11 @@ namespace CuaSessionHost
 
             TrySetExtended(extended, "DesktopScaleFactor", (uint)Math.Max(100, Math.Min(500, scalePercent)));
             TrySetExtended(extended, "DeviceScaleFactor", 100u);
-            object enabled = true;
-            extended.set_Property("ConnectToChildSession", ref enabled);
+            if (childSession)
+            {
+                object enabled = true;
+                extended.set_Property("ConnectToChildSession", ref enabled);
+            }
 
             if (credential != null)
             {

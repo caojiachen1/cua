@@ -226,8 +226,8 @@ fn host_call(state: &SessionState, op: &str, extra: Value) -> Result<Value> {
 pub fn dispatch(op: SessionOp) -> Result<i32> {
     match op {
         SessionOp::Setup { enable_rdp } => cmd_setup(enable_rdp),
-        SessionOp::Start { view: _, hide, interactive, keep_startup, width, height } => {
-            cmd_start(!hide, interactive, keep_startup, width, height)
+        SessionOp::Start { view: _, hide, interactive, keep_startup, routable, width, height } => {
+            cmd_start(!hide, interactive, keep_startup, routable, width, height)
         }
         SessionOp::Login => cmd_credentials(true),
         SessionOp::Logout => cmd_credentials(false),
@@ -415,6 +415,7 @@ fn cmd_start(
     view: bool,
     interactive: bool,
     keep_startup: bool,
+    routable: bool,
     width: Option<u32>,
     height: Option<u32>,
 ) -> Result<i32> {
@@ -486,25 +487,29 @@ fn cmd_start(
             let ready = st.connected && st.child_session_id > 0;
             latest = Some(st.clone());
             if ready && st.agent_ready {
-                // The child session exists; the routing flag was only needed for
-                // its creation. Turn it off right away so incoming remote-desktop
-                // logons (ToDesk/UU) keep reaching the main session while the
-                // child session keeps running.
-                let host = host_exe()?;
-                let dir = crate::util::ensure_data_dir();
-                let _ = std::fs::remove_file(setup_path());
-                let args = format!("--disable-child-sessions --keep-child-session --data-dir \"{}\"", dir.display());
                 let mut st_val = serde_json::to_value(&st)?;
-                st_val["child_sessions"] = match runas_wait(&host, &args, &dir) {
-                    Ok(_) => load_json(&setup_path()).unwrap_or_else(|| {
-                        serde_json::json!({ "ok": false, "error": "helper wrote no result" })
-                    }),
-                    Err(e) => serde_json::json!({
-                        "ok": false,
-                        "error": format!("elevation cancelled or failed: {e}"),
-                        "hint": "remote logons keep landing in the child session"
-                    }),
-                };
+                if routable {
+                    // 远程协助模式：路由开关保持开启，远程软件落在子会话；
+                    // 观察窗（RDP 老样子）持续可用。
+                    st_val["child_sessions"] = json!({ "ok": true, "kept_routable": true });
+                } else {
+                    // 默认：创建完成后立即关闭路由开关——远程软件接管主会话；
+                    // 子会话转入无头模式（任务继续，无画面可看）。
+                    let host = host_exe()?;
+                    let dir = crate::util::ensure_data_dir();
+                    let _ = std::fs::remove_file(setup_path());
+                    let args = format!("--disable-child-sessions --keep-child-session --data-dir \"{}\"", dir.display());
+                    st_val["child_sessions"] = match runas_wait(&host, &args, &dir) {
+                        Ok(_) => load_json(&setup_path()).unwrap_or_else(|| {
+                            serde_json::json!({ "ok": false, "error": "helper wrote no result" })
+                        }),
+                        Err(e) => serde_json::json!({
+                            "ok": false,
+                            "error": format!("elevation cancelled or failed: {e}"),
+                            "hint": "remote logons keep landing in the child session"
+                        }),
+                    };
+                }
                 print_value(&st_val);
                 return Ok(0);
             }
