@@ -169,13 +169,17 @@ namespace CuaSessionHost
             _tips.SetToolTip(_mode, "在 RDP（老式直连）与 VNC（自研抓屏）观察模式间切换");
 
             // 统一紧凑尺寸：同宽同高、小一号字体、圆角收紧
-            int bw = Math.Max(56, (int)Math.Round(62 * _uiScale));
-            int bh = Math.Max(22, (int)Math.Round(23 * _uiScale));
-            foreach (var b in new FluentButton[] { _takeover, _release, _hide, _settings, _edge, _mode })
+            // 所有按钮（动作钮 + 窗口控制钮）完全同尺寸
+            int bw = Math.Max(48, (int)Math.Round(50 * _uiScale));
+            int bh = Math.Max(20, (int)Math.Round(21 * _uiScale));
+            foreach (var b in new FluentButton[] { _takeover, _release, _hide, _settings, _edge, _mode, _minimize, _maximize, _close })
             {
                 b.Size = new Size(bw, bh);
+                b.CornerRadius = 4;
+            }
+            foreach (var b in new FluentButton[] { _takeover, _release, _hide, _settings, _edge, _mode })
+            {
                 b.Font = Theme.Ui(8f);
-                b.CornerRadius = 5;
             }
             BuildModeMenu();
             _mode.Click += delegate
@@ -347,8 +351,8 @@ namespace CuaSessionHost
         private void LayoutBar()
         {
             if (_bar == null || _title == null) return;
-            int pad = Math.Max(10, (int)Math.Round(14 * _uiScale));
-            int gap = Math.Max(3, (int)Math.Round(5 * _uiScale));
+            int pad = Math.Max(8, (int)Math.Round(10 * _uiScale));
+            int gap = Math.Max(2, (int)Math.Round(4 * _uiScale));
             int top = Math.Max(0, (_bar.Height - _title.Height) / 2);
             int pillTop = Math.Max(0, (_bar.Height - _statusPill.Height) / 2);
             int buttonTop = Math.Max(0, (_bar.Height - _takeover.Height) / 2);
