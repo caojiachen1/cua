@@ -27,6 +27,9 @@ namespace CuaSessionHost
 
         public bool Accent { get; set; }
 
+        /// 无边框无背景，仅绘制内容；悬停时淡高亮（标题栏图标钮用）
+        public bool Ghost { get; set; }
+
         public bool Danger { get; set; }
 
         public int CornerRadius { get; set; } = 8;
@@ -44,6 +47,13 @@ namespace CuaSessionHost
                 fill = Theme.Subtle;
                 border = Theme.Border;
                 text = Theme.Muted;
+            }
+            else if (Ghost)
+            {
+                // Fluent 标题栏图标：常态纯图标，悬停淡底，无外框
+                fill = _pressed ? Color.FromArgb(52, 52, 58) : _hover ? Theme.SubtleHover : Color.Transparent;
+                border = Color.Transparent;
+                text = ForeColor;
             }
             else if (Danger && _hover)
             {
@@ -69,8 +79,14 @@ namespace CuaSessionHost
             using (var brush = new SolidBrush(fill))
             using (var pen = new Pen(border))
             {
-                e.Graphics.FillPath(brush, path);
-                e.Graphics.DrawPath(pen, path);
+                if (fill.A > 0)
+                {
+                    e.Graphics.FillPath(brush, path);
+                }
+                if (border.A > 0)
+                {
+                    e.Graphics.DrawPath(pen, path);
+                }
             }
 
             TextRenderer.DrawText(

@@ -140,20 +140,23 @@ namespace CuaSessionHost
             _minimize = new FluentButton
             {
                 Text = "\uE921",
-                Font = Theme.Icon(9f),
-                CornerRadius = 6
+                Font = Theme.Icon(8f),
+                CornerRadius = 0,
+                Ghost = true
             };
             _maximize = new FluentButton
             {
                 Text = "\uE922",
-                Font = Theme.Icon(9f),
-                CornerRadius = 6
+                Font = Theme.Icon(8f),
+                CornerRadius = 0,
+                Ghost = true
             };
             _close = new FluentButton
             {
                 Text = "\uE8BB",
-                Font = Theme.Icon(9f),
-                CornerRadius = 6,
+                Font = Theme.Icon(8f),
+                CornerRadius = 0,
+                Ghost = true,
                 Danger = true
             };
             _tips = new ToolTip();
@@ -166,13 +169,13 @@ namespace CuaSessionHost
             _tips.SetToolTip(_mode, "在 RDP（老式直连）与 VNC（自研抓屏）观察模式间切换");
 
             // 统一紧凑尺寸：同宽同高、小一号字体、圆角收紧
-            int bw = Math.Max(64, (int)Math.Round(78 * _uiScale));
-            int bh = Math.Max(24, (int)Math.Round(27 * _uiScale));
+            int bw = Math.Max(56, (int)Math.Round(62 * _uiScale));
+            int bh = Math.Max(22, (int)Math.Round(23 * _uiScale));
             foreach (var b in new FluentButton[] { _takeover, _release, _hide, _settings, _edge, _mode })
             {
                 b.Size = new Size(bw, bh);
-                b.Font = Theme.Ui(8.5f);
-                b.CornerRadius = 6;
+                b.Font = Theme.Ui(8f);
+                b.CornerRadius = 5;
             }
             BuildModeMenu();
             _mode.Click += delegate
@@ -345,7 +348,7 @@ namespace CuaSessionHost
         {
             if (_bar == null || _title == null) return;
             int pad = Math.Max(10, (int)Math.Round(14 * _uiScale));
-            int gap = Math.Max(4, (int)Math.Round(6 * _uiScale));
+            int gap = Math.Max(3, (int)Math.Round(5 * _uiScale));
             int top = Math.Max(0, (_bar.Height - _title.Height) / 2);
             int pillTop = Math.Max(0, (_bar.Height - _statusPill.Height) / 2);
             int buttonTop = Math.Max(0, (_bar.Height - _takeover.Height) / 2);
@@ -974,10 +977,11 @@ namespace CuaSessionHost
         {
             _modeMenu = new System.Windows.Forms.ContextMenuStrip
             {
-                ShowImageMargin = false,
-                BackColor = Theme.Bar,
+                                BackColor = Theme.Bar,
                 ForeColor = Theme.Text,
                 Font = Theme.Ui(9f),
+                ShowImageMargin = false,
+                Renderer = new TrayMenuRenderer(),
                 DropShadowEnabled = true
             };
             _modeRdpItem = new System.Windows.Forms.ToolStripMenuItem("RDP（ActiveX 直连）")
