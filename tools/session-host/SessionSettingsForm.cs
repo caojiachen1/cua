@@ -30,6 +30,7 @@ namespace CuaSessionHost
         private Panel _capStrip;
         private Label _capTitle;
         private FluentButton _capClose;
+        private FluentButton _capVnc;
         private float _scale = 1f;
         private bool _edgeLoading;
 
@@ -112,12 +113,7 @@ namespace CuaSessionHost
             {
                 VncHelper.AutoStartOnChildStart = _chkAutoVnc.Checked;
                 _owner.SyncTrayToggleStates();
-                // 会话已启动时勾选/取消立即生效：勾选=打开视图，取消=关闭视图
-                if (_owner.IsChildRunning)
-                {
-                    if (_chkAutoVnc.Checked) { _owner.StartMainVnc(); }
-                    else { _owner.CloseMainVnc(); }
-                }
+                // 该选项只决定下次启动子会话时是否自动打开，不影响当前状态
             };
             _chkHeadless = new System.Windows.Forms.CheckBox
             {
@@ -151,8 +147,19 @@ namespace CuaSessionHost
             };
             _capClose = new FluentButton { Text = "\uE8BB", Font = Theme.Icon(8f), Ghost = true, Danger = true, CornerRadius = 0 };
             _capClose.Size = new Size(44, 40);
+            _capClose.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             _capClose.Location = new Point(Math.Max(0, ClientSize.Width - 44), 0);
             _capClose.Click += delegate { Close(); };
+            _capVnc = new FluentButton { Text = "启动 VNC 视图", Font = Theme.Ui(8.5f), Ghost = true, CornerRadius = 6 };
+            _capVnc.Size = new Size(120, 30);
+            _capVnc.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            _capVnc.Location = new Point(Math.Max(0, ClientSize.Width - 44 - 128), 5);
+            _capVnc.Click += delegate
+            {
+                if (_owner.IsMainVncRunning) { _owner.CloseMainVnc(); }
+                else { _owner.StartMainVnc(); }
+                UpdateCapVncText();
+            };
             foreach (var c in new Control[] { _capStrip, _capTitle })
             {
                 c.MouseDown += (sdr, ev) =>
@@ -166,6 +173,7 @@ namespace CuaSessionHost
             }
             Controls.Add(_capTitle);
             Controls.Add(_capClose);
+            Controls.Add(_capVnc);
             Controls.Add(_capStrip);
 
             _openEdge.Click += delegate { _owner.OpenChildEdgeFromSettings(); RefreshState(); };
@@ -219,6 +227,14 @@ namespace CuaSessionHost
                 Accent = accent,
                 Size = new Size(200, 38)
             };
+        }
+
+        private void UpdateCapVncText()
+        {
+            if (_capVnc != null)
+            {
+                _capVnc.Text = _owner.IsMainVncRunning ? "关闭 VNC 视图" : "启动 VNC 视图";
+            }
         }
 
         private void ApplyScale()
@@ -286,6 +302,7 @@ namespace CuaSessionHost
             _restart.Visible = _owner.SessionConnected;
             _logoff.Enabled = _owner.SessionConnected;
             _exit.Enabled = _owner.SessionConnected;
+            UpdateCapVncText();
         }
 
         private void RefreshEdgeInfo()

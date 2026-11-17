@@ -1024,6 +1024,26 @@ namespace CuaSessionHost
 
         /// 设置对话框改动后同步托盘菜单的勾选状态
         /// 子会话是否在运行（供设置对话框动态文案/立即生效用）
+        /// 主会话 VNC 视图（子会话内的 tvnviewer）是否在运行
+        public bool IsMainVncRunning
+        {
+            get
+            {
+                try
+                {
+                    foreach (var p in System.Diagnostics.Process.GetProcessesByName("tvnviewer"))
+                    {
+                        if (_childId.HasValue && p.SessionId == _childId.Value)
+                        {
+                            return true;
+                        }
+                    }
+                }
+                catch { }
+                return false;
+            }
+        }
+
         public bool IsChildRunning
         {
             get { return _childId.HasValue; }
@@ -1108,6 +1128,8 @@ namespace CuaSessionHost
                 if (_childId.HasValue)
                 {
                     VncHelper.LaunchViewerInChild(_childId.Value);
+                    // 主屏上的观察窗会被 tvnserver 捕进画面形成镜中镜，启动后隐藏它
+                    HideViewer();
                 }
                 _lastError = null;
             }
