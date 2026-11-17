@@ -76,6 +76,13 @@ namespace CuaSessionHost
         [DllImport("user32.dll")]
         public static extern uint GetDpiForWindow(IntPtr window);
 
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool ReleaseCapture();
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr SendMessage(IntPtr window, int msg, IntPtr wParam, IntPtr lParam);
+
         [DllImport("dwmapi.dll")]
         private static extern int DwmSetWindowAttribute(IntPtr window, int attribute, ref int value, int size);
 

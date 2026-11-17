@@ -165,6 +165,20 @@ namespace CuaSessionHost
             _tips.SetToolTip(_edge, "在子会话中打开独立浏览器（CuaEdge / CuaChrome）");
             _tips.SetToolTip(_mode, "在 RDP（老式直连）与 VNC（自研抓屏）观察模式间切换");
 
+            // 无边框窗口：按住标题栏空白处拖动 = 原生移动（含 Aero 贴边）
+            foreach (var c in new Control[] { _bar, _title, _meta })
+            {
+                c.MouseDown += (sdr, ev) =>
+                {
+                    if (ev.Button == MouseButtons.Left)
+                    {
+                        Native.ReleaseCapture();
+                        Native.SendMessage(Handle, 0xA1 /* WM_NCLBUTTONDOWN */, (IntPtr)2 /* HTCAPTION */, IntPtr.Zero);
+                    }
+                };
+            }
+            _bar.MouseDoubleClick += delegate { ToggleMaximize(); };
+
             // 统一紧凑尺寸：同宽同高、小一号字体、圆角收紧
             // 尺寸统一交给 LayoutBar（规避 DPI 自动缩放不一致）；这里只设字体
             foreach (var b in new FluentButton[] { _takeover, _release, _settings, _edge, _mode })
@@ -271,7 +285,7 @@ namespace CuaSessionHost
             if (dpi <= 0) dpi = 96;
             _uiScale = Math.Max(1f, dpi / 96f);
             _scalePercent = Math.Max(100, Math.Min(500, (int)Math.Round(dpi * 100.0 / 96.0)));
-            _bar.Height = Math.Max(44, (int)Math.Round(56 * _uiScale));
+            _bar.Height = Math.Max(38, (int)Math.Round(46 * _uiScale));
             _statusPill.Height = Math.Max(24, (int)Math.Round(28 * _uiScale));
             _statusPill.Font = Theme.Ui(9f, FontStyle.Bold);
             _statusPill.RefreshSize();
