@@ -16,7 +16,9 @@ namespace CuaSessionHost
                      ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw |
                      ControlStyles.SupportsTransparentBackColor, true);
             SetStyle(ControlStyles.StandardClick | ControlStyles.StandardDoubleClick, false);
-            BackColor = Color.Transparent;
+            // 不透明白底：Transparent 会让 WinForms 在每次重画时向父窗口要背景，
+            // 窗口移动/缩放时抠到的父背景可能是半截的，看着就是按钮被"盖掉一半"。
+            BackColor = Theme.Bar;
             ForeColor = Theme.Text;
             Font = Theme.Ui(9.5f, FontStyle.Bold);
             Cursor = Cursors.Hand;
@@ -36,6 +38,8 @@ namespace CuaSessionHost
 
         protected override void OnPaint(PaintEventArgs e)
         {
+            // 局部失效时也整块重画：否则只会补画失效那一块，另一半留着旧像素
+            e.Graphics.SetClip(ClientRectangle);
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             e.Graphics.Clear(Parent == null ? Theme.Bar : Parent.BackColor);
 
@@ -172,7 +176,7 @@ namespace CuaSessionHost
                      ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw |
                      ControlStyles.SupportsTransparentBackColor, true);
             SetStyle(ControlStyles.StandardClick | ControlStyles.StandardDoubleClick, false);
-            BackColor = Color.Transparent;
+            BackColor = Theme.Bar;
             ForeColor = Theme.Text;
             Font = Theme.Ui(9f, FontStyle.Bold);
             Height = 28;
@@ -194,6 +198,8 @@ namespace CuaSessionHost
 
         protected override void OnPaint(PaintEventArgs e)
         {
+            // 局部失效时也整块重画：否则只会补画失效那一块，另一半留着旧像素
+            e.Graphics.SetClip(ClientRectangle);
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             e.Graphics.Clear(Parent == null ? Theme.Bar : Parent.BackColor);
             Rectangle r = new Rectangle(0, 0, Width - 1, Height - 1);

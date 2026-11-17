@@ -51,6 +51,26 @@ namespace CuaSessionHost
         {
             internal HostForm Owner;
 
+            internal PipSurface()
+            {
+                // 标题栏/画面是自己的 Paint 里整块填色：不双缓冲 + 不裁剪子窗口，
+                // 填色会压到子按钮上，再等按钮自己重画——看着就是"半个按钮被盖住"。
+                SetStyle(ControlStyles.AllPaintingInWmPaint |
+                         ControlStyles.OptimizedDoubleBuffer |
+                         ControlStyles.ResizeRedraw, true);
+                DoubleBuffered = true;
+            }
+
+            protected override CreateParams CreateParams
+            {
+                get
+                {
+                    CreateParams cp = base.CreateParams;
+                    cp.Style |= 0x02000000;   // WS_CLIPCHILDREN
+                    return cp;
+                }
+            }
+
             protected override void WndProc(ref Message m)
             {
                 if (m.Msg == WmSetCursor && Owner != null && Owner.RelayCursor())
@@ -422,7 +442,7 @@ namespace CuaSessionHost
             get
             {
                 CreateParams cp = base.CreateParams;
-                cp.Style |= WsMinimizeBox;
+                cp.Style |= WsMinimizeBox | 0x02000000;   // WS_MINIMIZEBOX | WS_CLIPCHILDREN
                 return cp;
             }
         }
