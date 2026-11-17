@@ -131,6 +131,20 @@ namespace CuaSessionHost
             });
         }
 
+        public static bool HeadlessAutoDisable
+        {
+            get
+            {
+                using (var k = Registry.CurrentUser.OpenSubKey(SettingsKey))
+                    return k != null && (k.GetValue("HeadlessAutoDisable") as int? == 1);
+            }
+            set
+            {
+                using (var k = Registry.CurrentUser.CreateSubKey(SettingsKey))
+                    k.SetValue("HeadlessAutoDisable", value ? 1 : 0, RegistryValueKind.DWord);
+            }
+        }
+
         private const string SettingsKey = @"Software\cua\Vnc";
         public static bool AutoStartOnChildStart
         {

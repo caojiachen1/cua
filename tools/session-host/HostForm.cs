@@ -64,6 +64,10 @@ namespace CuaSessionHost
         private bool _plainTried;
         private RfbClientControl _rfbCtl;
         private bool _vncMode;
+        private System.Windows.Forms.ContextMenuStrip _modeMenu;
+        private System.Windows.Forms.ToolStripMenuItem _modeRdpItem;
+        private System.Windows.Forms.ToolStripMenuItem _modeVncItem;
+        private System.Windows.Forms.ToolStripMenuItem _menuHeadless;
         private bool _readyStatus;
         private bool _stopping;
         private bool _trayTipShown;
@@ -131,7 +135,7 @@ namespace CuaSessionHost
             _hide = new FluentButton { Text = "隐藏", Accent = false };
             _settings = new FluentButton { Text = "设置", Accent = false };
             _edge = new FluentButton { Text = "浏览器", Accent = false };
-            _mode = new FluentButton { Text = "观察模式：RDP", Accent = false };
+            _mode = new FluentButton { Text = "观察模式", Accent = false };
 
             _minimize = new FluentButton
             {
@@ -160,9 +164,20 @@ namespace CuaSessionHost
             _tips.SetToolTip(_settings, "子会话设置");
             _tips.SetToolTip(_edge, "在子会话中打开独立浏览器（CuaEdge / CuaChrome）");
             _tips.SetToolTip(_mode, "在 RDP（老式直连）与 VNC（自研抓屏）观察模式间切换");
+
+            // 统一紧凑尺寸：同宽同高、小一号字体、圆角收紧
+            int bw = Math.Max(64, (int)Math.Round(78 * _uiScale));
+            int bh = Math.Max(24, (int)Math.Round(27 * _uiScale));
+            foreach (var b in new FluentButton[] { _takeover, _release, _hide, _settings, _edge, _mode })
+            {
+                b.Size = new Size(bw, bh);
+                b.Font = Theme.Ui(8.5f);
+                b.CornerRadius = 6;
+            }
+            BuildModeMenu();
             _mode.Click += delegate
             {
-                SwitchViewMode(!_vncMode);
+                _modeMenu.Show(_mode, new Point(0, _mode.Height + 2));
             };
 
             _takeover.Click += delegate { SetViewOnly(false); };
@@ -329,8 +344,8 @@ namespace CuaSessionHost
         private void LayoutBar()
         {
             if (_bar == null || _title == null) return;
-            int pad = Math.Max(12, (int)Math.Round(18 * _uiScale));
-            int gap = Math.Max(6, (int)Math.Round(10 * _uiScale));
+            int pad = Math.Max(10, (int)Math.Round(14 * _uiScale));
+            int gap = Math.Max(4, (int)Math.Round(6 * _uiScale));
             int top = Math.Max(0, (_bar.Height - _title.Height) / 2);
             int pillTop = Math.Max(0, (_bar.Height - _statusPill.Height) / 2);
             int buttonTop = Math.Max(0, (_bar.Height - _takeover.Height) / 2);
@@ -403,6 +418,14 @@ namespace CuaSessionHost
                 _menuAutoVnc.Checked = VncHelper.AutoStartOnChildStart;
             };
             _trayMenu.Items.Add(_menuAutoVnc);
+            _menuHeadless = new System.Windows.Forms.ToolStripMenuItem("下次启动后自动关闭路由（无头模式）");
+            _menuHeadless.Checked = VncHelper.HeadlessAutoDisable;
+            _menuHeadless.Click += delegate
+            {
+                VncHelper.HeadlessAutoDisable = !_menuHeadless.Checked;
+                _menuHeadless.Checked = VncHelper.HeadlessAutoDisable;
+            };
+            _trayMenu.Items.Add(_menuHeadless);
             _trayMenu.Items.Add(new ToolStripSeparator());
             _menuTakeover = MenuItem("接管控制", delegate { ShowViewer(false); });
             _menuRelease = MenuItem("释放控制", delegate { ShowViewer(true); });
@@ -947,6 +970,30 @@ namespace CuaSessionHost
 
         /// 观察窗模式切换：RDP 与 VNC（子会话 RFB）无缝切换。
         /// VNC 模式不依赖路由开关，flag 关闭后的唯一可用观察方式。
+        private void BuildModeMenu()
+        {
+            _modeMenu = new System.Windows.Forms.ContextMenuStrip
+            {
+                ShowImageMargin = false,
+                BackColor = Theme.Bar,
+                ForeColor = Theme.Text,
+                Font = Theme.Ui(9f),
+                DropShadowEnabled = true
+            };
+            _modeRdpItem = new System.Windows.Forms.ToolStripMenuItem("RDP（ActiveX 直连）")
+            {
+                Checked = !_vncMode
+            };
+            _modeRdpItem.Click += delegate { SwitchViewMode(false); };
+            _modeVncItem = new System.Windows.Forms.ToolStripMenuItem("VNC（自研抓屏）")
+            {
+                Checked = _vncMode
+            };
+            _modeVncItem.Click += delegate { SwitchViewMode(true); };
+            _modeMenu.Items.Add(_modeRdpItem);
+            _modeMenu.Items.Add(_modeVncItem);
+        }
+
         private void SwitchViewMode(bool vnc)
         {
             try
@@ -980,7 +1027,11 @@ namespace CuaSessionHost
                     _rdp.BringToFront();
                     _statusPill.SetState("观察模式：RDP", Theme.Accent);
                 }
-                _mode.Text = vnc ? "观察模式：VNC" : "观察模式：RDP";
+                if (_modeRdpItem != null)
+                {
+                    _modeRdpItem.Checked = !vnc;
+                    _modeVncItem.Checked = vnc;
+                }
                 UpdateMeta();
                 _lastError = null;
             }
