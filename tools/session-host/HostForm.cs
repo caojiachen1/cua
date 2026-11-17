@@ -430,6 +430,13 @@ namespace CuaSessionHost
             _trayMenu.Items.Add(MenuItem("在子会话打开浏览器", OpenChildEdge));
             _trayMenu.Items.Add(MenuItem("观察模式：RDP (子会话)", delegate { SwitchViewMode(false); }));
             _trayMenu.Items.Add(MenuItem("观察模式：VNC (子会话)", delegate { SwitchViewMode(true); }));
+            _menuHeadless = new System.Windows.Forms.ToolStripMenuItem("下次启动后自动关闭路由（无头模式）");
+            _menuHeadless.Checked = VncHelper.HeadlessAutoDisable;
+            _menuHeadless.Click += delegate
+            {
+                VncHelper.HeadlessAutoDisable = !_menuHeadless.Checked;
+                _menuHeadless.Checked = VncHelper.HeadlessAutoDisable;
+            };
             _trayMenu.Items.Add(_menuHeadless);
             _trayMenu.Items.Add(new ToolStripSeparator());
             _menuTakeover = MenuItem("接管控制", delegate { ShowViewer(false); });
