@@ -169,19 +169,7 @@ namespace CuaSessionHost
             _tips.SetToolTip(_mode, "在 RDP（老式直连）与 VNC（自研抓屏）观察模式间切换");
 
             // 统一紧凑尺寸：同宽同高、小一号字体、圆角收紧
-            // 所有按钮（动作钮 + 窗口控制钮）完全同尺寸；
-            // 宽度按最长文字实测，任何 DPI 下都不截断
-            int bw = 0;
-            foreach (var b in new FluentButton[] { _takeover, _release, _hide, _settings, _edge, _mode })
-            {
-                bw = Math.Max(bw, TextRenderer.MeasureText(b.Text, b.Font).Width + 16);
-            }
-            int bh = Math.Max(20, (int)Math.Round(21 * _uiScale));
-            foreach (var b in new FluentButton[] { _takeover, _release, _hide, _settings, _edge, _mode, _minimize, _maximize, _close })
-            {
-                b.Size = new Size(bw, bh);
-                b.CornerRadius = 4;
-            }
+            // 尺寸统一交给 LayoutBar（规避 DPI 自动缩放不一致）；这里只设字体
             foreach (var b in new FluentButton[] { _takeover, _release, _hide, _settings, _edge, _mode })
             {
                 b.Font = Theme.Ui(8f);
@@ -356,6 +344,23 @@ namespace CuaSessionHost
         private void LayoutBar()
         {
             if (_bar == null || _title == null) return;
+            // 统一尺寸必须在布局时强制覆写：控件在构造期设置的 Size 会被
+            // WinForms 按 DPI 逐个自动缩放，加入父容器的时机不同导致高低不一。
+            int ubw = 0;
+            foreach (var b in new FluentButton[] { _takeover, _release, _hide, _settings, _edge, _mode })
+            {
+                ubw = Math.Max(ubw, TextRenderer.MeasureText(b.Text, b.Font).Width + 10);
+            }
+            int ubh = (int)Math.Round(22 * _uiScale);
+            int wbw = (int)Math.Round(ubh * 1.15); // 左右钮（窗口控制）更窄
+            foreach (var b in new FluentButton[] { _takeover, _release, _hide, _settings, _edge, _mode })
+            {
+                b.Size = new Size(ubw, ubh);
+            }
+            foreach (var b in new FluentButton[] { _minimize, _maximize, _close })
+            {
+                b.Size = new Size(wbw, ubh);
+            }
             int pad = Math.Max(8, (int)Math.Round(10 * _uiScale));
             int gap = Math.Max(2, (int)Math.Round(4 * _uiScale));
             int top = Math.Max(0, (_bar.Height - _title.Height) / 2);
