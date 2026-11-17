@@ -69,6 +69,10 @@ $sessionHost = Join-Path $root "target\session-host\cua-session-host.exe"
 if (Test-Path $sessionHost) {
     Copy-Item $sessionHost "$root\bin\cua-session-host.exe" -Force
     $sessionHostConfig = Join-Path $root "target\session-host\cua-session-host.exe.config"
+New-Item -ItemType Directory -Force -Path "$root\bin\vnc" | Out-Null
+if (Test-Path "$root\tools\vnc\tvnserver.exe") {
+    Copy-Item "$root\tools\vnc\*" "$root\bin\vnc\" -Force
+}
     if (Test-Path $sessionHostConfig) { Copy-Item $sessionHostConfig "$root\bin\cua-session-host.exe.config" -Force }
 }
 # The vendored UBB runtime, when it was built above.
