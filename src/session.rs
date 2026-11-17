@@ -410,7 +410,26 @@ fn cmd_start(
             let ready = st.connected && st.child_session_id > 0;
             latest = Some(st.clone());
             if ready && st.agent_ready {
-                print_value(&serde_json::to_value(&st)?);
+                // The child session exists; the routing flag was only needed for
+                // its creation. Turn it off right away so incoming remote-desktop
+                // logons (ToDesk/UU) keep reaching the main session while the
+                // child session keeps running.
+                let host = host_exe()?;
+                let dir = crate::util::ensure_data_dir();
+                let _ = std::fs::remove_file(setup_path());
+                let args = format!("--disable-child-sessions --keep-child-session --data-dir \"{}\"", dir.display());
+                let mut st_val = serde_json::to_value(&st)?;
+                st_val["child_sessions"] = match runas_wait(&host, &args, &dir) {
+                    Ok(_) => load_json(&setup_path()).unwrap_or_else(|| {
+                        serde_json::json!({ "ok": false, "error": "helper wrote no result" })
+                    }),
+                    Err(e) => serde_json::json!({
+                        "ok": false,
+                        "error": format!("elevation cancelled or failed: {e}"),
+                        "hint": "remote logons keep landing in the child session"
+                    }),
+                };
+                print_value(&st_val);
                 return Ok(0);
             }
         }

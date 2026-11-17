@@ -16,6 +16,7 @@ namespace CuaSessionHost
         public bool KeepStartup;
         public bool RestoreStartup;
         public bool DisableChildSessions;
+        public bool KeepChildSession;
         public int Width;
         public int Height;
         public bool ExplicitSize;
@@ -48,6 +49,7 @@ namespace CuaSessionHost
                     case "--keep-startup": o.KeepStartup = true; break;
                     case "--restore-startup": o.RestoreStartup = true; break;
                     case "--disable-child-sessions": o.DisableChildSessions = true; break;
+                    case "--keep-child-session": o.KeepChildSession = true; break;
                     case "--width": o.Width = ParseInt(Next(args, ref i), o.Width); o.ExplicitSize = true; break;
                     case "--height": o.Height = ParseInt(Next(args, ref i), o.Height); o.ExplicitSize = true; break;
                     case "--cua-exe": o.CuaExe = Next(args, ref i); break;
@@ -90,16 +92,24 @@ namespace CuaSessionHost
         /// land back in the console session instead of being routed away.
         /// Writes its result to session-setup.json for the CLI to read back.
         /// </summary>
-        private static int DisableChildSessionsFlow(string dataDir)
+        private static int DisableChildSessionsFlow(string dataDir, bool keepSession)
         {
             var result = new System.Collections.Generic.Dictionary<string, object>();
             try
             {
-                uint? id = ChildSessionApi.TryGetId();
-                if (id.HasValue)
+                if (!keepSession)
                 {
-                    try { ChildSessionApi.Logoff(id.Value); result["logged_off_session"] = id.Value; }
-                    catch (Exception ex) { result["logoff_error"] = ex.Message; }
+                    uint? id = ChildSessionApi.TryGetId();
+                    if (id.HasValue)
+                    {
+                        try { ChildSessionApi.Logoff(id.Value); result["logged_off_session"] = id.Value; }
+                        catch (Exception ex) { result["logoff_error"] = ex.Message; }
+                    }
+                }
+                else
+                {
+                    uint? id = ChildSessionApi.TryGetId();
+                    if (id.HasValue) result["kept_session"] = id.Value;
                 }
                 ChildSessionApi.Disable();
                 result["ok"] = true;
@@ -127,7 +137,7 @@ namespace CuaSessionHost
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
 
-                if (opt.DisableChildSessions) return DisableChildSessionsFlow(opt.DataDir);
+                if (opt.DisableChildSessions) return DisableChildSessionsFlow(opt.DataDir, opt.KeepChildSession);
                 if (opt.Login) return CredentialDialog.Run();
                 if (opt.Logout)
                 {

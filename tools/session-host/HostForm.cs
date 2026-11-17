@@ -55,6 +55,7 @@ namespace CuaSessionHost
         private bool _viewOnly = true;
         private bool _viewerShown;
         private bool _viewerInitialized;
+        private DateTime _reconnectAt = DateTime.MinValue;
         private bool _readyStatus;
         private bool _stopping;
         private bool _trayTipShown;
@@ -624,6 +625,34 @@ namespace CuaSessionHost
                     if (!_opt.Preview && lastSession.HasValue &&
                         !ChildSessionApi.SessionExists(lastSession.Value))
                         StopSession();
+                    // Self-heal: the WTS session may still exist while the viewer
+                    // link dropped (e.g. the routing flag was flipped after
+                    // creation) — schedule a full reconnect.
+                    _reconnectAt = DateTime.UtcNow.AddSeconds(10);
+                }
+                // Self-heal reconnect: the WTS child session still exists but the
+                // viewer link is down. Reconnect to it (RDP resumes the
+                // disconnected same-user session) and let the normal flow re-attach
+                // the agent.
+                if (!_opt.Preview && DateTime.UtcNow >= _reconnectAt &&
+                    ChildSessionApi.TryGetId() is uint healId && ChildSessionApi.SessionExists(healId))
+                {
+                    _reconnectAt = DateTime.UtcNow.AddSeconds(15);
+                    _statusPill.SetState("重连子会话", Theme.Accent);
+                    try
+                    {
+                        Size size = ChildSize();
+                        _opt.Width = size.Width;
+                        _opt.Height = size.Height;
+                        LayoutContent();
+                        _rdp.Connect(size, _scalePercent, _credential);
+                        _lastError = null;
+                        WriteState();
+                    }
+                    catch (Exception ex)
+                    {
+                        _lastError = "reconnect: " + ex.GetBaseException().Message;
+                    }
                 }
                 return;
             }
@@ -631,6 +660,7 @@ namespace CuaSessionHost
             if (!_connected)
             {
                 _connected = true;
+                _reconnectAt = DateTime.MinValue;
                 _childId = null;
                 _agentPipe = null;
                 _agentReady = false;
@@ -670,24 +700,42 @@ namespace CuaSessionHost
                 _agentAttempts++;
                 _statusPill.SetState("启动子会话 agent", Theme.Accent);
                 bool launched = false;
-                try
+                if (AgentPipeAlive(_agentPipe))
                 {
-                    TaskLauncher.Launch(_childId.Value, _opt.CuaExe, _opt.DataDir, _opt.DataDir);
+                    // A reconnect reuses a session whose previous agent survived
+                    // the viewer drop — its pipe is already serving; do not
+                    // launch a second one (CreateNamedPipeW would collide).
+                    _agentReady = true;
+                    _lastError = null;
                     launched = true;
                 }
-                catch (Exception ex)
+                else
                 {
-                    // The child session can be published before Task Scheduler
-                    // accepts RunEx for it. Retry briefly instead of failing the seat.
-                    if (_agentAttempts < 20)
+                    // Stale agents from before the drop would own the pipe name
+                    // and break the fresh agent — clear them first.
+                    foreach (var pr in System.Diagnostics.Process.GetProcessesByName("cua"))
                     {
-                        _agentTried = false;
-                        _agentRetryAt = DateTime.UtcNow.AddMilliseconds(500);
-                        _lastError = "agent launch pending: " + ex.GetBaseException().Message;
+                        try { if (pr.SessionId == _childId.Value) pr.Kill(); } catch { }
                     }
-                    else
+                    try
                     {
-                        SetError("agent launch failed: " + ex.GetBaseException().Message);
+                        TaskLauncher.Launch(_childId.Value, _opt.CuaExe, _opt.DataDir, _opt.DataDir);
+                        launched = true;
+                    }
+                    catch (Exception ex)
+                    {
+                        // The child session can be published before Task Scheduler
+                        // accepts RunEx for it. Retry briefly instead of failing the seat.
+                        if (_agentAttempts < 20)
+                        {
+                            _agentTried = false;
+                            _agentRetryAt = DateTime.UtcNow.AddMilliseconds(500);
+                            _lastError = "agent launch pending: " + ex.GetBaseException().Message;
+                        }
+                        else
+                        {
+                            SetError("agent launch failed: " + ex.GetBaseException().Message);
+                        }
                     }
                 }
 
@@ -746,6 +794,29 @@ namespace CuaSessionHost
             catch (Exception ex)
             {
                 _lastError = "startup restore failed: " + ex.GetBaseException().Message;
+            }
+        }
+
+        private bool AgentPipeAlive(string pipeName)
+        {
+            if (string.IsNullOrEmpty(pipeName)) return false;
+            try
+            {
+                using (var pipe = new System.IO.Pipes.NamedPipeClientStream(".", pipeName,
+                    System.IO.Pipes.PipeDirection.InOut))
+                {
+                    pipe.Connect(300);
+                    byte[] request = Encoding.UTF8.GetBytes("{\"op\":\"ping\"}\n");
+                    pipe.Write(request, 0, request.Length);
+                    pipe.Flush();
+                    byte[] response = new byte[4096];
+                    int n = pipe.Read(response, 0, response.Length);
+                    return n > 0;
+                }
+            }
+            catch
+            {
+                return false;
             }
         }
 
