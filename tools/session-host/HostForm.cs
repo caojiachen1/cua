@@ -218,7 +218,7 @@ namespace CuaSessionHost
             _tips.SetToolTip(_settings, "子会话设置");
             _tips.SetToolTip(_edge, "在子会话中打开独立浏览器（CuaEdge / CuaChrome）");
             _tips.SetToolTip(_mode, "在 RDP（老式直连）与 VNC（自研抓屏）观察模式间切换");
-            _tips.SetToolTip(_statusPill, "画中画：拖动画面移动小窗，拖动四周边缘等比缩放，双击画面最大化");
+            _tips.SetToolTip(_statusPill, "画中画：拖动画面移动小窗，拖动四周边缘等比缩放（Shift 自由缩放），双击画面最大化");
 
             // 无边框窗口：按住标题栏空白处拖动 = 原生移动（含 Aero 贴边）；
             // 双击标题栏 = 最大化/还原。原生拖动会吃掉第二次点击，所以双击
@@ -1392,7 +1392,7 @@ namespace CuaSessionHost
                 if (x + width < screen.Left + 96 || x > screen.Right - 96 ||
                     y + height < screen.Top + 48 || y > screen.Bottom - 48)
                     return null;   // 换过显示器/分辨率，旧位置没意义
-                return new Rectangle(x, y, width, HeightForWidth(width));
+                return new Rectangle(x, y, width, height);
             }
             catch
             {
@@ -1595,16 +1595,28 @@ namespace CuaSessionHost
             int chromeW = _pad * 2;
             int chromeH = _bar.Height + _pad * 2;
             int minW = MinPipWidth();
+            int minH = chromeH + 120;
             int maxW = Math.Max(minW, Math.Min(SystemInformation.VirtualScreen.Width,
                 (int)Math.Round((SystemInformation.VirtualScreen.Height - chromeH) * aspect) + chromeW));
+            int maxH = Math.Max(minH, SystemInformation.VirtualScreen.Height);
 
             int width;
-            if (stepX != 0 && (stepY == 0 || Math.Abs(stepX) >= Math.Abs((int)Math.Round(stepY * aspect))))
-                width = s.Width + stepX;                       // 横向拖动主导
+            int height;
+            if ((Control.ModifierKeys & Keys.Shift) != 0)
+            {
+                // Shift：自由缩放，画面按比例居中、多出来的部分留黑边
+                width = Math.Max(minW, Math.Min(maxW, s.Width + stepX));
+                height = Math.Max(minH, Math.Min(maxH, s.Height + stepY));
+            }
             else
-                width = chromeW + (int)Math.Round((s.Height + stepY - chromeH) * aspect);
-            width = Math.Max(minW, Math.Min(maxW, width));
-            int height = HeightForWidth(width);
+            {
+                if (stepX != 0 && (stepY == 0 || Math.Abs(stepX) >= Math.Abs((int)Math.Round(stepY * aspect))))
+                    width = s.Width + stepX;                       // 横向拖动主导
+                else
+                    width = chromeW + (int)Math.Round((s.Height + stepY - chromeH) * aspect);
+                width = Math.Max(minW, Math.Min(maxW, width));
+                height = HeightForWidth(width);
+            }
 
             int x = hasLeft ? s.Right - width
                 : hasRight ? s.Left
