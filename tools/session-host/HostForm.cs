@@ -402,12 +402,6 @@ namespace CuaSessionHost
             _meta.Top = top;
             _meta.Height = _title.Height;
             _meta.Width = Math.Max(0, right - left);
-
-            // Fitts 定律：关闭钮填满窗口右上角——鼠标甩到角上必中，
-            // 最大化时即屏幕物理角。Ghost 样式无视觉变化。
-            _close.Size = new Size(_close.Width, _bar.Height);
-            _close.Top = 0;
-            _close.Left = _bar.ClientSize.Width - _close.Width;
         }
 
         private void InitTray()
