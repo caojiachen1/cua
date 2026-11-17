@@ -129,7 +129,7 @@ namespace CuaSessionHost
                 Location = new Point(14, 10)
             };
             _capClose = new FluentButton { Text = "\uE8BB", Font = Theme.Icon(8f), Ghost = true, Danger = true, CornerRadius = 0 };
-            _capClose.Size = new Size(36, 40);
+            _capClose.Size = new Size(56, 40);
             _capClose.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             _capClose.Location = new Point(Math.Max(0, ClientSize.Width - 36), 0);
             _capClose.Click += delegate { Close(); };
