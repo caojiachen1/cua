@@ -441,7 +441,8 @@ namespace CuaSessionHost
                 }
                 var r = DisplayRect();
                 if (r.Width <= 0 || r.Height <= 0) return;
-                e.Graphics.InterpolationMode = InterpolationMode.Default;
+                // 画中画把 2560 宽的帧缩到几百像素，双线性比最近邻干净得多
+                e.Graphics.InterpolationMode = InterpolationMode.Bilinear;
                 e.Graphics.DrawImage(_frame, r);
             }
         }
