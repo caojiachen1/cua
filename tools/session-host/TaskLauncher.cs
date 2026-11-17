@@ -12,6 +12,11 @@ namespace CuaSessionHost
         // the only supported way to target a child session without SYSTEM.
         public static void Launch(uint sessionId, string exe, string workingDir, string dataDir)
         {
+            LaunchArgs(sessionId, exe, "__agent --data-dir \"" + dataDir + "\"", workingDir);
+        }
+
+        public static void LaunchArgs(uint sessionId, string exe, string arguments, string workingDir)
+        {
             Type schedulerType = Type.GetTypeFromProgID("Schedule.Service");
             if (schedulerType == null) throw new InvalidOperationException("Schedule.Service unavailable");
 
@@ -52,7 +57,7 @@ namespace CuaSessionHost
                 actionObj = def.Actions.Create(0); // TASK_ACTION_EXEC
                 dynamic action = actionObj;
                 action.Path = exe;
-                action.Arguments = "__agent --data-dir \"" + dataDir + "\"";
+                action.Arguments = arguments;
                 action.WorkingDirectory = workingDir;
 
                 registeredObj = root.RegisterTaskDefinition(

@@ -56,6 +56,8 @@ namespace CuaSessionHost
         private bool _viewerShown;
         private bool _viewerInitialized;
         private DateTime _reconnectAt = DateTime.MinValue;
+        private bool _vncAutoDone;
+        private System.Windows.Forms.ToolStripMenuItem _menuAutoVnc;
         private uint? _lastChildId;
         private bool _readyStatus;
         private bool _stopping;
@@ -374,6 +376,16 @@ namespace CuaSessionHost
             _trayMenu.Items.Add(MenuItem("打开观察窗", delegate { ShowViewer(!_viewOnly); }));
             _trayMenu.Items.Add(MenuItem("子会话设置…", OpenSettings));
             _trayMenu.Items.Add(MenuItem("在子会话打开浏览器", OpenChildEdge));
+            _trayMenu.Items.Add(MenuItem("远程到主会话 (VNC)", delegate { StartMainVnc(); }));
+            _trayMenu.Items.Add(MenuItem("在主会话看子会话 (VNC)", delegate { StartChildServerAndMainViewer(); }));
+            _menuAutoVnc = new System.Windows.Forms.ToolStripMenuItem("子会话启动时自动 VNC 到主会话");
+            _menuAutoVnc.Checked = VncHelper.AutoStartOnChildStart;
+            _menuAutoVnc.Click += delegate
+            {
+                VncHelper.AutoStartOnChildStart = !_menuAutoVnc.Checked;
+                _menuAutoVnc.Checked = VncHelper.AutoStartOnChildStart;
+            };
+            _trayMenu.Items.Add(_menuAutoVnc);
             _trayMenu.Items.Add(new ToolStripSeparator());
             _menuTakeover = MenuItem("接管控制", delegate { ShowViewer(false); });
             _menuRelease = MenuItem("释放控制", delegate { ShowViewer(true); });
@@ -621,9 +633,6 @@ namespace CuaSessionHost
                     _statusPill.SetState("子会话已断开", Theme.Warn);
                     UpdateMeta();
                     WriteState();
-                    // The tray icon means "a session is alive". A dropped viewer
-                    // connection is normal (it reconnects), so only leave when
-                    // the WTS session itself is gone; then the icon goes too.
                     if (!_opt.Preview && lastSession.HasValue &&
                         !ChildSessionApi.SessionExists(lastSession.Value))
                         StopSession();
@@ -631,11 +640,18 @@ namespace CuaSessionHost
                     // link dropped (e.g. the routing flag was flipped after
                     // creation) — schedule a full reconnect.
                     _reconnectAt = DateTime.UtcNow.AddSeconds(10);
+                    // The session and its agent are still alive — keep the state
+                    // fields so `cua child`/`cua vnc` keep working even though the
+                    // viewer link is down.
+                    if (lastSession.HasValue && ChildSessionApi.SessionExists(lastSession.Value))
+                    {
+                        _childId = lastSession;
+                        _agentPipe = "cua-child-agent-" + lastSession.Value;
+                    }
                 }
-                // Self-heal reconnect: the WTS child session still exists but the
-                // viewer link is down. Reconnect to it (RDP resumes the
-                // disconnected same-user session) and let the normal flow re-attach
-                // the agent.
+                // Self-heal reconnect (only while the link is down): RDP resumes
+                // the disconnected same-user session and the normal flow
+                // re-attaches the agent.
                 uint? healId = _lastChildId ?? ChildSessionApi.TryGetId();
                 if (!_opt.Preview && DateTime.UtcNow >= _reconnectAt &&
                     healId.HasValue && ChildSessionApi.SessionExists(healId.Value))
@@ -659,6 +675,7 @@ namespace CuaSessionHost
                 }
                 return;
             }
+
 
             if (!_connected)
             {
@@ -750,6 +767,11 @@ namespace CuaSessionHost
                     if (_agentReady)
                     {
                         _lastError = null;
+                        if (!_vncAutoDone && VncHelper.AutoStartOnChildStart)
+                        {
+                            _vncAutoDone = true;
+                            StartChildServerAndMainViewer();
+                        }
                     }
                     else if (_agentAttempts < 6)
                     {
@@ -850,6 +872,46 @@ namespace CuaSessionHost
                 }
             }
             return false;
+        }
+
+        /// 子会话内启动 tvnserver（抓子会话桌面），并在主会话打开 viewer。
+        /// flag 关闭后观察窗链路已死，这是用户唯一能看见子会话的方式。
+        private void StartChildServerAndMainViewer()
+        {
+            try
+            {
+                if (!_childId.HasValue || string.IsNullOrEmpty(_agentPipe))
+                {
+                    SetError("看子会话需要先启动子会话");
+                    return;
+                }
+                VncHelper.EnsureServerInChild(_agentPipe);
+                VncHelper.LaunchViewerHere();
+                _lastError = null;
+            }
+            catch (Exception ex)
+            {
+                SetError("vnc: " + ex.GetBaseException().Message);
+            }
+        }
+
+        private void StartMainVnc()
+        {
+            try
+            {
+                if (!_childId.HasValue)
+                {
+                    SetError("远程到主会话需要先启动子会话");
+                    return;
+                }
+                VncHelper.EnsureServer();
+                VncHelper.LaunchViewerInChild(_childId.Value);
+                _lastError = null;
+            }
+            catch (Exception ex)
+            {
+                SetError("vnc: " + ex.GetBaseException().Message);
+            }
         }
 
         private void ShowViewer(bool viewOnly)
@@ -1514,6 +1576,12 @@ namespace CuaSessionHost
                         break;
                     case "release":
                         ShowViewer(true);
+                        break;
+                    case "vnc.child":
+                        StartChildServerAndMainViewer();
+                        break;
+                    case "vnc.main":
+                        StartMainVnc();
                         break;
                     case "stop":
                         {

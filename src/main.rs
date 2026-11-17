@@ -1235,6 +1235,9 @@ fn main() {
             if let Some(code) = session::maybe_child(&raw) {
                 return code;
             }
+            if let Some(code) = session::maybe_vnc(&raw) {
+                return code;
+            }
             let cli = Cli::parse();
             if let Some(id) = &cli.observation_id {
                 util::set_observation_override(id);

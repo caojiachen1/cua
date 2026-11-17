@@ -11,8 +11,9 @@ use serde_json::{json, Value};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, ERROR_PIPE_BUSY, GetLastError, HANDLE};
 use windows::Win32::System::Pipes::CallNamedPipeW;
@@ -336,6 +337,80 @@ fn cmd_credentials(login: bool) -> Result<i32> {
     Ok(0)
 }
 
+/// `cua vnc [main]` — 默认：在主会话看子会话（子会话内 tvnserver 抓屏 +
+/// 主会话 tvnviewer 显示）；`cua vnc main`：从子会话远程到主会话。
+/// 全程不依赖子会话路由开关。
+fn cmd_vnc(main_view: bool) -> Result<i32> {
+    let mut ensured = false;
+    if let Some(st) = load_state() {
+        if host_alive(&st) {
+            let op = if main_view { "vnc.main" } else { "vnc.child" };
+            let v = host_call(&st, op, json!({}))?;
+            ensured = v["ok"].as_bool().unwrap_or(false);
+            if ensured {
+                print_value(&json!({ "ok": true, "mode": if main_view { "main" } else { "child" } }));
+                return Ok(0);
+            }
+        }
+    }
+    if !main_view {
+        bail!("需要子会话：先运行 `cua session start`");
+    }
+    // 兜底：主会话直启 server（host 不在的场景）
+    let vnc_dir = std::env::current_exe()?
+        .parent()
+        .map(|p| p.join("vnc"))
+        .ok_or_else(|| anyhow::anyhow!("cua.exe has no parent directory"))?;
+    let server = vnc_dir.join("tvnserver.exe");
+    if !server.exists() {
+        bail!("tvnserver.exe 未找到（{}）", server.display());
+    }
+    for (name, value) in [
+        ("AllowLoopback", "1"),
+        ("UseVncAuthentication", "0"),
+        ("LoopbackOnly", "1"),
+        ("PortNumber", "5900"),
+    ] {
+        let _ = Command::new("reg")
+            .args(["add", r"HKCU\Software\TightVNC\Server", "/v", name, "/t", "REG_DWORD", "/d", value, "/f"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+    }
+    Command::new(&server)
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .with_context(|| format!("start {}", server.display()))?;
+    std::thread::sleep(Duration::from_millis(1200));
+    print_value(&json!({ "ok": true, "mode": "local-fallback" }));
+    Ok(0)
+}
+
+/// `cua vnc [main]` 前缀分发。
+pub fn maybe_vnc(raw: &[String]) -> Option<i32> {
+    let mut rest: Vec<String> = raw.iter().skip(1).cloned().collect();
+    if rest.first().map(|s| s == "vnc").unwrap_or(false) {
+        rest.remove(0);
+    } else {
+        return None;
+    }
+    let main_view = rest.first().map(|s| s == "main").unwrap_or(false);
+    if main_view {
+        rest.remove(0);
+    }
+    if rest.iter().any(|s| s.starts_with('-')) {
+        eprintln!("usage: cua vnc [main]");
+        return Some(1);
+    }
+    match cmd_vnc(main_view) {
+        Ok(code) => Some(code),
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            Some(1)
+        }
+    }
+}
+
+
 fn cmd_start(
     view: bool,
     interactive: bool,
@@ -343,6 +418,7 @@ fn cmd_start(
     width: Option<u32>,
     height: Option<u32>,
 ) -> Result<i32> {
+
     // A previous stop turns the system-wide child-sessions flag off (it steals
     // remote-desktop logons otherwise). Starting again must re-enable it, so
     // run the elevated setup helper here instead of failing later.
