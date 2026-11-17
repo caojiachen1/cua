@@ -382,7 +382,7 @@ namespace CuaSessionHost
             _trayMenu.Items.Add(MenuItem("子会话设置…", OpenSettings));
             _trayMenu.Items.Add(MenuItem("在子会话打开浏览器", OpenChildEdge));
             _trayMenu.Items.Add(MenuItem("远程到主会话 (VNC)", delegate { StartMainVnc(); }));
-            _trayMenu.Items.Add(MenuItem("观察模式：RDP (老样子)", delegate { SwitchViewMode(false); }));
+            _trayMenu.Items.Add(MenuItem("观察模式：RDP (子会话)", delegate { SwitchViewMode(false); }));
             _trayMenu.Items.Add(MenuItem("观察模式：VNC (子会话)", delegate { SwitchViewMode(true); }));
             _menuAutoVnc = new System.Windows.Forms.ToolStripMenuItem("子会话启动时自动 VNC 到主会话");
             _menuAutoVnc.Checked = VncHelper.AutoStartOnChildStart;
@@ -934,7 +934,7 @@ namespace CuaSessionHost
             }
         }
 
-        /// 观察窗模式切换：RDP（老样子）与 VNC（子会话 RFB）无缝切换。
+        /// 观察窗模式切换：RDP 与 VNC（子会话 RFB）无缝切换。
         /// VNC 模式不依赖路由开关，flag 关闭后的唯一可用观察方式。
         private void SwitchViewMode(bool vnc)
         {

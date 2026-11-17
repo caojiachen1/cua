@@ -25,11 +25,25 @@ namespace CuaSessionHost
         private Bitmap _frame;
         private int _fw, _fh;
         private byte _prevMask;
+        private long _frameN;
         private int _port;
         private volatile bool _handshaken;
 
         public event EventHandler Connected;
         public event Action<string> Failed;
+
+        private static long _logN;
+        private static void Clog(string m)
+        {
+            try
+            {
+                var dir = System.IO.Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "cua");
+                System.IO.File.AppendAllText(System.IO.Path.Combine(dir, "rfb-client.log"),
+                    DateTime.Now.ToString("HH:mm:ss.fff") + " " + m + Environment.NewLine);
+            }
+            catch { }
+        }
 
         public bool IsConnected
         {
@@ -70,6 +84,7 @@ namespace CuaSessionHost
                     _s.ReadTimeout = 15000;
                     Handshake();
                     _handshaken = true;
+                    Clog("handshake ok port=" + _port);
                     SafeConnected();
                     // RFB 的画面更新由客户端请求驱动：先全量请求，之后以 ~15fps
                     // 发增量请求，服务端仅在画面变化时回帧。
@@ -80,6 +95,7 @@ namespace CuaSessionHost
                 }
                 catch (Exception ex)
                 {
+                    Clog("net error: " + ex.Message);
                     SafeFailed(ex.Message);
                 }
                 if (_run) Thread.Sleep(1500);
@@ -123,8 +139,8 @@ namespace CuaSessionHost
             // ClientInit
             s.WriteByte(1); // shared
 
-            // ServerInit
-            var head = ReadExact(s, 8);
+            // ServerInit：w(2)+h(2) 为帧缓冲头，pixel-format 另占 16 字节
+            var head = ReadExact(s, 4);
             _fw = (head[0] << 8) | head[1];
             _fh = (head[2] << 8) | head[3];
             var pix = ReadExact(s, 16); // 声明格式（ bpp32 RGBA shifts 0/8/16）
@@ -192,6 +208,8 @@ namespace CuaSessionHost
                                 var px = ReadExact(s, rw * rh * 4);
                                 Blit(rx, ry, rw, rh, px);
                             }
+                            long n = Interlocked.Increment(ref _frameN);
+                            if (n % 20 == 1) Clog("frame #" + n + " rects=" + rects);
                             Invalidate();
                         }
                         break;

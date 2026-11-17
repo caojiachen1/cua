@@ -168,6 +168,12 @@ fn send_update(stream: &mut TcpStream, prev_frame: &mut Option<Vec<u8>>) -> Resu
             return Ok(());
         }
     };
+    // 抽样统计非零字节占比（黑帧检测）
+    let mut nonzero = 0usize;
+    { let d = &shot.rgba; let mut i = 0; while i < d.len() { if d[i] != 0 { nonzero += 1; } i += 64; } }
+    let total_sampled = shot.rgba.len() / 64 + 1;
+    let pct = if total_sampled > 0 { nonzero * 100 / total_sampled } else { 0 };
+
     let changed = match prev_frame {
         Some(p) => p.len() != shot.rgba.len() || p.as_slice() != shot.rgba.as_slice(),
         None => true,
@@ -190,6 +196,7 @@ fn send_update(stream: &mut TcpStream, prev_frame: &mut Option<Vec<u8>>) -> Resu
     out.extend_from_slice(&shot.rgba);
     stream.write_all(&out)?;
     *prev_frame = Some(shot.rgba);
+    log_line(&format!("frame {}B nonzero={}%", out.len(), pct));
     Ok(())
 }
 
