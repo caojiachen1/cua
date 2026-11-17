@@ -59,6 +59,7 @@ namespace CuaSessionHost
         private bool _vncAutoDone;
         private System.Windows.Forms.ToolStripMenuItem _menuAutoVnc;
         private uint? _lastChildId;
+        private int _reconnectAttempts;
         private bool _readyStatus;
         private bool _stopping;
         private bool _trayTipShown;
@@ -656,6 +657,16 @@ namespace CuaSessionHost
                 if (!_opt.Preview && DateTime.UtcNow >= _reconnectAt &&
                     healId.HasValue && ChildSessionApi.SessionExists(healId.Value))
                 {
+                    _reconnectAttempts++;
+                    // 路由开关关闭后 ConnectToChildSession 机制整体失效——重连不可
+                    // 能成功。3 次失败后自动切到 VNC 观察方式并停止重试。
+                    if (_reconnectAttempts >= 3)
+                    {
+                        _reconnectAt = DateTime.MaxValue;
+                        _statusPill.SetState("子会话画面已切换到 VNC", Theme.Accent);
+                        try { StartChildServerAndMainViewer(); } catch { }
+                        return;
+                    }
                     _reconnectAt = DateTime.UtcNow.AddSeconds(15);
                     _statusPill.SetState("重连子会话", Theme.Accent);
                     try
@@ -681,6 +692,7 @@ namespace CuaSessionHost
             {
                 _connected = true;
                 _reconnectAt = DateTime.MinValue;
+                _reconnectAttempts = 0;
                 _childId = null;
                 _agentPipe = null;
                 _agentReady = false;
