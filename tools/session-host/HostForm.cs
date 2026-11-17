@@ -15,6 +15,50 @@ namespace CuaSessionHost
     {
         private const int WsMinimizeBox = 0x00020000;
 
+        // 画中画手势：在消息分发前截获，才能盖住 RDP ActiveX / RFB 子控件
+        private const int WmMouseMove = 0x0200;
+        private const int WmLButtonDown = 0x0201;
+        private const int WmLButtonUp = 0x0202;
+        private const int WmLButtonDblClk = 0x0203;
+        private const int WmNcLButtonDblClk = 0x00A3;
+        private const int HtCaption = 2;
+
+        [Flags]
+        private enum PipZone
+        {
+            None = 0,
+            Left = 1,
+            Right = 2,
+            Top = 4,
+            Bottom = 8
+        }
+
+        private enum PipGesture
+        {
+            None,
+            Move,
+            Resize
+        }
+
+        /// <summary>
+        /// 画中画里 RDP 控件的点击会先经过本线程的消息泵；在这里截获鼠标，
+        /// 观察（只读）状态下把画面变成可拖动/可双击的窗口，接管状态下放行。
+        /// </summary>
+        private sealed class PipFilter : IMessageFilter
+        {
+            private readonly HostForm _form;
+
+            internal PipFilter(HostForm form)
+            {
+                _form = form;
+            }
+
+            public bool PreFilterMessage(ref Message m)
+            {
+                return _form.FilterMessage(ref m);
+            }
+        }
+
         private readonly Options _opt;
         private readonly Panel _bar;
         private readonly Panel _content;
@@ -32,7 +76,7 @@ namespace CuaSessionHost
         private readonly FluentButton _close;
         private readonly System.Windows.Forms.Timer _poll;
         private readonly DateTime _started = DateTime.UtcNow;
-        private readonly Rectangle _normalBounds;
+        private readonly PipFilter _filter;
 
         private NotifyIcon _tray;
         private ContextMenuStrip _trayMenu;
@@ -69,7 +113,7 @@ namespace CuaSessionHost
         private bool _readyStatus;
         private bool _stopping;
         private bool _trayTipShown;
-        private bool _isMaximized = true;
+        private bool _isMaximized;
         private StartupQuarantine _startup;
         private bool _startupReleased = true;
         private DateTime _startupReleaseAt = DateTime.MinValue;
@@ -78,9 +122,24 @@ namespace CuaSessionHost
         private int _scalePercent = 100;
         private float _uiScale = 1f;
 
+        // 画中画：内容四周的黑色边框同时是缩放手势带
+        private Rectangle _pipBounds = Rectangle.Empty;
+        private int _pad = 6;
+        private double _aspect = 16.0 / 9.0;
+        private PipGesture _gesture;
+        private PipZone _gestureZone;
+        private Rectangle _gestureStart;
+        private Point _gestureCursor;
+        private DateTime _lastDownAt = DateTime.MinValue;
+        private Point _lastDownPos = Point.Empty;
+        private DateTime _lastCaptionDown = DateTime.MinValue;
+
         public HostForm(Options opt)
         {
             _opt = opt;
+            // 明确给了桌面尺寸（--width/--height）就先按它定比例；连接后再由实际桌面覆盖
+            if (opt.ExplicitSize && opt.Width > 0 && opt.Height > 0)
+                _aspect = (double)opt.Width / opt.Height;
             Text = "cua · child session";
             Icon = Theme.AppIcon(false);
             FormBorderStyle = FormBorderStyle.None;
@@ -92,11 +151,7 @@ namespace CuaSessionHost
             MaximizeBox = true;
 
             Rectangle work = Screen.PrimaryScreen.WorkingArea;
-            _normalBounds = new Rectangle(
-                work.X + work.Width / 10,
-                work.Y + work.Height / 10,
-                work.Width * 8 / 10,
-                work.Height * 8 / 10);
+            // 默认就是画中画小窗；几何在 ApplyDpi 后（已知 DPI/栏高）再算
             Bounds = work;
             WindowState = FormWindowState.Normal;
 
@@ -158,25 +213,36 @@ namespace CuaSessionHost
             };
             _tips = new ToolTip();
             _tips.SetToolTip(_minimize, "最小化到任务栏");
-            _tips.SetToolTip(_maximize, "最大化 / 还原");
+            _tips.SetToolTip(_maximize, "最大化 / 还原（双击画面也可以）");
             _tips.SetToolTip(_close, "隐藏到托盘（子会话继续运行）");
             _tips.SetToolTip(_settings, "子会话设置");
             _tips.SetToolTip(_edge, "在子会话中打开独立浏览器（CuaEdge / CuaChrome）");
             _tips.SetToolTip(_mode, "在 RDP（老式直连）与 VNC（自研抓屏）观察模式间切换");
+            _tips.SetToolTip(_statusPill, "画中画：拖动画面移动小窗，拖动四周边缘等比缩放，双击画面最大化");
 
-            // 无边框窗口：按住标题栏空白处拖动 = 原生移动（含 Aero 贴边）
+            // 无边框窗口：按住标题栏空白处拖动 = 原生移动（含 Aero 贴边）；
+            // 双击标题栏 = 最大化/还原。原生拖动会吃掉第二次点击，所以双击
+            // 判定要自己做：按下时先比时间，再决定是拖动还是切换最大化。
             foreach (var c in new Control[] { _bar, _title, _meta })
             {
                 c.MouseDown += (sdr, ev) =>
                 {
-                    if (ev.Button == MouseButtons.Left)
+                    if (ev.Button != MouseButtons.Left) return;
+                    if (_lastCaptionDown != DateTime.MinValue &&
+                        (DateTime.UtcNow - _lastCaptionDown).TotalMilliseconds <=
+                        SystemInformation.DoubleClickTime)
                     {
-                        Native.ReleaseCapture();
-                        Native.SendMessage(Handle, 0xA1 /* WM_NCLBUTTONDOWN */, (IntPtr)2 /* HTCAPTION */, IntPtr.Zero);
+                        _lastCaptionDown = DateTime.MinValue;
+                        ToggleMaximize();
+                        return;
                     }
+                    _lastCaptionDown = DateTime.UtcNow;
+                    Native.ReleaseCapture();
+                    Native.SendMessage(Handle, 0xA1 /* WM_NCLBUTTONDOWN */, (IntPtr)2 /* HTCAPTION */, IntPtr.Zero);
                 };
             }
-            _bar.MouseDoubleClick += delegate { ToggleMaximize(); };
+            // 双击标题栏的最大化/还原走 WndProc 的 WM_NCLBUTTONDBLCLK：
+            // 按住标题栏已经被转成原生拖动，WinForms 收不到第二次点击。
 
             // 统一紧凑尺寸：同宽同高、小一号字体、圆角收紧
             // 尺寸统一交给 LayoutBar（规避 DPI 自动缩放不一致）；这里只设字体
@@ -224,6 +290,10 @@ namespace CuaSessionHost
             Load += delegate
             {
                 ApplyDpi();
+                Rectangle? saved = LoadViewerBounds();
+                if (saved.HasValue) _pipBounds = saved.Value;
+                if (_pipBounds.IsEmpty) _pipBounds = DefaultPipBounds(Screen.PrimaryScreen.WorkingArea);
+                if (!_isMaximized && _opt.View) Bounds = _pipBounds;
                 LayoutShell();
                 LayoutBar();
                 InitTray();
@@ -263,9 +333,48 @@ namespace CuaSessionHost
                 LayoutShell();
                 LayoutBar();
                 UpdateWindowGlyph();
+                ApplyTopMost();
+            };
+            // 边框带不属于任何子控件，鼠标移动只在这里出现：给出缩放光标
+            MouseMove += delegate(object sender, MouseEventArgs e)
+            {
+                if (_gesture != PipGesture.None) return;
+                PipZone zone = ZoneOf(e.Location);
+                Cursor = zone == PipZone.None ? Cursors.Default : GestureCursor(PipGesture.Resize, zone);
             };
             FormClosing += OnFormClosing;
+            _filter = new PipFilter(this);
+            PipLog("ctor filter registered debug=" + PipDebug);
+            Application.AddMessageFilter(_filter);
             UpdateButtons();
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && _filter != null)
+            {
+                try { Application.RemoveMessageFilter(_filter); } catch { }
+            }
+            base.Dispose(disposing);
+        }
+
+        protected override void OnMouseCaptureChanged(EventArgs e)
+        {
+            base.OnMouseCaptureChanged(e);
+            // Alt+Tab 等抢走捕获时不要让手势卡住
+            if (_gesture != PipGesture.None && !Capture) EndGesture();
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            // 标题栏按住是原生拖动（HTCAPTION），双击消息到不了 WinForms，
+            // 这里补上"双击标题栏 = 最大化/还原"。
+            if (m.Msg == WmNcLButtonDblClk && m.WParam.ToInt32() == HtCaption)
+            {
+                ToggleMaximize();
+                return;
+            }
+            base.WndProc(ref m);
         }
 
         protected override CreateParams CreateParams
@@ -285,6 +394,7 @@ namespace CuaSessionHost
             _uiScale = Math.Max(1f, dpi / 96f);
             _scalePercent = Math.Max(100, Math.Min(500, (int)Math.Round(dpi * 100.0 / 96.0)));
             _bar.Height = Math.Max(38, (int)Math.Round(46 * _uiScale));
+            _pad = Math.Max(4, (int)Math.Round(5 * _uiScale));
             _statusPill.Height = Math.Max(24, (int)Math.Round(28 * _uiScale));
             _statusPill.Font = Theme.Ui(9f, FontStyle.Bold);
             _statusPill.RefreshSize();
@@ -303,10 +413,12 @@ namespace CuaSessionHost
         private void LayoutShell()
         {
             if (_bar == null || _content == null) return;
+            int pad = _pad;
+            int width = Math.Max(0, ClientSize.Width - pad * 2);
             int barHeight = _bar.Height;
-            _bar.Bounds = new Rectangle(0, 0, ClientSize.Width, barHeight);
-            int contentHeight = Math.Max(0, ClientSize.Height - barHeight);
-            _content.Bounds = new Rectangle(0, barHeight, ClientSize.Width, contentHeight);
+            _bar.Bounds = new Rectangle(pad, pad, width, barHeight);
+            int contentHeight = Math.Max(0, ClientSize.Height - barHeight - pad * 2);
+            _content.Bounds = new Rectangle(pad, pad + barHeight, width, contentHeight);
             LayoutContent();
         }
 
@@ -332,11 +444,12 @@ namespace CuaSessionHost
                     area.Y + (area.Height - height) / 2,
                     width,
                     height);
-            if (_rfbCtl != null) _rfbCtl.Bounds = _rdp.Bounds;
+                if (_rfbCtl != null) _rfbCtl.Bounds = _rdp.Bounds;
             }
             else
             {
                 _rdp.Bounds = area;
+                if (_rfbCtl != null) _rfbCtl.Bounds = area;
             }
         }
 
@@ -370,47 +483,53 @@ namespace CuaSessionHost
             }
             int pad = Math.Max(8, (int)Math.Round(10 * _uiScale));
             int gap = Math.Max(2, (int)Math.Round(4 * _uiScale));
-            int top = Math.Max(0, (_bar.Height - _title.Height) / 2);
-            int pillTop = Math.Max(0, (_bar.Height - _statusPill.Height) / 2);
+            int barWidth = _bar.ClientSize.Width;
+
+            // 画中画很窄：按宽度分层收次要控件，接管/窗口按钮永不挤掉
+            _edge.Visible = barWidth >= (int)Math.Round(880 * _uiScale);
+            _mode.Visible = _edge.Visible;
+            _settings.Visible = barWidth >= (int)Math.Round(700 * _uiScale);
+            _meta.Visible = _settings.Visible;
+            _statusPill.Visible = barWidth >= (int)Math.Round(560 * _uiScale);
+            _title.Visible = barWidth >= (int)Math.Round(330 * _uiScale);
+
             int buttonTop = Math.Max(0, (_bar.Height - _takeover.Height) / 2);
-
-            int right = _bar.ClientSize.Width - pad;
-            _close.Left = right - _close.Width;
-            right = _close.Left - gap;
-            _maximize.Left = right - _maximize.Width;
-            right = _maximize.Left - gap;
-            _minimize.Left = right - _minimize.Width;
-            right = _minimize.Left - gap;
-            _mode.Left = right - _mode.Width;
-            right = _mode.Left - gap;
-            FluentButton action = _viewOnly ? _takeover : _release;
-            action.Left = right - action.Width;
-            right = action.Left - gap;
-            _settings.Left = right - _settings.Width;
-            right = _settings.Left - gap;
-            _edge.Left = right - _edge.Width;
-            right = _edge.Left - gap;
-
-            _close.Top = buttonTop;
-            _maximize.Top = buttonTop;
-            _minimize.Top = buttonTop;
-            _mode.Top = buttonTop;
-            _settings.Top = buttonTop;
-            _edge.Top = buttonTop;
-            _takeover.Top = buttonTop;
-            _release.Top = buttonTop;
+            int right = barWidth - pad;
+            var stack = new FluentButton[]
+            {
+                _close, _maximize, _minimize, _mode,
+                _viewOnly ? _takeover : _release, _settings, _edge
+            };
+            foreach (var b in stack)
+            {
+                if (!b.Visible) continue;
+                b.Left = right - b.Width;
+                b.Top = buttonTop;
+                right = b.Left - gap;
+            }
 
             int left = pad;
-            _title.Left = left;
-            _title.Top = top;
-            left = _title.Right + gap;
-            _statusPill.Left = left;
-            _statusPill.Top = pillTop;
-            left = _statusPill.Right + gap;
-            _meta.Left = left;
-            _meta.Top = top;
-            _meta.Height = _title.Height;
-            _meta.Width = Math.Max(0, right - left);
+            int titleTop = Math.Max(0, (_bar.Height - _title.Height) / 2);
+            int pillTop = Math.Max(0, (_bar.Height - _statusPill.Height) / 2);
+            if (_title.Visible)
+            {
+                _title.Left = left;
+                _title.Top = titleTop;
+                left = _title.Right + gap;
+            }
+            if (_statusPill.Visible)
+            {
+                _statusPill.Left = left;
+                _statusPill.Top = pillTop;
+                left = _statusPill.Right + gap;
+            }
+            if (_meta.Visible)
+            {
+                _meta.Left = left;
+                _meta.Top = titleTop;
+                _meta.Height = _title.Height;
+                _meta.Width = Math.Max(0, right - left);
+            }
         }
 
         private void InitTray()
@@ -606,10 +725,7 @@ namespace CuaSessionHost
                     _startupReleased = true;
                 }
 
-                Size size = ChildSize();
-                _opt.Width = size.Width;
-                _opt.Height = size.Height;
-                LayoutContent();
+                Size size = SetChildSize(ChildSize());
                 UpdateMeta();
                 _statusPill.SetState("正在创建子会话", Theme.Accent);
                 LayoutBar();
@@ -630,17 +746,28 @@ namespace CuaSessionHost
             }
         }
 
+        /// <summary>
+        /// 子会话桌面尺寸一旦确定，观察窗就按这个宽高比缩放（画中画留黑边），
+        /// 所以它不跟随画中画小窗，仍取整块工作区：远端分辨率不因窗口变小而降级。
+        /// </summary>
         private Size ChildSize()
         {
             if (_opt.ExplicitSize)
                 return EvenSize(_opt.Width, _opt.Height);
 
-            Size content = _content.ClientSize;
-            if (content.Width >= 640 && content.Height >= 480)
-                return EvenSize(content.Width, content.Height);
-
             Rectangle work = Screen.PrimaryScreen.WorkingArea;
             return EvenSize(work.Width, work.Height - _bar.Height);
+        }
+
+        /// <summary>记录子会话桌面尺寸并重排内容（比例由它决定）。</summary>
+        private Size SetChildSize(Size size)
+        {
+            _opt.Width = size.Width;
+            _opt.Height = size.Height;
+            if (size.Width > 0 && size.Height > 0)
+                _aspect = (double)size.Width / size.Height;
+            LayoutContent();
+            return size;
         }
 
         private static Size EvenSize(int width, int height)
@@ -719,10 +846,7 @@ namespace CuaSessionHost
                         _statusPill.SetState("标准 RDP 重连子会话", Theme.Accent);
                         try
                         {
-                            Size size = ChildSize();
-                            _opt.Width = size.Width;
-                            _opt.Height = size.Height;
-                            LayoutContent();
+                            Size size = SetChildSize(ChildSize());
                             _rdp.Connect(size, _scalePercent, _credential, false);
                         }
                         catch { }
@@ -741,10 +865,7 @@ namespace CuaSessionHost
                     _statusPill.SetState("重连子会话", Theme.Accent);
                     try
                     {
-                        Size size = ChildSize();
-                        _opt.Width = size.Width;
-                        _opt.Height = size.Height;
-                        LayoutContent();
+                        Size size = SetChildSize(ChildSize());
                         _rdp.Connect(size, _scalePercent, _credential, !_plainTried);
                         _lastError = null;
                         WriteState();
@@ -1077,9 +1198,10 @@ namespace CuaSessionHost
                 ShowInTaskbar = true;
                 Opacity = 1;
                 WindowState = FormWindowState.Normal;
-                _isMaximized = true;
-                Bounds = Screen.PrimaryScreen.WorkingArea;
+                if (_pipBounds.IsEmpty) _pipBounds = DefaultPipBounds(Screen.PrimaryScreen.WorkingArea);
+                Bounds = _isMaximized ? Screen.PrimaryScreen.WorkingArea : _pipBounds;
                 Show();
+                ApplyTopMost();
                 LayoutShell();
                 LayoutBar();
                 Activate();
@@ -1103,6 +1225,7 @@ namespace CuaSessionHost
             Hide();
             ShowInTaskbar = false;
             _viewerShown = false;
+            ApplyTopMost();
             WriteState();
             if (!_trayTipShown && _tray != null)
             {
@@ -1121,20 +1244,38 @@ namespace CuaSessionHost
 
         private void ToggleMaximize()
         {
+            if (!_isMaximized) _pipBounds = Bounds;   // 记住画中画的当前位置
             _isMaximized = !_isMaximized;
             if (WindowState == FormWindowState.Minimized)
                 WindowState = FormWindowState.Normal;
-            Bounds = _isMaximized ? Screen.PrimaryScreen.WorkingArea : _normalBounds;
+            if (_isMaximized)
+            {
+                Bounds = Screen.PrimaryScreen.WorkingArea;
+            }
+            else
+            {
+                if (_pipBounds.IsEmpty) _pipBounds = DefaultPipBounds(Screen.PrimaryScreen.WorkingArea);
+                Bounds = _pipBounds;
+            }
+            ApplyTopMost();
             LayoutShell();
             LayoutBar();
             UpdateWindowGlyph();
+            if (Visible) Activate();
+        }
+
+        /// <summary>画中画悬浮在其他窗口之上；最大化时退回普通窗口。</summary>
+        private void ApplyTopMost()
+        {
+            bool top = Visible && !_isMaximized && WindowState == FormWindowState.Normal;
+            if (TopMost != top) TopMost = top;
         }
 
         private void UpdateWindowGlyph()
         {
             if (_maximize == null) return;
             _maximize.Text = _isMaximized ? "\uE923" : "\uE922";
-            _tips?.SetToolTip(_maximize, _isMaximized ? "还原窗口" : "最大化窗口");
+            _tips?.SetToolTip(_maximize, _isMaximized ? "还原窗口（双击画面）" : "最大化窗口（双击画面）");
         }
 
         private void SetViewOnly(bool viewOnly)
@@ -1145,10 +1286,17 @@ namespace CuaSessionHost
                 return;
             }
             _viewOnly = viewOnly;
-            try { _rdp.SetInputBlocked(viewOnly); } catch { }
+            try
+            {
+                // 缩放/重连会让 mstscax 重建隐藏的输入窗口，缓存句柄可能已失效——
+                // 只读必须真的挡住输入，所以每次都重新解析再设禁用状态。
+                ChildSessionApi.ClearCache(_rdp.Handle);
+                _rdp.SetInputBlocked(viewOnly);
+            }
+            catch { }
             if (viewOnly)
             {
-                _statusPill.SetState("只读观察 · 键鼠已屏蔽", Theme.Warn);
+                _statusPill.SetState("只读观察 · 拖动画面移动窗口", Theme.Warn);
             }
             else
             {
@@ -1156,12 +1304,339 @@ namespace CuaSessionHost
                 if (Visible)
                 {
                     Activate();
-                    _rdp.FocusInput();
+                    ReassertInput();
                 }
             }
             UpdateButtons();
             LayoutBar();
             WriteState();
+        }
+
+        /// <summary>
+        /// 接管控制时重新启用 RDP 的 Input Capture Window。窗口一缩放，mstscax
+        /// 会重建这个隐藏子窗口；旧句柄上残留的禁用状态正是"只有最大化全屏才点
+        /// 得动"的典型症状，所以接管/缩放之后都重新解析并启用一次。
+        /// </summary>
+        private void ReassertInput()
+        {
+            if (_viewOnly) return;
+            try
+            {
+                ChildSessionApi.ClearCache(_rdp.Handle);
+                _rdp.SetInputBlocked(false);
+                _rdp.FocusInput();
+            }
+            catch { }
+        }
+
+        // ---------------- 画中画：默认几何 / 手势 ----------------
+
+        private static readonly bool PipDebug =
+            Environment.GetEnvironmentVariable("CUA_PIP_DEBUG") == "1";
+
+        private void PipLog(string text)
+        {
+            if (!PipDebug) return;
+            try
+            {
+                File.AppendAllText(Path.Combine(_opt.DataDir, "pip-debug.log"),
+                    DateTime.Now.ToString("HH:mm:ss.fff") + " " + text + Environment.NewLine);
+            }
+            catch { }
+        }
+
+        /// <summary>默认画中画：右下角一块按子会话比例的小窗，四周留出边框带。</summary>
+        private Rectangle DefaultPipBounds(Rectangle work)
+        {
+            double aspect = _aspect > 0 ? _aspect : 16.0 / 9.0;
+            int pad = Math.Max(4, (int)Math.Round(5 * _uiScale));
+            int barHeight = _bar != null
+                ? _bar.Height
+                : Math.Max(38, (int)Math.Round(46 * _uiScale));
+            int contentWidth = (int)Math.Round(work.Width * 0.28);
+            contentWidth = Math.Max(MinPipWidth() - pad * 2,
+                Math.Min(work.Width - pad * 2 - 16, contentWidth));
+            int contentHeight = Math.Max(1, (int)Math.Round(contentWidth / aspect));
+            int width = contentWidth + pad * 2;
+            int height = barHeight + pad * 2 + contentHeight;
+            int margin = Math.Max(12, (int)Math.Round(24 * _uiScale));
+            return new Rectangle(
+                Math.Max(work.Left + margin, work.Right - width - margin),
+                Math.Max(work.Top + margin, work.Bottom - height - margin),
+                width,
+                height);
+        }
+
+        private int MinPipWidth()
+        {
+            return Math.Max(380, (int)Math.Round(380 * _uiScale));
+        }
+
+        /// <summary>画中画位置存盘：下次打开观察窗还在原地，不用每次重新摆。</summary>
+        private string ViewerGeometryPath()
+        {
+            return Path.Combine(_opt.DataDir, "viewer.json");
+        }
+
+        private Rectangle? LoadViewerBounds()
+        {
+            try
+            {
+                var d = Json.Parse(File.ReadAllText(ViewerGeometryPath()));
+                int x = Json.Int(d, "x", int.MinValue);
+                int y = Json.Int(d, "y", int.MinValue);
+                int width = Json.Int(d, "width", 0);
+                int height = Json.Int(d, "height", 0);
+                if (width < MinPipWidth() || height < _bar.Height + _pad * 2 + 120) return null;
+                Rectangle screen = SystemInformation.VirtualScreen;
+                if (x + width < screen.Left + 96 || x > screen.Right - 96 ||
+                    y + height < screen.Top + 48 || y > screen.Bottom - 48)
+                    return null;   // 换过显示器/分辨率，旧位置没意义
+                return new Rectangle(x, y, width, HeightForWidth(width));
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private void SaveViewerBounds()
+        {
+            try
+            {
+                File.WriteAllText(ViewerGeometryPath(), Json.Serialize(
+                    new Dictionary<string, object>
+                    {
+                        { "x", Bounds.X },
+                        { "y", Bounds.Y },
+                        { "width", Bounds.Width },
+                        { "height", Bounds.Height }
+                    }));
+            }
+            catch { }
+        }
+
+        /// <summary>窗口高度：内容按子会话比例算，再加标题栏与边框带。</summary>
+        private int HeightForWidth(int width)
+        {
+            double aspect = _aspect > 0 ? _aspect : 16.0 / 9.0;
+            int chromeW = _pad * 2;
+            int chromeH = _bar.Height + _pad * 2;
+            int contentWidth = Math.Max(1, width - chromeW);
+            return chromeH + Math.Max(1, (int)Math.Round(contentWidth / aspect));
+        }
+
+        /// <summary>边缘/角落拖拽手势带：整个内容外侧的边框。</summary>
+        private PipZone ZoneOf(Point p)
+        {
+            int grip = Math.Max(4, _pad);
+            PipZone zone = PipZone.None;
+            if (p.X < grip) zone |= PipZone.Left;
+            else if (p.X >= ClientSize.Width - grip) zone |= PipZone.Right;
+            if (p.Y < grip) zone |= PipZone.Top;
+            else if (p.Y >= ClientSize.Height - grip) zone |= PipZone.Bottom;
+            return zone;
+        }
+
+        private bool InContent(Point p)
+        {
+            return _content != null && _content.Visible && _content.Bounds.Contains(p);
+        }
+
+        private bool IsDoubleClick(Point cursor)
+        {
+            DateTime now = DateTime.UtcNow;
+            Size tolerance = SystemInformation.DoubleClickSize;
+            bool hit = (now - _lastDownAt).TotalMilliseconds <= SystemInformation.DoubleClickTime
+                       && Math.Abs(cursor.X - _lastDownPos.X) <= Math.Max(1, tolerance.Width / 2)
+                       && Math.Abs(cursor.Y - _lastDownPos.Y) <= Math.Max(1, tolerance.Height / 2);
+            _lastDownAt = hit ? DateTime.MinValue : now;
+            _lastDownPos = cursor;
+            return hit;
+        }
+
+        /// <summary>
+        /// 在消息分发前处理画中画手势。返回 true = 消息已被吞掉。
+        /// 只读观察时画面就是窗口：中心拖动 = 移动，双击 = 最大化；
+        /// 边框带任意角落 = 等比缩放。接管控制时全部放行给子会话。
+        /// </summary>
+        internal bool FilterMessage(ref Message m)
+        {
+            int msg = m.Msg;
+            if (msg != WmLButtonDown && msg != WmLButtonDblClk &&
+                msg != WmLButtonUp && msg != WmMouseMove) return false;
+            if (_stopping || IsDisposed) return false;
+            if (!Visible || !Enabled || !IsHandleCreated)
+            {
+                if (msg != WmMouseMove) PipLog("skip state visible=" + Visible + " enabled=" + Enabled + " msg=" + msg);
+                return false;
+            }
+            if (m.HWnd != Handle && !Native.IsChild(Handle, m.HWnd))
+            {
+                if (msg != WmMouseMove) PipLog("skip foreign hwnd=" + m.HWnd + " handle=" + Handle);
+                return false;
+            }
+            if (msg != WmMouseMove) PipLog("msg=" + msg + " hwnd=" + m.HWnd + " self=" + (m.HWnd == Handle));
+
+            Point cursor = Cursor.Position;
+            Point p = PointToClient(cursor);
+            if (msg != WmMouseMove)
+                PipLog("p=" + p.X + "," + p.Y + " content=" + InContent(p) +
+                       " zone=" + ZoneOf(p) + " viewOnly=" + _viewOnly + " max=" + _isMaximized);
+
+            if (msg == WmLButtonDown || msg == WmLButtonDblClk)
+            {
+                if (_gesture != PipGesture.None) return false;
+                PipZone zone = ZoneOf(p);
+                if (zone != PipZone.None)
+                {
+                    _lastDownAt = DateTime.MinValue;
+                    BeginGesture(PipGesture.Resize, zone, cursor);
+                    return true;
+                }
+                if (InContent(p))
+                {
+                    if (_viewOnly)
+                    {
+                        if (IsDoubleClick(cursor))
+                        {
+                            ToggleMaximize();
+                            return true;
+                        }
+                        if (!_isMaximized)
+                        {
+                            BeginGesture(PipGesture.Move, PipZone.None, cursor);
+                            return true;
+                        }
+                        return false;
+                    }
+                    // 接管控制：点击前再启用一次 RDP 输入窗口，防止窗口缩放后点击落空
+                    ReassertInput();
+                }
+                return false;
+            }
+
+            if (msg == WmMouseMove)
+            {
+                if (_gesture == PipGesture.Move)
+                {
+                    DragTo(cursor);
+                    return true;
+                }
+                if (_gesture == PipGesture.Resize)
+                {
+                    ResizeTo(cursor);
+                    return true;
+                }
+                return false;
+            }
+
+            if (_gesture != PipGesture.None)
+            {
+                EndGesture();
+                return true;
+            }
+            return false;
+        }
+
+        private void BeginGesture(PipGesture gesture, PipZone zone, Point cursor)
+        {
+            PipLog("begin " + gesture + " zone=" + zone + " cursor=" + cursor + " bounds=" + Bounds);
+            try { if (!Focused) Activate(); } catch { }
+            _gesture = gesture;
+            _gestureZone = zone;
+            _gestureStart = Bounds;
+            _gestureCursor = cursor;
+            Cursor = GestureCursor(gesture, zone);
+            try { Capture = true; } catch { }
+        }
+
+        private void EndGesture()
+        {
+            if (_gesture == PipGesture.None) return;
+            _gesture = PipGesture.None;
+            _gestureZone = PipZone.None;
+            try { Capture = false; } catch { }
+            Cursor = Cursors.Default;
+            PipLog("end bounds=" + Bounds);
+            if (!_isMaximized)
+            {
+                _pipBounds = Bounds;
+                SaveViewerBounds();
+                ReassertInput();      // 缩放后 mstscax 可能重建了输入窗口
+            }
+            WriteState();
+        }
+
+        private void DragTo(Point cursor)
+        {
+            Rectangle b = _gestureStart;
+            b.X += cursor.X - _gestureCursor.X;
+            b.Y += cursor.Y - _gestureCursor.Y;
+            Bounds = ClampToScreen(b);
+        }
+
+        /// <summary>等比缩放：宽度是唯一自由度，高度由子会话比例推出。</summary>
+        private void ResizeTo(Point cursor)
+        {
+            Rectangle s = _gestureStart;
+            PipZone zone = _gestureZone;
+            bool hasLeft = (zone & PipZone.Left) != 0;
+            bool hasRight = (zone & PipZone.Right) != 0;
+            bool hasTop = (zone & PipZone.Top) != 0;
+            bool hasBottom = (zone & PipZone.Bottom) != 0;
+
+            int dx = cursor.X - _gestureCursor.X;
+            int dy = cursor.Y - _gestureCursor.Y;
+            int stepX = hasLeft ? -dx : hasRight ? dx : 0;
+            int stepY = hasTop ? -dy : hasBottom ? dy : 0;
+
+            double aspect = _aspect > 0 ? _aspect : 16.0 / 9.0;
+            int chromeW = _pad * 2;
+            int chromeH = _bar.Height + _pad * 2;
+            int minW = MinPipWidth();
+            int maxW = Math.Max(minW, Math.Min(SystemInformation.VirtualScreen.Width,
+                (int)Math.Round((SystemInformation.VirtualScreen.Height - chromeH) * aspect) + chromeW));
+
+            int width;
+            if (stepX != 0 && (stepY == 0 || Math.Abs(stepX) >= Math.Abs((int)Math.Round(stepY * aspect))))
+                width = s.Width + stepX;                       // 横向拖动主导
+            else
+                width = chromeW + (int)Math.Round((s.Height + stepY - chromeH) * aspect);
+            width = Math.Max(minW, Math.Min(maxW, width));
+            int height = HeightForWidth(width);
+
+            int x = hasLeft ? s.Right - width
+                : hasRight ? s.Left
+                : s.Left + (s.Width - width) / 2;   // 纯上下拖动：水平居中
+            int y = hasTop ? s.Bottom - height
+                : s.Top;                            // 左右拖动时标题栏不跟着上下跳
+            Bounds = new Rectangle(x, y, width, height);
+        }
+
+        private static Rectangle ClampToScreen(Rectangle b)
+        {
+            Rectangle v = SystemInformation.VirtualScreen;
+            const int keep = 96;   // 至少留一条可抓回来的边
+            if (b.Right < v.Left + keep) b.X = v.Left + keep - b.Width;
+            if (b.Left > v.Right - keep) b.X = v.Right - keep;
+            if (b.Bottom < v.Top + keep) b.Y = v.Top + keep - b.Height;
+            if (b.Top > v.Bottom - keep) b.Y = v.Bottom - keep;
+            return b;
+        }
+
+        private static Cursor GestureCursor(PipGesture gesture, PipZone zone)
+        {
+            if (gesture == PipGesture.Move) return Cursors.SizeAll;
+            bool left = (zone & PipZone.Left) != 0;
+            bool right = (zone & PipZone.Right) != 0;
+            bool top = (zone & PipZone.Top) != 0;
+            bool bottom = (zone & PipZone.Bottom) != 0;
+            if ((left && top) || (right && bottom)) return Cursors.SizeNWSE;
+            if ((right && top) || (left && bottom)) return Cursors.SizeNESW;
+            if (left || right) return Cursors.SizeWE;
+            if (top || bottom) return Cursors.SizeNS;
+            return Cursors.Default;
         }
 
         private void UpdateButtons()
@@ -1783,6 +2258,11 @@ namespace CuaSessionHost
                 { "connected", _connected },
                 { "viewer_visible", Visible && WindowState != FormWindowState.Minimized },
                 { "viewer_shown", _viewerShown },
+                { "viewer_maximized", _isMaximized },
+                { "viewer_x", Bounds.X },
+                { "viewer_y", Bounds.Y },
+                { "viewer_width", Bounds.Width },
+                { "viewer_height", Bounds.Height },
                 { "view_only", _viewOnly },
                 { "width", _opt.Width },
                 { "height", _opt.Height },
