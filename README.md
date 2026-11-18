@@ -350,7 +350,10 @@ outcome, then fades out: nothing stays parked on screen. Sandbox commands show n
 (the hidden desktop is invisible). Inside a Child Session the preview runs in that session
 (the read-only viewer shows it). The overlay is a resident host (`cua preview serve`,
 auto-spawned on first use, `cua preview stop` to exit, idle-exits after 30 minutes); disable
-with `pointer_preview: false` in config.json or `CUA_POINTER_PREVIEW=0`.
+with `pointer_preview: false` in config.json or `CUA_POINTER_PREVIEW=0`. Every mutating
+command's bubble labels the delivery type — `[键鼠]` real pointer/keyboard input, `[UIA]`
+accessibility patterns (the real pointer never moves), `[消息]` posted window messages,
+`[窗口]` window management, `[系统]` process launch, `[剪贴板]` clipboard writes.
 
 ## Known limits
 

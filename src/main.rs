@@ -907,7 +907,7 @@ enum RecOp {
 }
 
 #[derive(Subcommand)]
-enum ClipOp {
+pub(crate) enum ClipOp {
     Get,
     Set {
         #[arg(long)]

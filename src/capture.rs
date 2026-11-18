@@ -211,11 +211,14 @@ pub fn save_jpeg(shot: &Shot, path: &std::path::Path, quality: u8) -> Result<()>
 /// BGRA, top-down, 32bpp — the layout of GetDIBits and of GDI+'
 /// PixelFormat32bppARGB (little-endian ARGB dword), so the raw DIB scan can
 /// be handed to the JPEG encoder unchanged.
+///
+/// The screen DC is RE-ACQUIRED every grab as a defensive measure: an RDP
+/// session's display surface can be recreated on display events, and a DC
+/// held across such an event would serve stale content. DC setup is ~1 ms,
+/// negligible next to BitBlt; the 13 MB buffer reuse is what actually saves
+/// the frame budget.
 pub struct ScreenGrabber {
-    hdc: HDC,
-    mem: HDC,
-    bmp: HBITMAP,
-    old: HGDIOBJ,
+    all_monitors: bool,
     w: i32,
     h: i32,
     vx: i32,
@@ -239,23 +242,8 @@ impl ScreenGrabber {
             if w <= 0 || h <= 0 {
                 bail!("bad screen metrics");
             }
-            let hdc = GetDC(HWND::default());
-            if hdc.is_invalid() {
-                bail!("GetDC screen failed");
-            }
-            let mem = CreateCompatibleDC(hdc);
-            let bmp = CreateCompatibleBitmap(hdc, w, h);
-            if mem.is_invalid() || bmp.is_invalid() {
-                ReleaseDC(HWND::default(), hdc);
-                bail!("screen grabber GDI setup failed");
-            }
-            let obj: HGDIOBJ = bmp.into();
-            let old = SelectObject(mem, obj);
             Ok(Self {
-                hdc,
-                mem,
-                bmp,
-                old,
+                all_monitors,
                 w,
                 h,
                 vx,
@@ -269,47 +257,67 @@ impl ScreenGrabber {
     /// the scan. The borrow ends at the next grab.
     pub fn grab(&mut self, with_cursor: bool) -> Result<&[u8]> {
         unsafe {
-            BitBlt(self.mem, 0, 0, self.w, self.h, self.hdc, self.vx, self.vy, SRCCOPY)
-                .map_err(|e| anyhow::anyhow!("BitBlt screen: {e}"))?;
-            if with_cursor {
-                self.draw_cursor();
+            let hdc = GetDC(HWND::default());
+            if hdc.is_invalid() {
+                bail!("GetDC screen failed");
             }
-            let mut bi = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: self.w,
-                    biHeight: -self.h,
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB.0,
+            let mem = CreateCompatibleDC(hdc);
+            let bmp = CreateCompatibleBitmap(hdc, self.w, self.h);
+            if mem.is_invalid() || bmp.is_invalid() {
+                ReleaseDC(HWND::default(), hdc);
+                bail!("screen grabber GDI setup failed");
+            }
+            let obj: HGDIOBJ = bmp.into();
+            let old = SelectObject(mem, obj);
+            let grabbed = (|| -> Result<()> {
+                BitBlt(mem, 0, 0, self.w, self.h, hdc, self.vx, self.vy, SRCCOPY)
+                    .map_err(|e| anyhow::anyhow!("BitBlt screen: {e}"))?;
+                if with_cursor {
+                    self.draw_cursor(mem);
+                }
+                let mut bi = BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: self.w,
+                        biHeight: -self.h,
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: BI_RGB.0,
+                        ..Default::default()
+                    },
                     ..Default::default()
-                },
-                ..Default::default()
-            };
-            if GetDIBits(
-                self.mem,
-                self.bmp,
-                0,
-                self.h as u32,
-                Some(self.buf.as_mut_ptr() as *mut _),
-                &mut bi,
-                DIB_RGB_COLORS,
-            ) == 0
-            {
-                bail!("GetDIBits failed");
-            }
+                };
+                if GetDIBits(
+                    mem,
+                    bmp,
+                    0,
+                    self.h as u32,
+                    Some(self.buf.as_mut_ptr() as *mut _),
+                    &mut bi,
+                    DIB_RGB_COLORS,
+                ) == 0
+                {
+                    bail!("GetDIBits failed");
+                }
+                Ok(())
+            })();
+            let _ = SelectObject(mem, old);
+            let _ = DeleteObject(HGDIOBJ(bmp.0));
+            let _ = DeleteDC(mem);
+            let _ = ReleaseDC(HWND::default(), hdc);
+            grabbed?;
             Ok(&self.buf)
         }
     }
 
-    /// Bake the current mouse cursor into the frame at its true position —
-    /// without it the recording cannot show where real input lands.
     /// Frame dimensions (physical px), fixed at construction.
     pub fn size(&self) -> (u32, u32) {
         (self.w as u32, self.h as u32)
     }
 
-    unsafe fn draw_cursor(&mut self) {
+    /// Bake the current mouse cursor into the frame at its true position —
+    /// without it the recording cannot show where real input lands.
+    unsafe fn draw_cursor(&self, mem: HDC) {
         let mut ci = CURSORINFO { cbSize: std::mem::size_of::<CURSORINFO>() as u32, ..Default::default() };
         if GetCursorInfo(&mut ci).is_err() || (ci.flags.0 & CURSOR_SHOWING.0) == 0 || ci.hCursor.is_invalid() {
             return;
@@ -357,7 +365,7 @@ impl ScreenGrabber {
             let _ = DeleteObject(HGDIOBJ(ii.hbmMask.0));
         }
         let _ = DrawIconEx(
-            self.mem,
+            mem,
             ci.ptScreenPos.x - self.vx - ii.xHotspot as i32,
             ci.ptScreenPos.y - self.vy - ii.yHotspot as i32,
             ci.hCursor,
@@ -367,17 +375,6 @@ impl ScreenGrabber {
             None,
             DI_NORMAL,
         );
-    }
-}
-
-impl Drop for ScreenGrabber {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = SelectObject(self.mem, self.old);
-            let _ = DeleteObject(HGDIOBJ(self.bmp.0));
-            let _ = DeleteDC(self.mem);
-            let _ = ReleaseDC(HWND::default(), self.hdc);
-        }
     }
 }
 

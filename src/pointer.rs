@@ -71,6 +71,11 @@ pub struct Spec {
     /// a11y actions have no coordinates — the emitter resolves this selector to
     /// the target window's rect centre, so the preview still lands on target
     pub window_sel: Option<String>,
+    /// delivery type shown in the bubble: 键鼠 (real SendInput), UIA
+    /// (accessibility patterns, the real pointer never moves), 消息 (posted
+    /// window messages), 窗口 (window management), 系统 (ShellExecute/process
+    /// launch), 剪贴板 (clipboard write)
+    pub tag: &'static str,
     /// where the POST packet should anchor the dot, when the action ends
     /// somewhere other than it started (drag: the release point). Not
     /// serialized — consumed by `post_from` only.
@@ -82,6 +87,7 @@ impl Spec {
         json!({
             "phase": self.phase,
             "verb": self.verb,
+            "tag": self.tag,
             "detail": self.detail,
             "x": self.x,
             "y": self.y,
@@ -239,33 +245,71 @@ pub fn pre_spec(cmd: &crate::Cmd) -> Option<Spec> {
         }
         t.chars().take(44).collect::<String>()
     };
+    // real key input lands on the focused window, so its centre is the honest
+    // anchor for window-less key/type actions
+    let fg = || -> Option<(i32, i32)> {
+        let hwnd = crate::win::foreground_hwnd();
+        crate::win::window_rect(hwnd).ok().map(|[rx, ry, rw, rh]| (rx + rw / 2, ry + rh / 2))
+    };
     match cmd {
         // every arm below that carries a `sandbox` flag must gate on it: a
         // sandbox action runs on the hidden desktop, so a preview dot on the
-        // user's real desktop would be a lie
-        Cmd::Click { window, x, y, sandbox, double, .. } if !*sandbox => Some(Spec {
+        // user's real desktop would be a lie. `tag` says how the action will
+        // actually be delivered — 键鼠 moves the real pointer/keyboard, UIA
+        // drives accessibility patterns without touching the pointer, 消息
+        // posts window messages, 窗口/系统 manage windows and processes.
+        Cmd::Click { window, index, x, y, sandbox, double, background, delivery, .. } if !*sandbox => {
+            let tag = if *background || delivery.as_deref() == Some("background") {
+                "消息"
+            } else if index.is_some() {
+                "UIA"
+            } else {
+                "键鼠"
+            };
+            Some(Spec {
+                phase: "pre",
+                verb: if *double { "双击" } else { "点击" },
+                tag,
+                detail: d(window, *x, *y),
+                x: *x,
+                y: *y,
+                click: true,
+                ok: None,
+                window_sel: window.clone(),
+                post_xy: None,
+            })
+        }
+        Cmd::Hover { window, x, y, background, .. } => Some(Spec {
             phase: "pre",
-            verb: if *double { "双击" } else { "点击" },
+            verb: "悬停",
+            tag: if *background { "消息" } else { "键鼠" },
             detail: d(window, *x, *y),
             x: *x,
             y: *y,
-            click: true,
+            click: false,
             ok: None,
             window_sel: window.clone(),
             post_xy: None,
         }),
-        Cmd::Hover { window, x, y, .. } => Some(Spec {
-            phase: "pre", verb: "悬停", detail: d(window, *x, *y), x: *x, y: *y, click: false, ok: None, window_sel: window.clone(), post_xy: None,
+        Cmd::Scroll { dx: _, dy: _, x, y, window, sandbox, background, .. } if !*sandbox => Some(Spec {
+            phase: "pre",
+            verb: "滚动",
+            tag: if *background { "消息" } else { "键鼠" },
+            detail: d(window, *x, *y),
+            x: *x,
+            y: *y,
+            click: false,
+            ok: None,
+            window_sel: window.clone(),
+            post_xy: None,
         }),
-        Cmd::Scroll { dx: _, dy: _, x, y, window, sandbox, .. } if !*sandbox => Some(Spec {
-            phase: "pre", verb: "滚动", detail: d(window, *x, *y), x: *x, y: *y, click: false, ok: None, window_sel: window.clone(), post_xy: None,
-        }),
-        Cmd::Drag { x1, y1, x2, y2, sandbox, .. } if !*sandbox => Some(Spec {
+        Cmd::Drag { x1, y1, x2, y2, sandbox, background, .. } if !*sandbox => Some(Spec {
             // pre anchors at the press point; the post packet re-anchors at the
             // release point via post_xy (a drag that keeps showing its start
             // would misreport where the input ended)
             phase: "pre",
             verb: "拖拽",
+            tag: if *background { "消息" } else { "键鼠" },
             detail: format!("({x1},{y1}) → ({x2},{y2})"),
             x: Some(*x1),
             y: Some(*y1),
@@ -274,23 +318,40 @@ pub fn pre_spec(cmd: &crate::Cmd) -> Option<Spec> {
             window_sel: None,
             post_xy: Some((*x2, *y2)),
         }),
-        Cmd::Key { keys, window, sandbox, .. } if !*sandbox => Some(Spec {
-            phase: "pre", verb: "按键", detail: keys.chars().take(24).collect(), x: None, y: None, click: false, ok: None, window_sel: window.clone(), post_xy: None,
-        }),
-        Cmd::Type { text, window, sandbox, .. } if !*sandbox => Some(Spec {
-            phase: "pre",
-            verb: "输入",
-            detail: format!("{} ({})", window.clone().unwrap_or_default(), text.chars().count()).chars().take(44).collect(),
-            x: None,
-            y: None,
-            click: false,
-            ok: None,
-            window_sel: window.clone(),
-            post_xy: None,
-        }),
+        Cmd::Key { keys, window, sandbox, background, .. } if !*sandbox => {
+            let (x, y) = if window.is_none() { fg().map(|(a, b)| (Some(a), Some(b))).unwrap_or((None, None)) } else { (None, None) };
+            Some(Spec {
+                phase: "pre",
+                verb: "按键",
+                tag: if *background { "消息" } else { "键鼠" },
+                detail: keys.chars().take(24).collect(),
+                x,
+                y,
+                click: false,
+                ok: None,
+                window_sel: window.clone(),
+                post_xy: None,
+            })
+        }
+        Cmd::Type { text, window, sandbox, background, .. } if !*sandbox => {
+            let (x, y) = if window.is_none() { fg().map(|(a, b)| (Some(a), Some(b))).unwrap_or((None, None)) } else { (None, None) };
+            Some(Spec {
+                phase: "pre",
+                verb: "输入",
+                tag: if *background { "消息" } else { "键鼠" },
+                detail: format!("{} ({})", window.clone().unwrap_or_default(), text.chars().count()).chars().take(44).collect(),
+                x,
+                y,
+                click: false,
+                ok: None,
+                window_sel: window.clone(),
+                post_xy: None,
+            })
+        }
         Cmd::SetValue { window, clear, sandbox, .. } if !*sandbox => Some(Spec {
             phase: "pre",
             verb: if *clear { "清空" } else { "输入" },
+            tag: "UIA",
             detail: d(&Some(window.clone()), None, None),
             x: None,
             y: None,
@@ -299,15 +360,45 @@ pub fn pre_spec(cmd: &crate::Cmd) -> Option<Spec> {
             window_sel: Some(window.clone()),
             post_xy: None,
         }),
-        Cmd::Toggle { window, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "切换", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
-        Cmd::Select { window, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "选择", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
-        Cmd::SelectAdd { window, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "多选", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
-        Cmd::SelectRemove { window, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "取消选择", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
-        Cmd::Expand { window, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "展开", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
-        Cmd::Collapse { window, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "折叠", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
-        Cmd::SetRange { window, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "设值", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
-        Cmd::Realize { window, .. } => Some(Spec { phase: "pre", verb: "展开", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
-        Cmd::Close { window, .. } => Some(Spec { phase: "pre", verb: "关闭", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
+        Cmd::Toggle { window, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "切换", tag: "UIA", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
+        Cmd::Select { window, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "选择", tag: "UIA", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
+        Cmd::SelectAdd { window, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "多选", tag: "UIA", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
+        Cmd::SelectRemove { window, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "取消选择", tag: "UIA", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
+        Cmd::Expand { window, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "展开", tag: "UIA", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
+        Cmd::Collapse { window, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "折叠", tag: "UIA", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
+        Cmd::SetRange { window, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "设值", tag: "UIA", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
+        Cmd::ScrollItem { window, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "滚动到", tag: "UIA", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
+        Cmd::Realize { window, .. } => Some(Spec { phase: "pre", verb: "展开", tag: "UIA", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
+        Cmd::Grid { window, row, col, invoke, .. } if *invoke && row.is_some() && col.is_some() => Some(Spec { phase: "pre", verb: "选中", tag: "UIA", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
+        Cmd::Transform { window, move_to, size, zoom, .. } if move_to.is_some() || size.is_some() || zoom.is_some() => Some(Spec { phase: "pre", verb: "变换", tag: "UIA", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
+        // window management: real desktop changes, but never the pointer
+        Cmd::Close { window, .. } => Some(Spec { phase: "pre", verb: "关闭", tag: "窗口", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
+        Cmd::Activate { window, .. } => Some(Spec { phase: "pre", verb: "激活", tag: "窗口", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
+        Cmd::Minimize { window, .. } => Some(Spec { phase: "pre", verb: "最小化", tag: "窗口", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
+        Cmd::Maximize { window, .. } => Some(Spec { phase: "pre", verb: "最大化", tag: "窗口", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
+        Cmd::Restore { window, .. } => Some(Spec { phase: "pre", verb: "还原", tag: "窗口", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
+        Cmd::Resize { window, width, height, x, y, .. } => Some(Spec {
+            phase: "pre",
+            verb: "调整大小",
+            tag: "窗口",
+            detail: format!("{} → {}x{} @({},{})", window,
+                width.map_or(-1, |v| v), height.map_or(-1, |v| v),
+                x.map_or(-1, |v| v), y.map_or(-1, |v| v))
+                .chars().take(44).collect(),
+            x: None,
+            y: None,
+            click: false,
+            ok: None,
+            window_sel: Some(window.clone()),
+            post_xy: None,
+        }),
+        // process launches: no pointer involved
+        Cmd::Open { name, .. } => Some(Spec { phase: "pre", verb: "打开", tag: "系统", detail: name.chars().take(24).collect(), x: None, y: None, click: false, ok: None, window_sel: None, post_xy: None }),
+        Cmd::Launch { exe, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "启动", tag: "系统", detail: exe.chars().take(24).collect(), x: None, y: None, click: false, ok: None, window_sel: None, post_xy: None }),
+        Cmd::Clipboard { op: crate::ClipOp::Set { .. } } => {
+            let (x, y) = fg().map(|(a, b)| (Some(a), Some(b))).unwrap_or((None, None));
+            Some(Spec { phase: "pre", verb: "剪贴", tag: "剪贴板", detail: "写入剪贴板".into(), x, y, click: false, ok: None, window_sel: None, post_xy: None })
+        }
         _ => None,
     }
 }
@@ -323,6 +414,7 @@ pub fn post_from(pre: &Spec, ok: bool) -> Spec {
     Spec {
         phase: "post",
         verb: pre.verb,
+        tag: pre.tag,
         detail: pre.detail.clone(),
         x,
         y,
@@ -430,6 +522,7 @@ mod host {
     struct HostState {
         phase: &'static str,
         verb: String,
+        tag: String,
         detail: String,
         target: (i32, i32),
         current: (f64, f64),
@@ -491,6 +584,11 @@ mod host {
             .get("verb")
             .and_then(|s| s.as_str())
             .unwrap_or("动作")
+            .to_string();
+        state.tag = v
+            .get("tag")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
             .to_string();
         state.detail = fit_width(
             v.get("detail").and_then(|s| s.as_str()).unwrap_or(""),
@@ -711,7 +809,11 @@ mod host {
                 }
             }
         };
-        let line1 = format!("{phase_word} {}\0", state.verb);
+        let line1 = if state.tag.is_empty() {
+            format!("{phase_word} {}\0", state.verb)
+        } else {
+            format!("{phase_word} [{}] {}\0", state.tag, state.verb)
+        };
         let w1: Vec<u16> = line1.encode_utf16().collect();
         let w2: Vec<u16> = format!("{}\0", state.detail).encode_utf16().collect();
         let r1 = RectF { X: bx + 14.0, Y: by + 6.0, Width: BUBBLE_W - 24.0, Height: 24.0 };
@@ -882,6 +984,7 @@ mod host {
             let mut state = HostState {
                 phase: "post",
                 verb: String::new(),
+                tag: String::new(),
                 detail: String::new(),
                 target: (0, 0),
                 current: (0.0, 0.0),
