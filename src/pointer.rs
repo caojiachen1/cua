@@ -2,14 +2,20 @@
 //! cursor wherever an agent action is about to land, what it is doing while it
 //! runs, and what it did afterwards — for the global desktop commands, for
 //! actions inside a Child Session, and (separately, in-page) for the browser.
+//! The dot is pinned to the exact target (bubble flips sides near screen
+//! edges), colour-coded by phase (amber 即将 / blue 正在 / green 已 / red ✗,
+//! same palette as the browser cursor), and fades out ~8 s after the last
+//! action so nothing stays parked on screen.
 //!
 //! Architecture: `cua preview serve` is a detached resident process that owns
 //! one layered window and listens on a loopback UDP port (persisted in
 //! `preview/preview-<session>.json` together with its pid). Every mutating
-//! command in `dispatch` emits two packets — `pre` ("即将 …") before the action
-//! and `post` ("已 …" / "✗ …") after — fire-and-forget, the same way the
-//! browser's CUA_CURSOR works. The overlay can never fail the action it
-//! decorates: UDP delivery is best-effort and every send is swallowed.
+//! command in `dispatch` emits two packets — `pre` ("即将 …", async) before
+//! the action and `post` ("已 …" / "✗ …", synchronous — the CLI is about to
+//! exit, so a detached send would be killed first) — fire-and-forget, the
+//! same way the browser's CUA_CURSOR works. The overlay can never fail the
+//! action it decorates: UDP delivery is best-effort and every send is
+//! swallowed.
 //!
 //! Session scoping: the port file name carries `CUA_SESSION`, so a Child
 //! Session's agent spawns its OWN host inside the child desktop (where the
@@ -65,6 +71,10 @@ pub struct Spec {
     /// a11y actions have no coordinates — the emitter resolves this selector to
     /// the target window's rect centre, so the preview still lands on target
     pub window_sel: Option<String>,
+    /// where the POST packet should anchor the dot, when the action ends
+    /// somewhere other than it started (drag: the release point). Not
+    /// serialized — consumed by `post_from` only.
+    pub post_xy: Option<(i32, i32)>,
 }
 
 impl Spec {
@@ -124,72 +134,96 @@ fn spawn_host() -> bool {
 /// only blocking part is the one-time host spawn wait (≤2 s per session);
 /// every send is sub-millisecond and best-effort.
 pub fn emit(spec: Spec) {
+    // async is safe for the pre packet: dispatch keeps running after the
+    // spawn, so the thread gets its full lifetime
+    std::thread::spawn(move || deliver(spec));
+}
+
+/// Synchronous variant for the post packet. The CLI is about to exit by the
+/// time the post packet is emitted — a detached thread would be killed by
+/// `process::exit` before its `send_to` ran, so post frames ("已 …"/"✗ …")
+/// never reached the host and the overlay froze on the amber "即将" frame.
+pub fn emit_sync(spec: Spec) {
+    deliver(spec);
+}
+
+fn deliver(spec: Spec) {
     if !enabled() {
         return;
     }
-    let resend_after_spawn = spec.phase == "pre";
-    std::thread::spawn(move || {
-        // a11y actions carry no coordinates: resolve the target window's rect
-        // centre here (on the preview thread — never blocking the action)
-        let spec = match (&spec.window_sel, spec.x, spec.y) {
-            (Some(sel), None, None) => {
-                let centered = match crate::win::resolve_window(sel) {
-                    Ok(hwnd) => match crate::win::window_rect(hwnd) {
-                        Ok([rx, ry, rw, rh]) => Some((rx + rw / 2, ry + rh / 2)),
-                        _ => None,
-                    },
-                    Err(_) => None,
-                };
-                match centered {
-                    Some((x, y)) => {
-                        let mut s2 = spec.clone();
-                        s2.x = Some(x);
-                        s2.y = Some(y);
-                        s2
-                    }
-                    None => spec.clone(),
+    // a11y actions carry no coordinates: resolve the target window's rect
+    // centre here (never blocking the action path for long — the host is
+    // already warm by post time)
+    let spec = match (&spec.window_sel, spec.x, spec.y) {
+        (Some(sel), None, None) => {
+            let centered = match crate::win::resolve_window(sel) {
+                Ok(hwnd) => match crate::win::window_rect(hwnd) {
+                    Ok([rx, ry, rw, rh]) => Some((rx + rw / 2, ry + rh / 2)),
+                    _ => None,
+                },
+                Err(_) => None,
+            };
+            match centered {
+                Some((x, y)) => {
+                    let mut s2 = spec.clone();
+                    s2.x = Some(x);
+                    s2.y = Some(y);
+                    s2
                 }
+                None => spec.clone(),
             }
-            _ => spec.clone(),
-        };
-        let payload = spec.to_packet().to_string();
-        let ensure = |attempt: u8| -> Option<u16> {
+        }
+        _ => spec.clone(),
+    };
+    let payload = spec.to_packet().to_string();
+    let ensure = |attempt: u8| -> Option<u16> {
+        if let Some((port, pid)) = read_port() {
+            if pid_alive(pid) {
+                return Some(port);
+            }
+        }
+        if attempt > 0 {
+            return None;
+        }
+        // another emitter (the pre/post pair race ~a few ms apart) may
+        // already be spawning the host — poll briefly before spawning a
+        // second one; two hosts mean takeover kills the one holding the
+        // half-drawn frame and the post packet lands on the wrong port
+        for _ in 0..8 {
+            std::thread::sleep(Duration::from_millis(150));
             if let Some((port, pid)) = read_port() {
                 if pid_alive(pid) {
                     return Some(port);
                 }
             }
-            if attempt > 0 {
-                return None;
-            }
-            if !spawn_host() {
-                return None;
-            }
-            for _ in 0..20 {
-                std::thread::sleep(Duration::from_millis(100));
-                if let Some((port, pid)) = read_port() {
-                    if pid_alive(pid) {
-                        return Some(port);
-                    }
+        }
+        if !spawn_host() {
+            return None;
+        }
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(100));
+            if let Some((port, pid)) = read_port() {
+                if pid_alive(pid) {
+                    return Some(port);
                 }
             }
-            None
-        };
-        let Some(port) = ensure(0) else {
-            return;
-        };
-        let Ok(sock) = UdpSocket::bind("127.0.0.1:0") else {
-            return;
-        };
-        let dst = format!("127.0.0.1:{port}");
-        let _ = sock.send_to(payload.as_bytes(), &dst);
-        // the very first packet after a cold spawn races the host's bind —
-        // resend once; UDP is stateless so a duplicate only re-anchors the dot
-        if resend_after_spawn {
-            std::thread::sleep(Duration::from_millis(250));
-            let _ = sock.send_to(payload.as_bytes(), &dst);
         }
-    });
+        None
+    };
+    let Some(port) = ensure(0) else {
+        return;
+    };
+    let Ok(sock) = UdpSocket::bind("127.0.0.1:0") else {
+        return;
+    };
+    let dst = format!("127.0.0.1:{port}");
+    let _ = sock.send_to(payload.as_bytes(), &dst);
+    // the very first packet after a cold spawn races the host's bind —
+    // resend once; UDP is stateless so a duplicate only re-anchors the dot
+    if spec.phase == "pre" {
+        std::thread::sleep(Duration::from_millis(250));
+        let _ = sock.send_to(payload.as_bytes(), &dst);
+    }
 }
 
 /// Maps a dispatched command to its preview packet, or None for commands that
@@ -206,6 +240,9 @@ pub fn pre_spec(cmd: &crate::Cmd) -> Option<Spec> {
         t.chars().take(44).collect::<String>()
     };
     match cmd {
+        // every arm below that carries a `sandbox` flag must gate on it: a
+        // sandbox action runs on the hidden desktop, so a preview dot on the
+        // user's real desktop would be a lie
         Cmd::Click { window, x, y, sandbox, double, .. } if !*sandbox => Some(Spec {
             phase: "pre",
             verb: if *double { "双击" } else { "点击" },
@@ -215,20 +252,32 @@ pub fn pre_spec(cmd: &crate::Cmd) -> Option<Spec> {
             click: true,
             ok: None,
             window_sel: window.clone(),
+            post_xy: None,
         }),
         Cmd::Hover { window, x, y, .. } => Some(Spec {
-            phase: "pre", verb: "悬停", detail: d(window, *x, *y), x: *x, y: *y, click: false, ok: None, window_sel: window.clone(),
+            phase: "pre", verb: "悬停", detail: d(window, *x, *y), x: *x, y: *y, click: false, ok: None, window_sel: window.clone(), post_xy: None,
         }),
-        Cmd::Scroll { dx: _, dy: _, x, y, window, .. } => Some(Spec {
-            phase: "pre", verb: "滚动", detail: d(window, *x, *y), x: *x, y: *y, click: false, ok: None, window_sel: window.clone(),
+        Cmd::Scroll { dx: _, dy: _, x, y, window, sandbox, .. } if !*sandbox => Some(Spec {
+            phase: "pre", verb: "滚动", detail: d(window, *x, *y), x: *x, y: *y, click: false, ok: None, window_sel: window.clone(), post_xy: None,
         }),
-        Cmd::Drag { x1, y1, .. } => Some(Spec {
-            phase: "pre", verb: "拖拽", detail: format!("({x1},{y1}) →"), x: Some(*x1), y: Some(*y1), click: false, ok: None, window_sel: None,
+        Cmd::Drag { x1, y1, x2, y2, sandbox, .. } if !*sandbox => Some(Spec {
+            // pre anchors at the press point; the post packet re-anchors at the
+            // release point via post_xy (a drag that keeps showing its start
+            // would misreport where the input ended)
+            phase: "pre",
+            verb: "拖拽",
+            detail: format!("({x1},{y1}) → ({x2},{y2})"),
+            x: Some(*x1),
+            y: Some(*y1),
+            click: false,
+            ok: None,
+            window_sel: None,
+            post_xy: Some((*x2, *y2)),
         }),
-        Cmd::Key { keys, window, .. } => Some(Spec {
-            phase: "pre", verb: "按键", detail: keys.chars().take(24).collect(), x: None, y: None, click: false, ok: None, window_sel: window.clone(),
+        Cmd::Key { keys, window, sandbox, .. } if !*sandbox => Some(Spec {
+            phase: "pre", verb: "按键", detail: keys.chars().take(24).collect(), x: None, y: None, click: false, ok: None, window_sel: window.clone(), post_xy: None,
         }),
-        Cmd::Type { text, window, .. } => Some(Spec {
+        Cmd::Type { text, window, sandbox, .. } if !*sandbox => Some(Spec {
             phase: "pre",
             verb: "输入",
             detail: format!("{} ({})", window.clone().unwrap_or_default(), text.chars().count()).chars().take(44).collect(),
@@ -237,8 +286,9 @@ pub fn pre_spec(cmd: &crate::Cmd) -> Option<Spec> {
             click: false,
             ok: None,
             window_sel: window.clone(),
+            post_xy: None,
         }),
-        Cmd::SetValue { window, clear, value, .. } => Some(Spec {
+        Cmd::SetValue { window, clear, sandbox, .. } if !*sandbox => Some(Spec {
             phase: "pre",
             verb: if *clear { "清空" } else { "输入" },
             detail: d(&Some(window.clone()), None, None),
@@ -247,31 +297,39 @@ pub fn pre_spec(cmd: &crate::Cmd) -> Option<Spec> {
             click: false,
             ok: None,
             window_sel: Some(window.clone()),
+            post_xy: None,
         }),
-        Cmd::Toggle { window, .. } => Some(Spec { phase: "pre", verb: "切换", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()) }),
-        Cmd::Select { window, .. } => Some(Spec { phase: "pre", verb: "选择", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()) }),
-        Cmd::SelectAdd { window, .. } => Some(Spec { phase: "pre", verb: "多选", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()) }),
-        Cmd::SelectRemove { window, .. } => Some(Spec { phase: "pre", verb: "取消选择", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()) }),
-        Cmd::Expand { window, .. } => Some(Spec { phase: "pre", verb: "展开", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()) }),
-        Cmd::Collapse { window, .. } => Some(Spec { phase: "pre", verb: "折叠", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()) }),
-        Cmd::SetRange { window, .. } => Some(Spec { phase: "pre", verb: "设值", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()) }),
-        Cmd::Realize { window, .. } => Some(Spec { phase: "pre", verb: "展开", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()) }),
-        Cmd::Close { window, .. } => Some(Spec { phase: "pre", verb: "关闭", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()) }),
+        Cmd::Toggle { window, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "切换", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
+        Cmd::Select { window, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "选择", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
+        Cmd::SelectAdd { window, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "多选", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
+        Cmd::SelectRemove { window, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "取消选择", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
+        Cmd::Expand { window, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "展开", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
+        Cmd::Collapse { window, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "折叠", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
+        Cmd::SetRange { window, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "设值", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
+        Cmd::Realize { window, .. } => Some(Spec { phase: "pre", verb: "展开", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
+        Cmd::Close { window, .. } => Some(Spec { phase: "pre", verb: "关闭", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
         _ => None,
     }
 }
 
-/// The post packet mirrors the pre one with the outcome attached.
+/// The post packet mirrors the pre one with the outcome attached. When the
+/// action ends somewhere else than it started (drag), the dot re-anchors at
+/// `post_xy`.
 pub fn post_from(pre: &Spec, ok: bool) -> Spec {
+    let (x, y) = match pre.post_xy {
+        Some((px, py)) => (Some(px), Some(py)),
+        None => (pre.x, pre.y),
+    };
     Spec {
         phase: "post",
         verb: pre.verb,
         detail: pre.detail.clone(),
-        x: pre.x,
-        y: pre.y,
+        x,
+        y,
         click: pre.click,
         ok: Some(ok),
-            window_sel: pre.window_sel.clone(),
+        window_sel: pre.window_sel.clone(),
+        post_xy: None,
     }
 }
 
@@ -342,6 +400,17 @@ mod host {
     const WINDOW_H: i32 = 180;
     const FPS_MS: u64 = 33;
     const IDLE_EXIT_SECS: u64 = 1800;
+    // after the last packet the overlay holds still for a moment so the user
+    // can read the outcome, then fades out — a parked fake cursor is residue
+    const FADE_HOLD_MS: u64 = 8000;
+    const FADE_MS: f64 = 600.0;
+    // dot + bubble geometry (physical px): the dot is deliberately small —
+    // it must mark a point, not cover it
+    const DOT_R: f32 = 8.0;
+    const BUBBLE_W: f32 = 300.0;
+    const BUBBLE_H: f32 = 56.0;
+    // the dot's home position inside the window bitmap
+    const DOT_HOME: (i32, i32) = (70, 110);
 
     static RUNNING: AtomicBool = AtomicBool::new(false);
 
@@ -369,6 +438,9 @@ mod host {
         click: bool,
         ok: Option<bool>,
         ripple_start: Option<std::time::Instant>,
+        /// false until the first packet: the very first appearance must JUMP to
+        /// its target, not glide in from the virtual-screen origin
+        anchored: bool,
     }
 
     impl HostState {
@@ -378,6 +450,22 @@ mod host {
                 None => 0.0,
             }
         }
+    }
+
+    /// Truncate to a pixel budget: CJK/fullwidth glyphs count ~2× an ASCII
+    /// char. Keeps one-line details inside the bubble instead of wrapping.
+    fn fit_width(s: &str, max_px: f32) -> String {
+        let mut w = 0.0;
+        let mut end = s.len();
+        for (i, c) in s.char_indices() {
+            let cw = if (c as u32) > 0x2E7F { 12.5 } else { 6.5 };
+            if w + cw > max_px {
+                end = i;
+                break;
+            }
+            w += cw;
+        }
+        s[..end].to_string()
     }
 
     fn apply(state: &mut HostState, v: &Value) {
@@ -404,21 +492,23 @@ mod host {
             .and_then(|s| s.as_str())
             .unwrap_or("动作")
             .to_string();
-        state.detail = v
-            .get("detail")
-            .and_then(|s| s.as_str())
-            .unwrap_or("")
-            .chars()
-            .take(44)
-            .collect();
+        state.detail = fit_width(
+            v.get("detail").and_then(|s| s.as_str()).unwrap_or(""),
+            BUBBLE_W - 28.0,
+        );
         state.click = v.get("click").and_then(|c| c.as_bool()).unwrap_or(false);
         state.ok = v.get("ok").and_then(|o| o.as_bool());
         if let (Some(x), Some(y)) = (
             v.get("x").and_then(|n| n.as_i64()).map(|n| n as i32),
             v.get("y").and_then(|n| n.as_i64()).map(|n| n as i32),
         ) {
-            state.glide_from = state.current;
+            state.glide_from = if state.anchored {
+                state.current
+            } else {
+                (x as f64, y as f64) // first appearance: jump, don't glide
+            };
             state.target = (x, y);
+            state.anchored = true;
             state.glide_start = std::time::Instant::now();
         }
         state.phase = match phase.as_str() {
@@ -533,10 +623,10 @@ mod host {
         }
         let mut font_main: *mut GpFont = std::ptr::null_mut();
         let mut font_dim: *mut GpFont = std::ptr::null_mut();
-        if GdipCreateFont(family, 17.0, FontStyleRegular.0, UnitPixel, &mut font_main) != Status(0) {
+        if GdipCreateFont(family, 15.0, FontStyleRegular.0, UnitPixel, &mut font_main) != Status(0) {
             return None;
         }
-        if GdipCreateFont(family, 14.0, FontStyleRegular.0, UnitPixel, &mut font_dim) != Status(0) {
+        if GdipCreateFont(family, 12.0, FontStyleRegular.0, UnitPixel, &mut font_dim) != Status(0) {
             return None;
         }
         let mut bubble_sf: *mut GpSolidFill = std::ptr::null_mut();
@@ -575,26 +665,38 @@ mod host {
         ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
     }
 
-    unsafe fn draw_frame(ui: &Ui, state: &mut HostState) {
+    unsafe fn draw_frame(ui: &Ui, state: &mut HostState, dot: (i32, i32)) {
         // clear to fully transparent
         let n = (WINDOW_W * WINDOW_H * 4) as usize;
         std::ptr::write_bytes(ui.bits, 0, n);
-        let dot = (70i32, 110i32);
-        let (dot_c, ring_c) = match (state.phase, state.ok) {
-            ("pre", _) => (argb(255, 245, 158, 11), argb(220, 245, 158, 11)),
-            ("act", _) => (argb(255, 239, 68, 68), argb(220, 239, 68, 68)),
-            ("post", Some(false)) => (argb(255, 239, 68, 68), argb(220, 239, 68, 68)),
-            _ => (argb(255, 34, 197, 94), argb(220, 34, 197, 94)),
+        // one colour per phase, same palette as the browser's in-page cursor:
+        // amber 即将 → blue 正在 → green 已, red is reserved for ✗
+        let dot_c = match (state.phase, state.ok) {
+            ("pre", _) => argb(255, 245, 158, 11),
+            ("act", _) => argb(255, 59, 130, 246),
+            ("post", Some(false)) => argb(255, 239, 68, 68),
+            _ => argb(255, 34, 197, 94),
         };
-        // bubble
-        let bw = 320.0f32;
-        let bh = 66.0f32;
-        let bx = (dot.0 + 20) as f32;
-        let by = (dot.1 - 40) as f32;
-        let _ = GdipFillRectangle(ui.graphics, ui.bubble_brush, bx, by, bw, bh);
+        // bubble: right of the dot when it fits, otherwise flipped to the left;
+        // above the dot unless that would leave the window
+        let bx = {
+            let right = dot.0 as f32 + 16.0;
+            let left = dot.0 as f32 - 16.0 - BUBBLE_W;
+            if right + BUBBLE_W <= (WINDOW_W - 4) as f32 {
+                right
+            } else {
+                left.clamp(4.0, (WINDOW_W - 4) as f32 - BUBBLE_W)
+            }
+        };
+        let mut by = dot.1 as f32 - 8.0 - BUBBLE_H;
+        if by < 4.0 {
+            by = dot.1 as f32 + 16.0;
+        }
+        let by = by.clamp(4.0, (WINDOW_H - 4) as f32 - BUBBLE_H);
+        let _ = GdipFillRectangle(ui.graphics, ui.bubble_brush, bx, by, BUBBLE_W, BUBBLE_H);
         let mut pen: *mut GpPen = std::ptr::null_mut();
         if GdipCreatePen1(0x66000000, 1.0, UnitPixel, &mut pen) == Status(0) {
-            let _ = GdipDrawRectangle(ui.graphics, pen, bx, by, bw, bh);
+            let _ = GdipDrawRectangle(ui.graphics, pen, bx, by, BUBBLE_W, BUBBLE_H);
             GdipDeletePen(pen);
         }
         // text: line1 = phase + verb, line2 = detail
@@ -609,28 +711,28 @@ mod host {
                 }
             }
         };
-        let line1 = format!("{phase_word} {}", state.verb);
+        let line1 = format!("{phase_word} {}\0", state.verb);
         let w1: Vec<u16> = line1.encode_utf16().collect();
         let w2: Vec<u16> = format!("{}\0", state.detail).encode_utf16().collect();
-        let r1 = RectF { X: bx + 14.0, Y: by + 9.0, Width: bw - 22.0, Height: 24.0 };
+        let r1 = RectF { X: bx + 14.0, Y: by + 6.0, Width: BUBBLE_W - 24.0, Height: 24.0 };
         let _ = GdipDrawString(ui.graphics, PCWSTR::from_raw(w1.as_ptr()), (w1.len() - 1) as i32, ui.font_main, &r1, std::ptr::null(), ui.text_brush);
-        let r2 = RectF { X: bx + 14.0, Y: by + 36.0, Width: bw - 22.0, Height: 22.0 };
+        let r2 = RectF { X: bx + 14.0, Y: by + 31.0, Width: BUBBLE_W - 24.0, Height: 20.0 };
         let _ = GdipDrawString(ui.graphics, PCWSTR::from_raw(w2.as_ptr()), (w2.len() - 1) as i32, ui.font_dim, &r2, std::ptr::null(), ui.dim_brush);
-        // dot + border
+        // dot + white border
         let mut fill: *mut GpSolidFill = std::ptr::null_mut();
         if GdipCreateSolidFill(dot_c, &mut fill) == Status(0) {
-            let _ = GdipFillEllipse(ui.graphics, fill as *mut GpBrush, (dot.0 - 11) as f32, (dot.1 - 11) as f32, 22.0, 22.0);
+            let _ = GdipFillEllipse(ui.graphics, fill as *mut GpBrush, (dot.0 as f32) - DOT_R, (dot.1 as f32) - DOT_R, DOT_R * 2.0, DOT_R * 2.0);
             GdipDeleteBrush(fill as *mut GpBrush);
         }
         let mut bpen: *mut GpPen = std::ptr::null_mut();
         if GdipCreatePen1(argb(255, 255, 255, 255), 2.0, UnitPixel, &mut bpen) == Status(0) {
-            let _ = GdipDrawEllipse(ui.graphics, bpen, (dot.0 - 11) as f32, (dot.1 - 11) as f32, 22.0, 22.0);
+            let _ = GdipDrawEllipse(ui.graphics, bpen, (dot.0 as f32) - DOT_R, (dot.1 as f32) - DOT_R, DOT_R * 2.0, DOT_R * 2.0);
             GdipDeletePen(bpen);
         }
         // success ripple
         if state.phase == "post" && state.ok != Some(false) && state.click {
             let t = state.ripple_t();
-            let r = 11.0 + 30.0 * t;
+            let r = DOT_R + 28.0 * t;
             let a = (220.0 * (1.0 - t)) as u8;
             let mut rpen: *mut GpPen = std::ptr::null_mut();
             if GdipCreatePen1(argb(a, 34, 197, 94), 2.5, UnitPixel, &mut rpen) == Status(0) {
@@ -638,34 +740,43 @@ mod host {
                 GdipDeletePen(rpen);
             }
         }
-        let _ = ring_c;
         // GDI+ renders lazily — without the flush, ULW reads the freshly-cleared
         // (all-zero) pixels and the overlay stays invisible forever
         GdipFlush(ui.graphics, FlushIntentionFlush);
     }
 
-    unsafe fn paint(hwnd: HWND, ui: &Ui, state: &mut HostState) {
+    unsafe fn paint(hwnd: HWND, ui: &Ui, state: &mut HostState, alpha: u8) {
         // glide: ease-out cubic over GLIDE_MS
         let t = ((state.glide_start.elapsed().as_millis() as f64) / (super::GLIDE_MS as f64)).clamp(0.0, 1.0);
         let e = 1.0 - (1.0 - t).powi(3);
         state.current.0 = state.glide_from.0 + (state.target.0 as f64 - state.glide_from.0) * e;
         state.current.1 = state.glide_from.1 + (state.target.1 as f64 - state.glide_from.1) * e;
-        draw_frame(ui, state);
-        GdiFlush();
-        // the window FOLLOWS the dot: ULW repositions via pptDst
+        // The dot must sit EXACTLY on the point the input will land on. Placing
+        // the window at target-DOT_HOME and clamping that into the virtual
+        // screen would drag the dot hundreds of px away from edge targets, so
+        // instead the window is clamped first and the dot is drawn wherever the
+        // target then falls inside the bitmap — the dot is pinned, the window
+        // follows.
         let vs_x = GetSystemMetrics(SM_XVIRTUALSCREEN);
         let vs_y = GetSystemMetrics(SM_YVIRTUALSCREEN);
         let vs_w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
         let vs_h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-        let dst_x = (state.current.0 as i32 - 80).clamp(vs_x, vs_x + vs_w - WINDOW_W);
-        let dst_y = (state.current.1 as i32 - 110).clamp(vs_y, vs_y + vs_h - WINDOW_H);
+        let dst_x = (state.current.0 as i32 - DOT_HOME.0).clamp(vs_x, vs_x + vs_w - WINDOW_W);
+        let dst_y = (state.current.1 as i32 - DOT_HOME.1).clamp(vs_y, vs_y + vs_h - WINDOW_H);
+        let dot = (
+            state.current.0 as i32 - dst_x,
+            state.current.1 as i32 - dst_y,
+        );
+        draw_frame(ui, state, dot);
+        GdiFlush();
         let dst = POINT { x: dst_x, y: dst_y };
         let size = SIZE { cx: WINDOW_W, cy: WINDOW_H };
         let src = POINT { x: 0, y: 0 };
         let blend = BLENDFUNCTION {
             BlendOp: 0,     // AC_SRC_OVER
             BlendFlags: 0,
-            SourceConstantAlpha: 255,
+            // whole-window alpha: the idle fade-out ramps this to 0
+            SourceConstantAlpha: alpha,
             AlphaFormat: 1, // AC_SRC_ALPHA
         };
         let screen_dc = GetDC(windows::Win32::Foundation::HWND::default());
@@ -688,6 +799,23 @@ mod host {
             eprintln!("preview host already running in this session");
             return 1;
         }
+        let pid = std::process::id();
+        // take over from an orphaned host: a second `preview serve` would
+        // otherwise leave the old one topmost on screen with a frozen frame it
+        // can never repaint (nothing sends to its port any more)
+        if let Some((old_port, old_pid)) = read_port() {
+            if old_pid != pid && pid_alive(old_pid) {
+                if let Ok(s) = UdpSocket::bind("127.0.0.1:0") {
+                    let _ = s.send_to(b"{\"phase\":\"shutdown\"}", format!("127.0.0.1:{old_port}"));
+                    for _ in 0..6 {
+                        std::thread::sleep(Duration::from_millis(100));
+                        if !pid_alive(old_pid) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         let sock = (8767..=8790)
             .find_map(|p| UdpSocket::bind(("127.0.0.1", p)).ok())
             .or_else(|| UdpSocket::bind(("127.0.0.1", 0)).ok());
@@ -697,7 +825,6 @@ mod host {
         };
         let _ = sock.set_read_timeout(Some(Duration::from_millis(400)));
         let port = sock.local_addr().map(|a| a.port()).unwrap_or(0);
-        let pid = std::process::id();
         let sf = super::state_file();
         let _ = std::fs::write(&sf, json!({ "port": port, "pid": pid }).to_string());
         eprintln!("[cua-preview] listening on 127.0.0.1:{port} (pid {pid})");
@@ -711,9 +838,11 @@ mod host {
                             continue;
                         };
                         if v.get("phase").and_then(|p| p.as_str()) == Some("shutdown") {
+                            // forward and let the pump quit: exiting here would
+                            // race (and lose) the pump's window/GDI+ teardown
+                            // and state-file cleanup
                             let _ = tx.send(v);
-                            std::thread::sleep(Duration::from_millis(200));
-                            std::process::exit(0);
+                            return;
                         }
                         if tx.send(v).is_err() {
                             return;
@@ -761,10 +890,19 @@ mod host {
                 click: false,
                 ok: Some(true),
                 ripple_start: None,
+                anchored: false,
             };
+            // nothing is painted until the first packet arrives: a layered
+            // window that has never seen ULW is not composited at all, so a
+            // freshly-started host leaves the screen clean instead of showing
+            // a stray "已" frame at the virtual-screen origin
+            let mut has_packet = false;
+            let mut last_packet = std::time::Instant::now();
+            let mut last_alpha = 255u8;
             let mut idle = std::time::Instant::now();
             let mut quit = false;
             loop {
+                let mut got = false;
                 while let Ok(v) = rx.try_recv() {
                     idle = std::time::Instant::now();
                     if v.get("phase").and_then(|p| p.as_str()) == Some("shutdown") {
@@ -772,11 +910,44 @@ mod host {
                         break;
                     }
                     apply(&mut state, &v);
+                    got = true;
                 }
                 if quit {
                     break;
                 }
-                paint(ui.hwnd, &ui, &mut state);
+                if got {
+                    last_packet = std::time::Instant::now();
+                    has_packet = true;
+                }
+                // repaint only while something actually moves: a packet just
+                // landed, the dot is gliding, a ripple is expanding, or the
+                // idle fade is running. A settled overlay costs no GDI+ work.
+                // Packets without coordinates (bare key/type) never paint
+                // before the dot has a real anchor — a corner (0,0) frame
+                // would be a lie about where the input goes.
+                if has_packet && state.anchored {
+                    let glide_active = state.glide_start.elapsed().as_millis() < GLIDE_MS;
+                    let ripple_active = state
+                        .ripple_start
+                        .map_or(false, |t| t.elapsed().as_millis() < 600);
+                    let since = last_packet.elapsed().as_millis();
+                    let fade_t = if since > FADE_HOLD_MS as u128 + FADE_MS as u128 {
+                        1.0
+                    } else if since > FADE_HOLD_MS as u128 {
+                        (since - FADE_HOLD_MS as u128) as f64 / FADE_MS
+                    } else {
+                        0.0
+                    };
+                    let alpha = (255.0 * (1.0 - fade_t)) as u8;
+                    if got
+                        || glide_active
+                        || ripple_active
+                        || (fade_t > 0.0 && alpha != last_alpha)
+                    {
+                        paint(ui.hwnd, &ui, &mut state, alpha);
+                        last_alpha = alpha;
+                    }
+                }
                 // non-blocking message pump
                 let mut msg = MSG::default();
                 while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {

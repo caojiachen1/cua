@@ -877,6 +877,8 @@ enum RecOp {
         out: Option<String>,
         #[arg(long, default_value_t = 900, help = "hard stop so a forgotten recording cannot fill the disk")]
         max_seconds: u64,
+        #[arg(long, help = "JPEG quality 1-100 (default 80)")]
+        quality: Option<u8>,
     },
     /// Stop, encode, and report the artifact
     Stop {
@@ -899,6 +901,8 @@ enum RecOp {
         window: Option<String>,
         #[arg(long, default_value_t = 900)]
         max_seconds: u64,
+        #[arg(long, default_value_t = 80)]
+        quality: u8,
     },
 }
 
@@ -1460,11 +1464,15 @@ fn dispatch(cmd: Cmd) -> i32 {
                 })
             }
             Cmd::Rec { op } => match op {
-                RecOp::Start { window, fps, out, max_seconds } => rec::cmd_start(window, fps, out, max_seconds),
+                RecOp::Start { window, fps, out, max_seconds, quality } => {
+                    rec::cmd_start(window, fps, out, max_seconds, quality)
+                }
                 RecOp::Stop { out, keep_frames } => rec::cmd_stop(out, keep_frames),
                 RecOp::Cancel => rec::cmd_cancel(),
                 RecOp::Status => rec::cmd_status(),
-                RecOp::Capture { dir, fps, window, max_seconds } => rec::cmd_capture(&dir, fps, window, max_seconds),
+                RecOp::Capture { dir, fps, window, max_seconds, quality } => {
+                    rec::cmd_capture(&dir, fps, window, max_seconds, quality)
+                }
             },
         }
     })();
@@ -1476,7 +1484,9 @@ fn dispatch(cmd: Cmd) -> i32 {
         }
     };
     if let Some(spec) = &pv {
-        pointer::emit(pointer::post_from(spec, code == 0));
+        // synchronous: dispatch is about to return and main will exit — an
+        // async send would be killed before it hit the wire
+        pointer::emit_sync(pointer::post_from(spec, code == 0));
     }
     code
 }
@@ -3993,7 +4003,7 @@ fn cmd_open(name: &str, background: bool, record: Option<String>) -> Result<i32>
             use windows::Win32::UI::WindowsAndMessaging::{SW_SHOWNORMAL, SW_SHOWNOACTIVATE};
             let prev = crate::win::foreground_hwnd();
             let before = if background { crate::win::top_level_hwnds() } else { std::collections::HashSet::new() };
-            let mut verb_w: Vec<u16> = "open ".encode_utf16().collect();
+            let mut verb_w: Vec<u16> = "open\0".encode_utf16().collect();
             let mut file_w: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
             let mut sei = SHELLEXECUTEINFOW {
                 cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,

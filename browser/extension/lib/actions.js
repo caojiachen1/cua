@@ -414,25 +414,30 @@ export async function mouse(tabId, type, x, y, opts = {}) {
   // reaches the wire. No open pass = nothing to confirm (read-only callers and
   // un-armed tabs never pay), same semantics as lib/tools.js's gate.check().
   await assertInputGate(tabId);
-  // cursor preview (act): every CDP dispatch moves the in-page preview dot —
-  // mouseMoved drags are coalesced inside cursorEmit; mousePressed switches the
-  // bubble to 正在点击, mouseReleased closes it with 已点击 + ripple
-  cursorEmit(tabId, {
-    phase: type === 'mouseReleased' ? 'post' : 'act',
-    ok: true,
-    op: type === 'mouseMoved' ? 'hover' : 'click',
-    x: Math.round(x),
-    y: Math.round(y),
-  });
-  await cdp.send(tabId, `Input.dispatchMouseEvent`, {
-    type,
-    x,
-    y,
-    button: opts.button || 'left',
-    buttons: opts.buttons ?? (type === 'mouseReleased' ? 1 : type === 'mousePressed' ? 1 : 0),
-    clickCount: opts.clickCount || 1,
-    modifiers: opts.modifiers || 0,
-  });
+  // cursor preview: act ("正在 …") while the dispatch is on the wire —
+  // mouseMoved drags are coalesced inside cursorEmit. The post ("已 …" +
+  // ripple, or ✗ on failure) is only emitted AFTER the dispatch settles:
+  // emitting it before the await reported 已点击 even when CDP refused.
+  const op = type === 'mouseMoved' ? 'hover' : 'click';
+  const at = { x: Math.round(x), y: Math.round(y) };
+  cursorEmit(tabId, { phase: 'act', ok: true, op, ...at });
+  try {
+    await cdp.send(tabId, `Input.dispatchMouseEvent`, {
+      type,
+      x,
+      y,
+      button: opts.button || 'left',
+      buttons: opts.buttons ?? (type === 'mouseReleased' ? 1 : type === 'mousePressed' ? 1 : 0),
+      clickCount: opts.clickCount || 1,
+      modifiers: opts.modifiers || 0,
+    });
+  } catch (e) {
+    cursorEmit(tabId, { phase: 'post', ok: false, op, ...at });
+    throw e;
+  }
+  if (type === 'mouseReleased') {
+    cursorEmit(tabId, { phase: 'post', ok: true, op, ...at });
+  }
 }
 
 export const KEY_MAP = {
@@ -450,15 +455,20 @@ export async function key(tabId, type, keyName, { modifiers = 0, code, text } = 
   cursorEmit(tabId, { phase: 'act', ok: true, op: 'press_key', key: keyName, x: null, y: null });
   const k = keyName.toLowerCase();
   const needsText = !/^(control|shift|alt|meta|enter|tab|escape|backspace|delete|arrowup|arrowdown|arrowleft|arrowright|home|end|pageup|pagedown)/.test(k);
-  await cdp.send(tabId, 'Input.dispatchKeyEvent', {
-    type,
-    modifiers,
-    key: keyName,
-    code: code || (k.length === 1 ? 'Key' + keyName.toUpperCase() : keyName),
-    windowsVirtualKeyCode: keyCodeOf(k),
-    ...(type === 'keyDown' && needsText && !text ? { text: keyName } : {}),
-    ...(text ? { text } : {}),
-  });
+  try {
+    await cdp.send(tabId, 'Input.dispatchKeyEvent', {
+      type,
+      modifiers,
+      key: keyName,
+      code: code || (k.length === 1 ? 'Key' + keyName.toUpperCase() : keyName),
+      windowsVirtualKeyCode: keyCodeOf(k),
+      ...(type === 'keyDown' && needsText && !text ? { text: keyName } : {}),
+      ...(text ? { text } : {}),
+    });
+  } catch (e) {
+    cursorEmit(tabId, { phase: 'post', ok: false, op: 'press_key', key: keyName, x: null, y: null });
+    throw e;
+  }
 }
 
 export function keyCodeOf(k) {

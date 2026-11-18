@@ -39,7 +39,7 @@
   background:#3b82f6;border:2px solid #fff;box-shadow:0 1px 6px rgba(0,0,0,.35)}
 #cua-agent-cursor.cua-on .cua-cursor-dot{animation:cua-cursor-pulse 1.2s ease-in-out infinite}
 #cua-agent-cursor.cua-pre .cua-cursor-dot{background:#f59e0b;border-color:#fff}
-#cua-agent-cursor.cua-act .cua-cursor-dot{background:#ef4444;border-color:#fff}
+#cua-agent-cursor.cua-act .cua-cursor-dot{background:#3b82f6;border-color:#fff}
 #cua-agent-cursor.cua-post .cua-cursor-dot{background:#22c55e;border-color:#fff}
 #cua-agent-cursor.cua-fail .cua-cursor-dot{background:#ef4444;border-color:#fff}
 .cua-cursor-ring{position:absolute;left:-9px;top:-9px;width:18px;height:18px;border-radius:50%;

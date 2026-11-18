@@ -1,14 +1,24 @@
 // capture.rs — screenshots: PrintWindow(PW_RENDERFULLCONTENT) for background/occluded windows (Qoder WGC-occluded analog + ZCode background observation)
 use anyhow::{bail, Result};
 use image::RgbaImage;
+use std::os::windows::ffi::OsStrExt as _;
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
-    GetWindowDC, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
-    SRCCOPY,
+    GetObjectW, GetWindowDC, ReleaseDC, SelectObject, BITMAP, BITMAPINFO, BITMAPINFOHEADER,
+    BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, SRCCOPY,
+};
+use windows::Win32::Graphics::GdiPlus::{
+    EncoderParameter, EncoderParameters, EncoderQuality, GdiplusShutdown, GdiplusStartup,
+    GdiplusStartupInput, GdipCreateBitmapFromScan0, GdipDisposeImage, GdipGetImageEncoders,
+    GdipGetImageEncodersSize, GdipSaveImageToFile, GpBitmap, GpImage, ImageCodecInfo, Status,
 };
 use windows::Win32::Storage::Xps::{PW_CLIENTONLY, PrintWindow, PRINT_WINDOW_FLAGS};
-use windows::Win32::UI::WindowsAndMessaging::PW_RENDERFULLCONTENT;
+use windows::Win32::UI::WindowsAndMessaging::{
+    CURSORINFO, CURSOR_SHOWING, DI_NORMAL, DrawIconEx, GetCursorInfo, GetIconInfo, ICONINFO,
+    PW_RENDERFULLCONTENT,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
     SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
@@ -184,4 +194,289 @@ pub fn save_jpeg(shot: &Shot, path: &std::path::Path, quality: u8) -> Result<()>
     let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
     image::codecs::jpeg::JpegEncoder::new_with_quality(&mut f, quality).encode_image(&rgb)?;
     Ok(())
+}
+
+// ---------------- recorder fast path (`cua rec capture`) ----------------
+//
+// The recorder's hot loop cannot use shot_screen/save_jpeg: shot_screen
+// allocates a 13 MB buffer and rebuilds GDI objects per frame, and the image
+// crate's pure-Rust JPEG encoder needs 200-400 ms per 2K frame — together
+// that capped a full-screen recording at ~1.6 fps. This path keeps the GDI
+// objects and buffer alive across frames, feeds the BGRA DIB scan straight
+// into GDI+'s (C-speed) JPEG encoder with zero conversion passes, and bakes
+// the mouse cursor into the frame — BitBlt alone does NOT include the
+// pointer, so a recording without it could not be used to judge the pointer
+// preview against the real cursor.
+
+/// BGRA, top-down, 32bpp — the layout of GetDIBits and of GDI+'
+/// PixelFormat32bppARGB (little-endian ARGB dword), so the raw DIB scan can
+/// be handed to the JPEG encoder unchanged.
+pub struct ScreenGrabber {
+    hdc: HDC,
+    mem: HDC,
+    bmp: HBITMAP,
+    old: HGDIOBJ,
+    w: i32,
+    h: i32,
+    vx: i32,
+    vy: i32,
+    buf: Vec<u8>,
+}
+
+impl ScreenGrabber {
+    pub fn new(all_monitors: bool) -> Result<Self> {
+        unsafe {
+            let (vx, vy, w, h) = if all_monitors {
+                (
+                    GetSystemMetrics(SM_XVIRTUALSCREEN),
+                    GetSystemMetrics(SM_YVIRTUALSCREEN),
+                    GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                    GetSystemMetrics(SM_CYVIRTUALSCREEN),
+                )
+            } else {
+                (0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN))
+            };
+            if w <= 0 || h <= 0 {
+                bail!("bad screen metrics");
+            }
+            let hdc = GetDC(HWND::default());
+            if hdc.is_invalid() {
+                bail!("GetDC screen failed");
+            }
+            let mem = CreateCompatibleDC(hdc);
+            let bmp = CreateCompatibleBitmap(hdc, w, h);
+            if mem.is_invalid() || bmp.is_invalid() {
+                ReleaseDC(HWND::default(), hdc);
+                bail!("screen grabber GDI setup failed");
+            }
+            let obj: HGDIOBJ = bmp.into();
+            let old = SelectObject(mem, obj);
+            Ok(Self {
+                hdc,
+                mem,
+                bmp,
+                old,
+                w,
+                h,
+                vx,
+                vy,
+                buf: vec![0u8; (w as usize * h as usize * 4).max(4)],
+            })
+        }
+    }
+
+    /// BitBlt the screen into the reused buffer (BGRA, top-down) and return
+    /// the scan. The borrow ends at the next grab.
+    pub fn grab(&mut self, with_cursor: bool) -> Result<&[u8]> {
+        unsafe {
+            BitBlt(self.mem, 0, 0, self.w, self.h, self.hdc, self.vx, self.vy, SRCCOPY)
+                .map_err(|e| anyhow::anyhow!("BitBlt screen: {e}"))?;
+            if with_cursor {
+                self.draw_cursor();
+            }
+            let mut bi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: self.w,
+                    biHeight: -self.h,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            if GetDIBits(
+                self.mem,
+                self.bmp,
+                0,
+                self.h as u32,
+                Some(self.buf.as_mut_ptr() as *mut _),
+                &mut bi,
+                DIB_RGB_COLORS,
+            ) == 0
+            {
+                bail!("GetDIBits failed");
+            }
+            Ok(&self.buf)
+        }
+    }
+
+    /// Bake the current mouse cursor into the frame at its true position —
+    /// without it the recording cannot show where real input lands.
+    /// Frame dimensions (physical px), fixed at construction.
+    pub fn size(&self) -> (u32, u32) {
+        (self.w as u32, self.h as u32)
+    }
+
+    unsafe fn draw_cursor(&mut self) {
+        let mut ci = CURSORINFO { cbSize: std::mem::size_of::<CURSORINFO>() as u32, ..Default::default() };
+        if GetCursorInfo(&mut ci).is_err() || (ci.flags.0 & CURSOR_SHOWING.0) == 0 || ci.hCursor.is_invalid() {
+            return;
+        }
+        let mut ii = ICONINFO::default();
+        if GetIconInfo(ci.hCursor, &mut ii).is_err() {
+            return;
+        }
+        let (mut cw, mut ch) = (32i32, 32i32);
+        if !ii.hbmColor.is_invalid() {
+            // colour cursor: the colour bitmap IS the cursor at natural size
+            let mut bm = BITMAP::default();
+            if GetObjectW(
+                ii.hbmColor,
+                std::mem::size_of::<BITMAP>() as i32,
+                Some(&mut bm as *mut _ as *mut core::ffi::c_void),
+            ) != 0
+                && bm.bmWidth > 0
+                && bm.bmHeight > 0
+            {
+                cw = bm.bmWidth;
+                ch = bm.bmHeight;
+            }
+            let _ = DeleteObject(HGDIOBJ(ii.hbmColor.0));
+        }
+        if !ii.hbmMask.is_invalid() {
+            // monochrome cursor: the mask stacks the AND plane on the XOR
+            // plane, so its height is twice the cursor's — halve it, but only
+            // when there is no colour bitmap (halving a colour cursor's mask
+            // squashes the arrow flat)
+            let mut bm = BITMAP::default();
+            if GetObjectW(
+                ii.hbmMask,
+                std::mem::size_of::<BITMAP>() as i32,
+                Some(&mut bm as *mut _ as *mut core::ffi::c_void),
+            ) != 0
+                && bm.bmWidth > 0
+                && bm.bmHeight >= 2
+            {
+                cw = bm.bmWidth;
+                if ii.hbmColor.is_invalid() {
+                    ch = bm.bmHeight / 2;
+                }
+            }
+            let _ = DeleteObject(HGDIOBJ(ii.hbmMask.0));
+        }
+        let _ = DrawIconEx(
+            self.mem,
+            ci.ptScreenPos.x - self.vx - ii.xHotspot as i32,
+            ci.ptScreenPos.y - self.vy - ii.yHotspot as i32,
+            ci.hCursor,
+            cw,
+            ch,
+            0,
+            None,
+            DI_NORMAL,
+        );
+    }
+}
+
+impl Drop for ScreenGrabber {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = SelectObject(self.mem, self.old);
+            let _ = DeleteObject(HGDIOBJ(self.bmp.0));
+            let _ = DeleteDC(self.mem);
+            let _ = ReleaseDC(HWND::default(), self.hdc);
+        }
+    }
+}
+
+/// GDI+ JPEG encoder. `new` starts GDI+ once; the C encoder scales far better
+/// than the image crate's pure-Rust one and takes the BGRA scan as-is, so the
+/// recorder needs no RGBA conversion pass at all.
+pub struct GdiJpeg {
+    token: usize,
+    jpeg_clsid: windows::core::GUID,
+}
+
+/// JPEG codec format identifier {B96B3CAE-0728-11D3-9D7B-0000F81EF32E}
+/// (the windows crate does not export it as a constant).
+const GUID_FORMAT_JPEG: windows::core::GUID =
+    windows::core::GUID::from_u128(0xB96B3CAE_0728_11D3_9D7B_0000F81EF32E);
+
+impl GdiJpeg {
+    pub fn new() -> Result<Self> {
+        unsafe {
+            let si = GdiplusStartupInput {
+                GdiplusVersion: 1,
+                DebugEventCallback: 0,
+                SuppressBackgroundThread: windows::Win32::Foundation::BOOL(0),
+                SuppressExternalCodecs: windows::Win32::Foundation::BOOL(0),
+            };
+            let mut token = 0usize;
+            if GdiplusStartup(&mut token, &si, std::ptr::null_mut()) != Status(0) {
+                bail!("GdiplusStartup failed");
+            }
+            let (mut n, mut size) = (0u32, 0u32);
+            if GdipGetImageEncodersSize(&mut n, &mut size) != Status(0) || size == 0 {
+                bail!("GDI+ encoder enumeration failed");
+            }
+            let mut buf = vec![0u8; size as usize];
+            if GdipGetImageEncoders(n, size, buf.as_mut_ptr() as *mut ImageCodecInfo) != Status(0) {
+                bail!("GDI+ encoder list failed");
+            }
+            let codecs = buf.as_ptr() as *const ImageCodecInfo;
+            let mut jpeg_clsid = None;
+            for k in 0..n {
+                let c = &*codecs.offset(k as isize);
+                if c.FormatID == GUID_FORMAT_JPEG {
+                    jpeg_clsid = Some(c.Clsid);
+                    break;
+                }
+            }
+            let Some(jpeg_clsid) = jpeg_clsid else {
+                bail!("no GDI+ JPEG codec");
+            };
+            Ok(Self { token, jpeg_clsid })
+        }
+    }
+
+    /// Encode a BGRA scan as JPEG (alpha is ignored) and write it to `path`.
+    pub fn save(&self, bgra: &[u8], w: u32, h: u32, quality: u8, path: &std::path::Path) -> Result<()> {
+        unsafe {
+            let mut bmp: *mut GpBitmap = std::ptr::null_mut();
+            if GdipCreateBitmapFromScan0(
+                w as i32,
+                h as i32,
+                (w * 4) as i32,
+                0x0026200A, // PixelFormat32bppARGB
+                Some(bgra.as_ptr()),
+                &mut bmp,
+            ) != Status(0)
+            {
+                bail!("GdipCreateBitmapFromScan0 failed");
+            }
+            let q: u32 = quality as u32;
+            let mut params = EncoderParameters {
+                Count: 1,
+                Parameter: [EncoderParameter {
+                    Guid: EncoderQuality,
+                    Type: 4, // ValueTagTypeULONG
+                    NumberOfValues: 1,
+                    Value: &q as *const u32 as *mut core::ffi::c_void,
+                }],
+            };
+            let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+            wide.push(0);
+            let status = GdipSaveImageToFile(
+                bmp as *mut GpImage,
+                PCWSTR::from_raw(wide.as_ptr()),
+                &self.jpeg_clsid,
+                &params,
+            );
+            GdipDisposeImage(bmp as *mut GpImage);
+            if status != Status(0) {
+                bail!("GDI+ JPEG encode failed: {status:?}");
+            }
+            Ok(())
+        }
+    }
+}
+
+impl Drop for GdiJpeg {
+    fn drop(&mut self) {
+        unsafe {
+            GdiplusShutdown(self.token);
+        }
+    }
 }

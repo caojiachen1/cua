@@ -342,11 +342,15 @@ ladder without touching any app.
 Every mutating desktop command (`click`, `set-value`, `type`, `key`, `drag`, window moves, …)
 drives a click-through topmost overlay that shows a fake cursor where the action will land,
 what it is doing while it runs, and what it did afterwards — a11y actions point at the target
-window even though the real cursor never moves, and coordinate actions are exact. Inside a
-Child Session the preview runs in that session (the read-only viewer shows it). The overlay is
-a resident host (`cua preview serve`, auto-spawned on first use, `cua preview stop` to exit,
-idle-exits after 30 minutes); disable with `pointer_preview: false` in config.json or
-`CUA_POINTER_PREVIEW=0`.
+window even though the real cursor never moves, and coordinate actions are exact (the dot is
+pinned to the true target even at screen edges, where the bubble flips sides). The dot is
+colour-coded by phase — amber 即将, blue 正在, green 已 (+ ripple), red ✗ — matching the
+browser's in-page cursor. It holds ~8 s after the last action for the user to read the
+outcome, then fades out: nothing stays parked on screen. Sandbox commands show no preview
+(the hidden desktop is invisible). Inside a Child Session the preview runs in that session
+(the read-only viewer shows it). The overlay is a resident host (`cua preview serve`,
+auto-spawned on first use, `cua preview stop` to exit, idle-exits after 30 minutes); disable
+with `pointer_preview: false` in config.json or `CUA_POINTER_PREVIEW=0`.
 
 ## Known limits
 

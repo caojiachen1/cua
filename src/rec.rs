@@ -4,6 +4,8 @@
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::io::Write as _;
+use std::os::windows::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 
 use crate::capture;
@@ -130,7 +132,7 @@ fn session_dir_name(name: &str) -> String {
     format!("{}-{}-{}-{}", util::sanitize(name), stamp, std::process::id(), seq)
 }
 
-pub fn cmd_start(window: Option<String>, fps: u32, out: Option<String>, max_seconds: u64) -> Result<i32> {
+pub fn cmd_start(window: Option<String>, fps: u32, out: Option<String>, max_seconds: u64, quality: Option<u8>) -> Result<i32> {
     if let Some(st) = load() {
         if worker_alive(&st) {
             bail!("a recording is already running: '{}' ({})", st.name, st.dir.display());
@@ -138,7 +140,8 @@ pub fn cmd_start(window: Option<String>, fps: u32, out: Option<String>, max_seco
         // A crashed/exited worker must not block every future recording.
         let _ = std::fs::remove_file(state_path());
     }
-    let fps = fps.clamp(1, 15);
+    let fps = fps.clamp(1, 30);
+    let quality = quality.unwrap_or(80).clamp(1, 100);
     let name = out.clone().unwrap_or_else(|| format!("rec-{}", util::now_iso().replace([':', '-'], "")));
     let dir = util::ensure_data_dir()
         .join("recordings")
@@ -150,6 +153,7 @@ pub fn cmd_start(window: Option<String>, fps: u32, out: Option<String>, max_seco
         "--dir".into(), format!("\"{}\"", dir.display()),
         "--fps".into(), fps.to_string(),
         "--max-seconds".into(), max_seconds.to_string(),
+        "--quality".into(), quality.to_string(),
     ];
     if let Some(w) = &window {
         args.push("--window".into());
@@ -157,7 +161,7 @@ pub fn cmd_start(window: Option<String>, fps: u32, out: Option<String>, max_seco
     }
     let pid = spawn_detached(&exe, &args)?;
     let created = crate::win::process_creation_time(pid);
-    let st = RecState { name, dir, fps, quality: 62, window, pid, created, started: util::now_iso() };
+    let st = RecState { name, dir, fps, quality, window, pid, created, started: util::now_iso() };
     let _ = std::fs::write(state_path(), serde_json::to_vec(&st)?);
     let r = util::Receipt::new("rec.start").ok(
         serde_json::json!({ "name": st.name, "fps": st.fps, "target": st.window.clone().unwrap_or_else(|| "screen".into()) }),
@@ -168,43 +172,133 @@ pub fn cmd_start(window: Option<String>, fps: u32, out: Option<String>, max_seco
 }
 
 /// Internal: the detached capture loop. Runs until STOP appears or max-seconds elapses.
-pub fn cmd_capture(dir: &str, fps: u32, window: Option<String>, max_seconds: u64) -> Result<i32> {
+///
+/// Screen captures take the fast path (reused GDI objects, cursor baked in,
+/// GDI+ encode on a worker thread) and record a wall-clock offset per tick so
+/// `rec stop` can build a variable-frame-rate timeline: a capture slower than
+/// the requested fps must still play back at the pace the user actually saw,
+/// which is the whole point of a recording. Ticks whose frame is
+/// byte-identical to the previous one are written as "repeats" (no new JPEG);
+/// the timeline extends that frame's duration, so idle stretches cost no disk
+/// yet stay time-accurate.
+pub fn cmd_capture(dir: &str, fps: u32, window: Option<String>, max_seconds: u64, quality: u8) -> Result<i32> {
     let dir = PathBuf::from(dir);
     let frames = dir.join("frames");
     std::fs::create_dir_all(&frames)?;
     let stop = dir.join("STOP");
     let started = std::time::Instant::now();
-    let mut i = 0u64;
-    let mut n = 0u64;
     let tick = (1000 / fps.max(1)) as u64;
+
+    // only the full-screen path gets the reusable-GDI pipeline; window targets
+    // keep the per-frame PrintWindow capture (each target may come and go)
+    let mut grabber = if window.is_none() { Some(capture::ScreenGrabber::new(true)?) } else { None };
+    let (w, h) = grabber.as_ref().map(|g| g.size()).unwrap_or((0, 0));
+
+    // two encoder workers round-robined by frame index: one GDI+ encode takes
+    // ~40-60 ms at 2.5K, so a single worker caps the sustained rate at ~15 fps
+    // no matter how fast the capture thread grabs
+    let mut encoders = Vec::new();
+    let mut enc_txs = Vec::new();
+    for k in 0..2usize {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(std::sync::Arc<Vec<u8>>, u64)>(8);
+        enc_txs.push(tx);
+        let frames = frames.clone();
+        let jpeg = std::sync::Arc::new(capture::GdiJpeg::new()?);
+        encoders.push(std::thread::spawn(move || {
+            let mut ok = 0u64;
+            for (buf, idx) in rx {
+                let p = frames.join(format!("frame_{:06}.jpg", idx));
+                if jpeg.save(&buf, w, h, quality, &p).is_ok() {
+                    ok += 1;
+                }
+            }
+            ok
+        }));
+    }
+
+    let mut prev: Option<std::sync::Arc<Vec<u8>>> = None;
+    let mut i = 0u64; // encoded frames
+    let mut n = 0u64; // ticks
+    let mut tsv = std::io::BufWriter::new(std::fs::File::create(dir.join("timestamps.tsv"))?);
+    let mut flushed = 0u64;
     loop {
         if stop.exists() || started.elapsed().as_secs() >= max_seconds {
             break;
         }
-        let shot = match &window {
-            Some(sel) => match crate::resolve_target(sel) {
-                Ok(t) => capture::shot_window(t.hwnd, false),
-                Err(e) => Err(e.into()),
-            },
-            None => capture::shot_screen(true),
-        };
-        if let Ok(s) = shot {
-            if s.rendered {
-                let p = frames.join(format!("frame_{:06}.jpg", i));
-                if capture::save_jpeg(&s, &p, 62).is_ok() {
-                    i += 1;
+        n += 1;
+        let ms = started.elapsed().as_millis() as u64;
+        if let Some(g) = grabber.as_mut() {
+            match g.grab(true) {
+                Ok(scan) => {
+                    if prev.as_ref().map_or(false, |p| p.as_slice() == scan) {
+                        // identical screen: extend the previous frame instead
+                        // of writing a duplicate JPEG
+                        let _ = writeln!(tsv, "\t{ms}");
+                    } else {
+                        let arc = std::sync::Arc::new(scan.to_vec());
+                        // round-robin the two encode workers; if a worker died
+                        // the frame cannot be written — record a repeat so the
+                        // timeline stays honest
+                        let sent = enc_txs[(i % 2) as usize].send((arc.clone(), i)).is_ok();
+                        if sent {
+                            let _ = writeln!(tsv, "{}\t{ms}", i);
+                            i += 1;
+                        } else {
+                            let _ = writeln!(tsv, "\t{ms}");
+                        }
+                        prev = Some(arc);
+                    }
+                }
+                Err(_) => {
+                    let _ = writeln!(tsv, "\t{ms}");
                 }
             }
+        } else {
+            let shot = match &window {
+                Some(sel) => match crate::resolve_target(sel) {
+                    Ok(t) => capture::shot_window(t.hwnd, false),
+                    Err(e) => Err(e.into()),
+                },
+                None => capture::shot_screen(true),
+            };
+            if let Ok(s) = shot {
+                if s.rendered {
+                    let p = frames.join(format!("frame_{:06}.jpg", i));
+                    if capture::save_jpeg(&s, &p, quality).is_ok() {
+                        let _ = writeln!(tsv, "{}\t{ms}", i);
+                        i += 1;
+                    } else {
+                        let _ = writeln!(tsv, "\t{ms}");
+                    }
+                } else {
+                    let _ = writeln!(tsv, "\t{ms}");
+                }
+            } else {
+                let _ = writeln!(tsv, "\t{ms}");
+            }
+        }
+        if n - flushed >= 16 {
+            // a killed worker still leaves usable timeline data
+            let _ = tsv.flush();
+            flushed = n;
         }
         // Pace on ticks attempted, not frames written, so a failed capture cannot spin the CPU.
-        n += 1;
         let ahead = n * tick;
         let elapsed = started.elapsed().as_millis() as u64;
         if ahead > elapsed {
             std::thread::sleep(std::time::Duration::from_millis(ahead - elapsed));
         }
     }
-    let _ = std::fs::write(dir.join("captured.json"), format!("{{\"frames\":{i}}}"));
+    let _ = tsv.flush();
+    drop(enc_txs);
+    let encoded: u64 = encoders.into_iter().map(|h| h.join().unwrap_or(0)).sum();
+    let _ = std::fs::write(
+        dir.join("captured.json"),
+        format!(
+            "{{\"frames\":{encoded},\"ticks\":{n},\"duration_ms\":{},\"width\":{w},\"height\":{h}}}",
+            started.elapsed().as_millis()
+        ),
+    );
     let _ = std::fs::remove_file(&stop);
     Ok(0)
 }
@@ -260,28 +354,49 @@ pub fn cmd_stop(out: Option<String>, keep_frames: bool) -> Result<i32> {
         r.print();
         return Ok(1);
     }
+    let timeline = read_timeline(&st.dir, st.fps);
     let mp4 = match &out {
         Some(o) => PathBuf::from(o),
         None => st.dir.join(format!("{}.mp4", st.name)),
     };
-    let (encoded, detail) = match find_ffmpeg() {
-        Some(ff) => match encode(&ff, &frames_dir(&st), &mp4, st.fps) {
-            Ok(size) => (
-                "mp4".to_string(),
-                format!("{} frames -> {} ({} KB, {} fps)", frames.len(), mp4.display(), size / 1024, st.fps),
+    // built-in H.264 first: full resolution, real wall-clock timeline, no
+    // ffmpeg needed. ffmpeg and the HTML player stay as fallbacks.
+    let (encoded, detail) = match unsafe { encode_mf(&mp4, &st.dir, &timeline) } {
+        Ok(()) => (
+            "mp4".to_string(),
+            format!(
+                "{} frames -> {} ({} KB, wall-clock {}.{:03}s, Media Foundation H.264)",
+                frames.len(), mp4.display(),
+                std::fs::metadata(&mp4).map(|m| m.len() / 1024).unwrap_or(0),
+                timeline.total_ms / 1000, timeline.total_ms % 1000
             ),
-            Err(e) => (
-                "frames".to_string(),
-                format!("{} frames; ffmpeg failed: {}", frames.len(), e),
+        ),
+        Err(mf_err) => match find_ffmpeg() {
+            Some(ff) => match encode(&ff, &st.dir, &mp4, &timeline) {
+                Ok(size) => (
+                    "mp4".to_string(),
+                    format!(
+                        "{} frames -> {} ({} KB, wall-clock {}.{:03}s)",
+                        frames.len(), mp4.display(), size / 1024,
+                        timeline.total_ms / 1000, timeline.total_ms % 1000
+                    ),
+                ),
+                Err(e) => (
+                    "frames".to_string(),
+                    format!("{} frames; Media Foundation: {mf_err}; ffmpeg failed: {e}", frames.len()),
+                ),
+            },
+            None => (
+                "html".to_string(),
+                format!(
+                    "{} frames; Media Foundation unavailable ({mf_err}), no ffmpeg on PATH -> HTML player",
+                    frames.len()
+                ),
             ),
         },
-        None => (
-            "html".to_string(),
-            format!("{} frames; no ffmpeg on PATH (set CUA_FFMPEG or config ffmpeg_path) -> HTML player", frames.len()),
-        ),
     };
     if encoded != "mp4" {
-        write_player(&st.dir, &frames, st.fps)?;
+        write_player(&st.dir, &frames, &timeline, st.fps)?;
     }
     if encoded == "mp4" && !keep_frames {
         let _ = std::fs::remove_dir_all(frames_dir(&st));
@@ -365,33 +480,255 @@ fn list_frames(dir: &Path) -> Vec<PathBuf> {
     v
 }
 
-fn encode(ff: &Path, frames: &Path, out: &Path, fps: u32) -> Result<u64> {
-    if let Some(p) = out.parent() {
+/// Playback timeline built from the capture loop's wall-clock ticks: one cue
+/// per encoded frame with the duration it must stay on screen. Captures
+/// slower than the requested fps and idle stretches (identical-frame ticks)
+/// are both faithfully represented — the artifact plays back at the pace the
+/// user actually saw, not at a nominal fps.
+struct Timeline {
+    /// (frame file name, on-screen seconds)
+    cues: Vec<(String, f64)>,
+    /// total wall-clock duration of the capture session
+    total_ms: u64,
+}
+
+fn read_timeline(dir: &Path, fps: u32) -> Timeline {
+    let meta = std::fs::read(dir.join("captured.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let dur_ms = meta
+        .as_ref()
+        .and_then(|v| v.get("duration_ms").and_then(|x| x.as_u64()))
+        .unwrap_or(0);
+    let entries: Vec<(Option<u64>, u64)> = std::fs::read(dir.join("timestamps.tsv"))
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+        .map(|s| {
+            s.lines()
+                .filter_map(|l| {
+                    let (a, b) = l.split_once('\t')?;
+                    let idx = if a.is_empty() { None } else { a.parse().ok() };
+                    Some((idx, b.trim().parse::<u64>().ok()?))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if entries.is_empty() {
+        return Timeline { cues: Vec::new(), total_ms: dur_ms };
+    }
+    // one cue per encoded frame, in tick order (frame idx appears exactly once)
+    let cues: Vec<(u64, u64)> = entries.iter().filter_map(|(idx, ms)| idx.map(|k| (k, *ms))).collect();
+    let total = if dur_ms > 0 { dur_ms } else { entries.last().map(|e| e.1).unwrap_or(0) };
+    let mut out = Vec::new();
+    for k in 0..cues.len() {
+        let start = cues[k].1;
+        let end = cues.get(k + 1).map(|c| c.1).unwrap_or(total.max(start + 1));
+        out.push((format!("frame_{:06}.jpg", cues[k].0), (end.saturating_sub(start)) as f64 / 1000.0));
+    }
+    Timeline { cues: out, total_ms: total }
+}
+
+/// H.264 MP4 via Windows' built-in Media Foundation encoder — no ffmpeg. Each
+/// cue becomes one RGB32 sample stamped with its wall-clock offset, so the
+/// variable frame rate survives into the container. MF's RGB32 is BGRA; the
+/// decoded JPEG rows are expanded RGB→BGRX while copying.
+unsafe fn encode_mf(out: &Path, dir: &Path, timeline: &Timeline) -> Result<()> {
+    use windows::Win32::Media::MediaFoundation as mf;
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+
+    if timeline.cues.is_empty() {
+        bail!("empty timeline");
+    }
+    // frame size: recorded by the capture worker, else probed from a frame
+    let (w, h) = std::fs::read(dir.join("captured.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| {
+            let w = v.get("width")?.as_u64()? as u32;
+            let h = v.get("height")?.as_u64()? as u32;
+            Some((w, h))
+        })
+        .unwrap_or_else(|| {
+            let p = dir.join("frames").join(&timeline.cues[0].0);
+            image::image_dimensions(&p).unwrap_or((0, 0))
+        });
+    if w == 0 || h == 0 {
+        bail!("unknown frame dimensions");
+    }
+    // bitrate scales with resolution: ~4.5 Mbps per megapixel at 30 fps
+    let bitrate: u32 = (((w as u64 * h as u64) / 100_000) * 450)
+        .clamp(4_000_000, 30_000_000) as u32;
+
+    let com = CoInitializeEx(None, COINIT_MULTITHREADED);
+    if com.is_err() && com != windows::Win32::Foundation::RPC_E_CHANGED_MODE {
+        com.ok()?;
+    }
+    mf::MFStartup(mf::MF_VERSION, mf::MFSTARTUP_NOSOCKET)?;
+    let result = encode_mf_inner(out, dir, timeline, w, h, bitrate);
+    let _ = mf::MFShutdown();
+    result
+}
+
+fn encode_mf_inner(
+    out: &Path,
+    dir: &Path,
+    timeline: &Timeline,
+    w: u32,
+    h: u32,
+    bitrate: u32,
+) -> Result<()> {
+    use windows::Win32::Media::MediaFoundation as mf;
+    use windows::core::HSTRING;
+
+    unsafe {
+        let mut wide: Vec<u16> = out.as_os_str().encode_wide().collect();
+        wide.push(0);
+        let hs = HSTRING::from_wide(&wide)?;
+        let writer = mf::MFCreateSinkWriterFromURL(
+            &hs,
+            None,
+            None,
+        )?;
+        let out_type = mf::MFCreateMediaType()?;
+        out_type.SetGUID(&mf::MF_MT_MAJOR_TYPE, &mf::MFMediaType_Video)?;
+        out_type.SetGUID(&mf::MF_MT_SUBTYPE, &mf::MFVideoFormat_H264)?;
+        out_type.SetUINT32(&mf::MF_MT_AVG_BITRATE, bitrate)?;
+        out_type.SetUINT64(&mf::MF_MT_FRAME_SIZE, ((w as u64) << 32) | h as u64)?;
+        out_type.SetUINT64(&mf::MF_MT_FRAME_RATE, (30u64 << 32) | 1)?;
+        out_type.SetUINT32(&mf::MF_MT_INTERLACE_MODE, mf::MFVideoInterlace_Progressive.0 as u32)?;
+        out_type.SetUINT32(&mf::MF_MT_ALL_SAMPLES_INDEPENDENT, 1)?;
+        let stream_id = writer.AddStream(&out_type)?;
+        let in_type = mf::MFCreateMediaType()?;
+        in_type.SetGUID(&mf::MF_MT_MAJOR_TYPE, &mf::MFMediaType_Video)?;
+        in_type.SetGUID(&mf::MF_MT_SUBTYPE, &mf::MFVideoFormat_RGB32)?;
+        in_type.SetUINT64(&mf::MF_MT_FRAME_SIZE, ((w as u64) << 32) | h as u64)?;
+        in_type.SetUINT64(&mf::MF_MT_FRAME_RATE, (30u64 << 32) | 1)?;
+        in_type.SetUINT32(&mf::MF_MT_INTERLACE_MODE, mf::MFVideoInterlace_Progressive.0 as u32)?;
+        in_type.SetUINT32(&mf::MF_MT_ALL_SAMPLES_INDEPENDENT, 1)?;
+        writer.SetInputMediaType(stream_id, &in_type, None)?;
+        writer.BeginWriting()?;
+
+        let frame_bytes = (w as usize * h as usize * 4).max(4);
+        let mut start_ms = 0u64;
+        for (name, dur) in &timeline.cues {
+            let p = dir.join("frames").join(name);
+            let bytes = std::fs::read(&p)?;
+            let img = image::load_from_memory(&bytes)?.to_rgb8();
+            if img.width() != w || img.height() != h {
+                bail!("frame {} is {}x{}, expected {w}x{h}", name, img.width(), img.height());
+            }
+            let sample = mf::MFCreateSample()?;
+            let buf = mf::MFCreateMemoryBuffer(frame_bytes as u32)?;
+            let mut pb: *mut u8 = std::ptr::null_mut();
+            let mut max_len = 0u32;
+            buf.Lock(&mut pb, Some(&mut max_len), None)?;
+            // MF RGB32 is bottom-up DIB order — write the rows flipped, or the
+            // mp4 plays upside down
+            for row in 0..h as usize {
+                let src = &img.as_raw()[row * w as usize * 3..][..w as usize * 3];
+                let dst = pb.add((h as usize - 1 - row) * w as usize * 4);
+                for x in 0..w as usize {
+                    *dst.add(x * 4) = src[x * 3 + 2];     // B
+                    *dst.add(x * 4 + 1) = src[x * 3 + 1]; // G
+                    *dst.add(x * 4 + 2) = src[x * 3];     // R
+                    *dst.add(x * 4 + 3) = 255;
+                }
+            }
+            buf.Unlock()?;
+            buf.SetCurrentLength(frame_bytes as u32)?;
+            sample.AddBuffer(&buf)?;
+            sample.SetSampleTime((start_ms * 10_000) as i64)?;
+            sample.SetSampleDuration((*dur * 10_000.0).round() as i64)?;
+            writer.WriteSample(stream_id, &sample)?;
+            start_ms += (*dur * 1000.0).round() as u64;
+        }
+        // the H.264 MFT does not extend the FINAL sample's duration — without
+        // padding, the mp4 ends at the last changed frame and the closing hold
+        // (e.g. the fade-out tail) is cut off
+        let tail = timeline.total_ms.saturating_sub(start_ms);
+        if tail > 0 && !timeline.cues.is_empty() {
+            let name = &timeline.cues.last().unwrap().0;
+            let bytes = std::fs::read(dir.join("frames").join(name))?;
+            let img = image::load_from_memory(&bytes)?.to_rgb8();
+            let mut pad = 0u64;
+            while pad < tail {
+                let step = pad.min(250);
+                let sample = mf::MFCreateSample()?;
+                let buf = mf::MFCreateMemoryBuffer(frame_bytes as u32)?;
+                let mut pb: *mut u8 = std::ptr::null_mut();
+                let mut max_len = 0u32;
+                buf.Lock(&mut pb, Some(&mut max_len), None)?;
+                for row in 0..h as usize {
+                    let src = &img.as_raw()[row * w as usize * 3..][..w as usize * 3];
+                    let dst = pb.add((h as usize - 1 - row) * w as usize * 4);
+                    for x in 0..w as usize {
+                        *dst.add(x * 4) = src[x * 3 + 2];
+                        *dst.add(x * 4 + 1) = src[x * 3 + 1];
+                        *dst.add(x * 4 + 2) = src[x * 3];
+                        *dst.add(x * 4 + 3) = 255;
+                    }
+                }
+                buf.Unlock()?;
+                buf.SetCurrentLength(frame_bytes as u32)?;
+                sample.AddBuffer(&buf)?;
+                sample.SetSampleTime(((start_ms + step) * 10_000) as i64)?;
+                sample.SetSampleDuration(250 * 10_000)?;
+                writer.WriteSample(stream_id, &sample)?;
+                pad += 250;
+            }
+        }
+        writer.Finalize()?;
+        Ok(())
+    }
+}
+
+fn encode(ff: &Path, dir: &Path, out: &Path, timeline: &Timeline) -> Result<u64> {    if let Some(p) = out.parent() {
         std::fs::create_dir_all(p)?;
     }
-    let status = std::process::Command::new(ff)
-        .args(["-y", "-hide_banner", "-loglevel", "error"])
-        .args(["-nostdin", "-framerate", &fps.to_string(), "-i", "frame_%06d.jpg"])
-        .args(["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-movflags", "+faststart"])
+    let mut cmd = std::process::Command::new(ff);
+    cmd.args(["-y", "-hide_banner", "-loglevel", "error", "-nostdin"]);
+    if timeline.cues.is_empty() {
+        // no timestamps (legacy/killed worker): uniform spacing from fps
+        cmd.args(["-framerate", "10", "-i", "frame_%06d.jpg"]).current_dir(dir);
+    } else {
+        // variable frame rate straight from the wall-clock timeline; resampled
+        // to 30 fps CFR at encode so every player shows the true pace
+        let mut list = String::from("ffconcat version 1.0\n");
+        for (name, d) in &timeline.cues {
+            list.push_str(&format!("file '{}'\nduration {:.3}\n", dir.join("frames").join(name).display(), d));
+        }
+        // concat-demuxer quirk: the final duration is honoured only when the
+        // last file is listed a second time
+        if let Some((name, d)) = timeline.cues.last() {
+            list.push_str(&format!("file '{}'\nduration {:.3}\n", dir.join("frames").join(name).display(), d));
+        }
+        std::fs::write(dir.join("list.ffconcat"), list)?;
+        cmd.args(["-f", "concat", "-safe", "0", "-i"])
+            .arg(dir.join("list.ffconcat"))
+            .args(["-vf", "fps=30"]);
+    }
+    cmd.args(["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-movflags", "+faststart"])
         .arg(out)
-        .current_dir(frames)
-        .stdin(std::process::Stdio::null())
-        .status()?;
+        .stdin(std::process::Stdio::null());
+    let status = cmd.status()?;
     if !status.success() {
         bail!("ffmpeg exited with {status}");
     }
     Ok(std::fs::metadata(out).map(|m| m.len()).unwrap_or(0))
 }
 
-/// Dependency-free fallback: a single HTML file that replays the JPEG frames. Frames are
-/// embedded as data URLs (bounded) so the artifact stands alone and stays reviewable; a
-/// multi-hour recording that would blow the budget falls back to file references.
-fn write_player(dir: &Path, frames: &[PathBuf], fps: u32) -> Result<()> {
+/// Dependency-free fallback: a single HTML file that replays the JPEG frames
+/// on the REAL wall-clock timeline (per-frame durations from the capture
+/// ticks), so idle stretches and slow captures look exactly like what the
+/// user saw. Frames are embedded as data URLs (bounded) so the artifact stands
+/// alone and stays reviewable; a multi-hour recording that would blow the
+/// budget falls back to file references.
+fn write_player(dir: &Path, frames: &[PathBuf], timeline: &Timeline, fps: u32) -> Result<()> {
     const EMBED_BUDGET: u64 = 48 * 1024 * 1024; // base64 inflates ~4/3; keep the html sane
     let total: u64 = frames.iter().filter_map(|p| std::fs::metadata(p).ok()).map(|m| m.len()).sum();
     let embed = total <= EMBED_BUDGET;
     let mut body = String::new();
-    for (i, p) in frames.iter().enumerate() {
+    for p in frames.iter() {
         let src = if embed {
             let bytes = std::fs::read(p)
                 .with_context(|| format!("reading frame {}", p.display()))?;
@@ -403,8 +740,16 @@ fn write_player(dir: &Path, frames: &[PathBuf], fps: u32) -> Result<()> {
             format!("frames/{}", p.file_name().unwrap_or_default().to_string_lossy())
         };
         body.push_str(&format!("<img src=\"{src}\" alt=\"\">\n"));
-        let _ = i;
     }
+    // per-frame on-screen ms; a timeline mismatch (or its absence) falls back
+    // to uniform 1000/fps spacing
+    let dur: Vec<u64> = if timeline.cues.len() == frames.len() {
+        timeline.cues.iter().map(|(_, d)| ((*d * 1000.0).round() as u64).max(1)).collect()
+    } else {
+        vec![1000 / fps.max(1) as u64; frames.len()]
+    };
+    let total_ms: u64 = dur.iter().sum();
+    let wall = format!("{}.{:03}", total_ms / 1000, total_ms % 1000);
     let count = frames.len();
     let html = format!(
         r#"<!doctype html><meta charset="utf-8"><title>cua recording</title>
@@ -413,21 +758,26 @@ fn write_player(dir: &Path, frames: &[PathBuf], fps: u32) -> Result<()> {
 img.on{{display:block}}#bar{{padding:8px 12px;display:flex;gap:10px;align-items:center;background:#1b1b1b}}</style>
 <div id="stage">{body}</div>
 <div id="bar"><button id="pp">⏸</button><input id="rng" type="range" min="0" max="{last}" value="0">
-<span id="lbl"></span><span>{count} frames @ {fps} fps{mode}</span></div>
+<span id="lbl"></span><span>{count} frames · wall-clock {wall}s · ←/→ 单帧步进</span></div>
 <script>
-const f=[...document.images];let i=0,t=null;const speed={fps};
-function show(n){{i=(n+f.length)%f.length;f.forEach((e,k)=>e.classList.toggle('on',k===i));rng.value=i;lbl.textContent=`${{i+1}} / ${{f.length}}`;}}
-function play(){{stop();t=setInterval(()=>show(i+1),1000/speed);pp.textContent='⏸';}}
-function stop(){{if(t)clearInterval(t);t=null;pp.textContent='▶';}}
-pp.onclick=()=>t?stop():play();rng.oninput=e=>{{stop();show(+e.target.value)}};
+const f=[...document.images];const dur={dur_json};const cum=[0];
+for(let k=0;k<dur.length;k++)cum.push(cum[k]+dur[k]);
+let i=0,t=null;
+const fmt=s=>`${{Math.floor(s/60)}}:${{(s%60).toFixed(1).padStart(4,'0')}}`;
+function show(n){{i=Math.max(0,Math.min(n,f.length-1));f.forEach((e,k)=>e.classList.toggle('on',k===i));rng.value=i;lbl.textContent=`${{i+1}}/${{f.length}}  ${{fmt(cum[i]/1000)}}`;}}
+function tick(){{t=setTimeout(()=>{{if(i+1<f.length){{show(i+1);tick();}}else{{stop();}}}},dur[i]);pp.textContent='⏸';}}
+function play(){{stop();tick();}}
+function stop(){{if(t)clearTimeout(t);t=null;pp.textContent='▶';}}
+pp.onclick=()=>t?stop():play();
+rng.oninput=e=>{{stop();show(+e.target.value)}};
 document.onkeydown=e=>{{if(e.key==='ArrowRight'){{stop();show(i+1)}}if(e.key==='ArrowLeft'){{stop();show(i-1)}}}};
 show(0);play();
 </script>"#,
         body = body,
         last = count.saturating_sub(1),
         count = count,
-        fps = fps,
-        mode = if embed { " (embedded)" } else { "" },
+        wall = wall,
+        dur_json = serde_json::to_string(&dur)?,
     );
     std::fs::write(dir.join("player.html"), html)?;
     Ok(())
