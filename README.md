@@ -47,7 +47,8 @@ cua ocr --window Notepad                                # local Windows OCR; als
 cua ocr --file "$env:TEMP\shot.png" --max-lines 50
 cua sandbox start --exe D:\app.exe                     # run and control on an invisible desktop
 cua session setup                                      # child session: one-time admin; sign out/in
-cua session start                                      # child session + startup isolation + read-only viewer
+cua session start                                      # child session + startup isolation, 无感后台（观察窗默认隐藏）
+cua session view                                       # show the hidden read-only viewer on demand
 cua session start --keep-startup                       # allow child-session startup apps
 cua session login                                      # optional: save Windows password for PIN/Hello logon
 cua session start --hide                               # background; no viewer

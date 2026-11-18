@@ -21,6 +21,10 @@ cuda = ["burn/cuda"]
 autotune = ["burn/autotune"]
 
 [[bin]]
+name = "cua-settings"
+path = "src/bin/settings.rs"
+
+[[bin]]
 name = "florence_bench"
 path = "src/bin/florence_bench.rs"
 required-features = ["candle"]
@@ -54,6 +58,7 @@ base64 = "0.22"
 # The browser bridge daemon + client, linked in-process so `cua browser` never
 # has to resolve or spawn a helper binary.
 cua-browser-bridge = { path = "crates/browser-bridge" }
+gpui = "0.2"
 
 [dependencies.windows]
 version = "0.58"

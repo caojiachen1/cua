@@ -206,8 +206,8 @@
   }
   const CSS = `
     @keyframes cua-pulse {
-      0%,100% { box-shadow: inset 0 0 0 3px rgba(99,102,241,.9), inset 0 0 24px rgba(99,102,241,.35); }
-      50%     { box-shadow: inset 0 0 0 3px rgba(129,140,248,1),  inset 0 0 48px rgba(99,102,241,.55); }
+      0%,100% { box-shadow: inset 0 0 0 2px rgba(255,255,255,.72), inset 0 0 28px rgba(255,255,255,.08); }
+      50%     { box-shadow: inset 0 0 0 2px rgba(255,255,255,.95),  inset 0 0 52px rgba(255,255,255,.16); }
     }
     * { all: initial; box-sizing: border-box; }
     /* "all: initial" above resets the <style> element's UA display:none to
@@ -220,57 +220,69 @@
     @media print { .host, .pill, .veil, .frame, .confirm, .helpcard { display: none !important; } }
     .host { position: fixed; inset: 0; z-index: 2147483647; pointer-events: none; font-family: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }
     .frame { position: absolute; inset: 0; pointer-events: none; animation: cua-pulse 1.6s ease-in-out infinite; }
-    .veil { position: absolute; inset: 0; pointer-events: auto; cursor: not-allowed; background: rgba(99,102,241,.05); }
+    /* monochrome veil: dark tint with a white gradient glowing in from all
+       four edges — the aside-style edge treatment */
+    .veil {
+      position: absolute; inset: 0; pointer-events: auto; cursor: not-allowed;
+      background:
+        linear-gradient(to right, rgba(255,255,255,.20), rgba(255,255,255,0) 5%, rgba(255,255,255,0) 95%, rgba(255,255,255,.20)),
+        linear-gradient(to bottom, rgba(255,255,255,.20), rgba(255,255,255,0) 5%, rgba(255,255,255,0) 95%, rgba(255,255,255,.20)),
+        rgba(10,10,10,.34);
+    }
     .pill {
-      position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
-      display: flex; align-items: center; gap: 10px;
-      background: rgba(30,27,75,.92); color: #e0e7ff;
-      border: 1px solid rgba(129,140,248,.6); border-radius: 999px;
-      padding: 7px 8px 7px 16px; font-size: 12.5px; line-height: 1;
+      position: absolute; top: 8px; left: 50%; transform: translateX(-50%);
+      display: flex; align-items: center; gap: 8px;
+      background: rgba(0,0,0,.88); color: #fff;
+      border: 1px solid rgba(255,255,255,.30); border-radius: 999px;
+      padding: 4px 5px 4px 12px; font-size: 11.5px; line-height: 1;
+      backdrop-filter: blur(8px);
       pointer-events: none; user-select: none;
     }
-    .dot { width: 8px; height: 8px; border-radius: 50%; background: #818cf8; animation: cua-blink 1s infinite; }
+    .dot { width: 6px; height: 6px; border-radius: 50%; background: #fff; animation: cua-blink 1.2s infinite; }
     @keyframes cua-blink { 50% { opacity: .25; } }
     button.stop {
       all: unset; pointer-events: auto; cursor: pointer;
-      background: #ef4444; color: #fff; border-radius: 999px;
-      padding: 6px 14px; font-size: 12px; font-weight: 600;
+      background: #fff; color: #000; border-radius: 999px;
+      padding: 4px 11px; font-size: 11px; font-weight: 600;
     }
-    button.stop:hover { background: #dc2626; }
+    button.stop:hover { background: #d4d4d4; }
     button.resume {
       all: unset; pointer-events: auto; cursor: pointer;
-      background: #4f46e5; color: #fff; border-radius: 999px;
-      padding: 6px 14px; font-size: 12px; font-weight: 600;
+      background: #000; color: #fff; border: 1px solid rgba(255,255,255,.5); border-radius: 999px;
+      padding: 4px 11px; font-size: 11px; font-weight: 600;
     }
-    button.resume:hover { background: #4338ca; }
+    button.resume:hover { background: #1a1a1a; }
     .confirm {
-      position: absolute; inset: 0; pointer-events: auto; background: rgba(15,12,40,.45);
+      position: absolute; inset: 0; pointer-events: auto; background: rgba(0,0,0,.5);
       display: flex; align-items: center; justify-content: center;
     }
     .card {
-      background: #fff; color: #111827; border-radius: 14px; padding: 22px 26px;
-      max-width: 440px; box-shadow: 0 24px 60px rgba(0,0,0,.35); font-size: 14px;
+      background: #0a0a0a; color: #fff; border: 1px solid rgba(255,255,255,.22); border-radius: 12px; padding: 18px 22px;
+      max-width: 420px; box-shadow: 0 24px 60px rgba(0,0,0,.5); font-size: 13.5px;
     }
-    .card h3 { margin: 0 0 8px; font-size: 16px; }
-    .card p { margin: 0 0 16px; color: #4b5563; }
-    .card .btns { display: flex; gap: 10px; justify-content: flex-end; }
-    .card button { all: unset; cursor: pointer; border-radius: 8px; padding: 8px 18px; font-size: 13px; font-weight: 600; }
-    .card .allow { background: #4f46e5; color: #fff; }
-    .card .deny { background: #e5e7eb; color: #374151; }
-    .count { color: #6b7280; font-size: 12px; margin-left: 10px; }
+    .card h3 { margin: 0 0 6px; font-size: 15px; }
+    .card p { margin: 0 0 14px; color: #a3a3a3; }
+    .card .btns { display: flex; gap: 8px; justify-content: flex-end; align-items: center; }
+    .card button { all: unset; cursor: pointer; border-radius: 8px; padding: 7px 16px; font-size: 12.5px; font-weight: 600; }
+    .card .allow { background: #fff; color: #000; }
+    .card .allow:hover { background: #e5e5e5; }
+    .card .deny { background: transparent; color: #fff; border: 1px solid rgba(255,255,255,.35); }
+    .card .deny:hover { background: rgba(255,255,255,.12); }
+    .count { color: #737373; font-size: 11.5px; margin-left: 10px; }
     .helpcard {
-      position: absolute; top: 64px; left: 50%; transform: translateX(-50%);
-      background: #fff; color: #111827; border-radius: 14px;
-      padding: 14px 18px; max-width: 480px; pointer-events: auto;
-      box-shadow: 0 18px 48px rgba(0,0,0,.3); font-size: 13.5px;
-      border: 1px solid rgba(99,102,241,.5);
+      position: absolute; top: 52px; left: 50%; transform: translateX(-50%);
+      background: #0a0a0a; color: #fff; border: 1px solid rgba(255,255,255,.22); border-radius: 12px;
+      padding: 12px 16px; max-width: 460px; pointer-events: auto;
+      box-shadow: 0 18px 48px rgba(0,0,0,.5); font-size: 13px;
     }
-    .helpcard .t { font-weight: 600; margin-bottom: 4px; font-size: 14px; }
-    .helpcard .s { color: #6b7280; font-size: 12px; margin-bottom: 10px; }
-    .helpcard .btns { display: flex; gap: 8px; justify-content: flex-end; align-items: center; }
-    .helpcard button { all: unset; cursor: pointer; border-radius: 8px; padding: 6px 14px; font-size: 12.5px; font-weight: 600; }
-    .helpcard .done { background: #4f46e5; color: #fff; }
-    .helpcard .cancel { background: #e5e7eb; color: #374151; }
+    .helpcard .t { font-weight: 600; margin-bottom: 3px; font-size: 13px; }
+    .helpcard .s { color: #a3a3a3; font-size: 11.5px; margin-bottom: 9px; }
+    .helpcard .btns { display: flex; gap: 7px; justify-content: flex-end; align-items: center; }
+    .helpcard button { all: unset; cursor: pointer; border-radius: 8px; padding: 5px 12px; font-size: 11.5px; font-weight: 600; }
+    .helpcard .done { background: #fff; color: #000; }
+    .helpcard .done:hover { background: #e5e5e5; }
+    .helpcard .cancel { background: transparent; color: #fff; border: 1px solid rgba(255,255,255,.35); }
+    .helpcard .cancel:hover { background: rgba(255,255,255,.12); }
   `;
 
   function hostsInDoc() {
@@ -377,16 +389,16 @@
     if (pillLabel) {
       pillLabel.textContent =
         mode === 'paused'
-          ? '⏸ 用户已接管 · 可自由操作'
-          : `${label}（代理操作中，点击被忽略）`;
+          ? '⏸ 已接管'
+          : `${label} · 点击已屏蔽`;
     }
     if (resumeBtn) resumeBtn.style.display = mode === 'paused' ? '' : 'none';
     const blocking = mode === 'armed' && blockMode === 'block' && hostOpen(host) === 0 && !helpActive;
     if (veil) {
       // pointer-events toggling is invisible; the tint NEVER changes with
-      // pass state, so the shield does not flicker during agent operations
+      // pass state, so the shield does not flicker during agent operations —
+      // the gradient itself lives in the stylesheet and is never touched here
       veil.style.pointerEvents = blocking ? 'auto' : 'none';
-      veil.style.background = 'rgba(99,102,241,.05)';
     }
     scheduleSweep();
   }

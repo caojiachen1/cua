@@ -326,7 +326,8 @@ Windows Credential Manager if the child shows a logon screen.
 ```bash
 cua session setup                      # one-time admin; sign out/in afterwards
 cua session setup --enable-rdp         # also enables Remote Desktop (security change; ask first)
-cua session start                      # default: startup isolation + maximized read-only viewer
+cua session start                      # default: 无感后台 — startup isolation, viewer hidden
+cua session view                       # show the read-only viewer on demand
 cua session start --keep-startup       # let the child run the user's startup apps too
 cua session login                      # optional one-time Windows password for PIN/Hello logon
 cua session logout                     # remove the saved child-session password

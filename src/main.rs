@@ -178,10 +178,10 @@ pub(crate) enum SessionOp {
     },
     /// Start a child session (same user, files and account).
     Start {
-        /// Kept for compatibility; the read-only viewer now opens by default.
-        #[arg(long, hide = true)]
+        /// Show the read-only viewer (default: 无感后台，观察窗隐藏).
+        #[arg(long)]
         view: bool,
-        /// Do not open the viewer; keep the session in the background.
+        /// Kept for compatibility; the viewer is hidden by default now.
         #[arg(long)]
         hide: bool,
         /// Open the viewer with keyboard/mouse enabled (no read-only mask).
@@ -785,6 +785,9 @@ enum Cmd {
         #[command(subcommand)]
         op: PreviewOp,
     },
+    /// Open the settings window (all optional cua settings, GPUI)
+    #[command(name = "settings")]
+    Settings,
     /// Run a sequence of actions from a JSON file (Trae batch)
     Batch {
         #[arg(long)]
@@ -1432,6 +1435,7 @@ fn dispatch(cmd: Cmd) -> i32 {
                 PreviewOp::Serve => Ok(pointer::serve()),
                 PreviewOp::Stop => Ok(pointer::stop()),
             },
+            Cmd::Settings => cmd_settings(),
             Cmd::Session { op } => session::dispatch(op),
             Cmd::Agent { data_dir } => agent::run(data_dir),
             Cmd::Browser { rest } => browser::cmd_browser(&rest),
@@ -4468,6 +4472,23 @@ fn expand_arg(s: &str, vars: &std::collections::HashMap<String, Value>) -> Resul
     }
     out.push_str(rest);
     Ok(out)
+}
+
+/// Launch the GPUI settings window detached (cua-settings.exe next to cua.exe).
+fn cmd_settings() -> Result<i32> {
+    let exe = std::env::current_exe()
+        .map_err(|e| anyhow!("current_exe: {e}"))?
+        .parent()
+        .ok_or_else(|| anyhow!("cua.exe has no parent directory"))?
+        .join("cua-settings.exe");
+    if !exe.is_file() {
+        bail!("cua-settings.exe not found next to cua.exe ({}) — run install.ps1", exe.display());
+    }
+    let launched = cua_browser_bridge::spawn_detached_process(&exe.display().to_string(), "");
+    if !launched {
+        bail!("could not spawn {}", exe.display());
+    }
+    Ok(0)
 }
 
 fn cmd_batch(file: &str, continue_on_error: bool) -> Result<i32> {

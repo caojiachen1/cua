@@ -47,10 +47,11 @@
 .cua-cursor-ring.cua-run{animation:cua-cursor-ripple .6s ease-out forwards}
 @keyframes cua-cursor-ripple{0%{transform:scale(.4);opacity:.9}
   100%{transform:scale(2.6);opacity:0}}
-.cua-cursor-bubble{position:absolute;left:14px;top:-30px;max-width:300px;white-space:nowrap;
-  overflow:hidden;text-overflow:ellipsis;background:rgba(17,24,39,.92);color:#fff;font-size:12px;
-  line-height:1;padding:6px 9px;border-radius:999px;box-shadow:0 2px 8px rgba(0,0,0,.3)}
-#cua-agent-cursor.cua-fail .cua-cursor-bubble{background:rgba(153,27,27,.94)}
+.cua-cursor-bubble{position:absolute;left:14px;top:-28px;max-width:300px;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis;background:rgba(0,0,0,.9);color:#fff;font-size:11.5px;
+  line-height:1;padding:5px 8px;border-radius:999px;box-shadow:0 1px 6px rgba(0,0,0,.4);
+  border:1px solid rgba(255,255,255,.2)}
+#cua-agent-cursor.cua-fail .cua-cursor-bubble{background:rgba(0,0,0,.95)}
 .cua-cursor-bubble .cua-cursor-kind{opacity:.65;margin-right:4px}
 #cua-agent-cursor.cua-flip .cua-cursor-bubble{left:auto;right:14px}
 #cua-agent-cursor.cua-below .cua-cursor-bubble{top:14px}

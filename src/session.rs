@@ -226,8 +226,8 @@ fn host_call(state: &SessionState, op: &str, extra: Value) -> Result<Value> {
 pub fn dispatch(op: SessionOp) -> Result<i32> {
     match op {
         SessionOp::Setup { enable_rdp } => cmd_setup(enable_rdp),
-        SessionOp::Start { view: _, hide, interactive, keep_startup, headless, width, height } => {
-            cmd_start(!hide, interactive, keep_startup, headless, width, height)
+        SessionOp::Start { view, hide, interactive, keep_startup, headless, width, height } => {
+            cmd_start(view, hide, interactive, keep_startup, headless, width, height)
         }
         SessionOp::Login => cmd_credentials(true),
         SessionOp::Logout => cmd_credentials(false),
@@ -413,12 +413,26 @@ pub fn maybe_vnc(raw: &[String]) -> Option<i32> {
 
 fn cmd_start(
     view: bool,
+    hide: bool,
     interactive: bool,
     keep_startup: bool,
     headless: bool,
     width: Option<u32>,
     height: Option<u32>,
 ) -> Result<i32> {
+    // 默认无感后台：观察窗隐藏（session_start_show_viewer 配置可改默认值）。
+    // --view 强制显示；--hide 强制隐藏（兼容旧参数）。
+    let cfg_show = crate::util::load_config_json()
+        .get("session_start_show_viewer")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let show_viewer = if view {
+        true
+    } else if hide {
+        false
+    } else {
+        cfg_show
+    };
     // 无头模式：CLI 显式指定，或托盘设置「自动关闭路由」开启。
     let headless = headless || headless_auto_disable_setting();
 
@@ -431,7 +445,7 @@ fn cmd_start(
 
     if let Some(st) = load_state() {
         if host_alive(&st) {
-            if view || interactive {
+            if show_viewer || interactive {
                 let v = host_call(&st, "view", json!({ "view_only": !interactive }))?;
                 print_value(&v);
             } else {
@@ -472,7 +486,7 @@ fn cmd_start(
     }
     if interactive {
         cmd.arg("--interactive");
-    } else if view {
+    } else if show_viewer {
         cmd.arg("--view");
     }
     cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
