@@ -3,14 +3,16 @@
 Rust CLI for driving Windows desktop apps: UIA accessibility tree + screenshots, a11y-first
 actions, real `SendInput`, message-level background input, a hidden-desktop sandbox for true
 background control, a Windows Child Session backend for real input in a second session, browser
-control bridged to UBB, screen recording, and JSON action receipts with safety guards.
+browser control through the user's own logged-in Edge/Chrome, screen recording, and JSON
+action receipts with safety guards.
 
 ## Install
 
 Needs Windows 10/11 x64, Rust (MSVC), CMake/C++ build tools (for the PaddleOCR native
 dependency), PowerShell 5.1+, and the .NET SDK (builds the optional child-session host).
 The first perception build downloads the ONNX Runtime native runtime. Browser tasks need the
-`ubb` CLI and its Edge extension connected (`cua browser status` → `extension: true`).
+CUA Browser extension loaded once (`cua browser install`, then `cua browser status` →
+`extension: true`); the bridge daemon is part of `cua.exe`.
 
 ```powershell
 git clone https://github.com/caojiachen1/cua.git
@@ -61,7 +63,7 @@ cua launch --exe app.exe --minimized                    # start minimized, still
 cua rec start --fps 2 --out session                    # record the screen while you work
 cua rec stop                                           # -> mp4 with ffmpeg, else an HTML player
 cua rec cancel                                         # force-stop a stuck recorder, keep frames
-cua browser tab.create '{"url":"https://example.com"}'  # bridged to UBB (the user's Edge)
+cua browser tab.create '{"url":"https://example.com"}'  # the user's own Edge
 cua browser find '{"query":"Sign in"}'                   # -> @ref
 cua browser click '{"ref":"@d1"}'
 ```
@@ -151,7 +153,7 @@ holds the profile.
 Autofill: Edge's normal password autofill is available from imported or account-synced
 credentials. If a password is missing, let Edge save it in the CuaEdge sign-in window or import
 browser data via Edge settings. Windows Hello may still ask for verification. `cua browser`
-remains the UBB bridge to the user's own browser and is not used for the child Edge.
+remains the bridge to the user's own browser and is not used for the child Edge.
 
 **Sync note (measured 2026-11-16):** cloud sync does not upload a profile's local passwords by
 itself. The main Edge profile had ~453 local passwords while the Microsoft account had 0, and
@@ -181,26 +183,25 @@ child session's holders; backup/delete refuse while any Edge is using the profil
 backup contains cookies and saved passwords and stays under the same user data directory, so
 treat it like the profile itself.
 
-## UBB (vendored)
+## Browser extension (`browser/`)
 
-`ubb/` is the merged Universal Browser Bridge: the unpacked extension (`manifest.json`,
-`background.js`, `content/`, `popup/`, `offscreen/`), the Node daemon (`daemon/`), the tool
-catalog (`lib/`) and the Rust CLI + daemon (`rust-cli/`). `cua browser` resolves it as
-`$CUA_UBB` → config `ubb_path` → this checkout (`ubb/bin/ubb.exe`,
-`ubb/rust-cli/target/release/ubb.exe`, `bin/ubb.exe`) → PATH, so the merged sources win over an
-older machine-wide install. `install.ps1` builds `ubb/rust-cli` into `ubb/bin/ubb.exe` and
-copies it next to `cua.exe`.
+`browser/extension/` is the unpacked CUA Browser extension — `manifest.json`, `background.js`,
+the CDP tool catalog (`lib/`), the content scripts (`content/`) and the popup. The daemon that
+routes calls to it lives in `crates/browser-bridge/` and is **linked into `cua.exe`**: there is
+no helper binary to install, resolve or spawn. `cua browser install` copies the extension to
+`%LOCALAPPDATA%\cua\browser-ext` and registers the native-messaging host (`com.cua.browser`)
+so the popup auto-pairs without a token ever leaving the machine.
 
-### Driving the profile through UBB (`cua edge --ubb`)
+### Driving the profile through the extension (`cua edge --pair`)
 
-`--ubb` asks the running daemon for a one-shot `browser.pair` nonce, launches the profile with
-`--load-extension=<ubb tree>` (plus `--disable-features=DisableLoadExtensionCommandLineSwitch`,
+`--pair` asks the running daemon for a one-shot `browser.pair` nonce, launches the profile with
+`--load-extension=<extension dir>` (plus `--disable-features=DisableLoadExtensionCommandLineSwitch`,
 which current Chromium needs) and the pair page as its first tab, and the extension registers
-that profile as a UBB slot: `cuaedge`, or `cuachrome` for Chrome. The full tool set then works
+that profile as a slot: `cuaedge`, or `cuachrome` for Chrome. The full tool set then works
 against it, including the challenge tools:
 
 ```powershell
-cua edge --ubb https://example.com
+cua edge --pair https://example.com
 cua browser --browser cuaedge tab.list '{}'
 cua browser --browser cuaedge challenge.detect '{}'
 cua browser --browser cuaedge challenge.solve '{"mode":"slider"}'
@@ -296,8 +297,7 @@ The runtime assets are downloaded from four public ModelScope repos:
 `cjc1887415157/ppocr-v4`, and `cjc1887415157/easyocr-en-reference`, with
 `cua perception models install --accept-license` (about 1.9GB; the candle decoder adds a
 387MB decoder-only safetensors), and checked by
-`cua perception models verify --deep
-cua perception serve [--idle-minutes 30] [--stop]          # resident OCR/detector/caption`. `toolsench-perception.ps1` scores OCR recall and
+`cua perception models verify --deep`. `tools\bench-perception.ps1` scores OCR recall and
 latency on the built-in fixture (or a `-Manifest` of images + expected strings), so accuracy
 claims can be re-run instead of eyeballed. `tools/gen-ui-dataset.ps1` renders a six-case
 light/dark, English/Chinese, small/large dataset with known labels and a manifest; no real
@@ -325,7 +325,7 @@ powershell -ExecutionPolicy Bypass -File tools\uia-probe.ps1 -Apps qqmusic,cloud
 ```
 
 Suites cover the CLI surface, deep behaviours (unicode input, drag, capture, error paths),
-control patterns and geometry, the UBB browser bridge, stock Windows apps (Notepad, Character
+control patterns and geometry, the browser bridge, stock Windows apps (Notepad, Character
 Map, System Information, Volume Mixer, Explorer) and third-party desktop apps (QQ Music,
 NetEase Cloud Music, Soda Music — skipped when not installed), and a long-horizon
 Bilibili scenario that is screen-recorded end to end (`cua rec`).
@@ -345,6 +345,7 @@ third-party app occupying the screen.
 The hidden desktop drives apps through UIA patterns and window messages; UWP apps cannot start
 there, and DRM-protected windows refuse `PrintWindow`. Message-level input reaches classic
 controls (EDIT/RICHEDIT/BUTTON) but not XAML/DirectUI surfaces — use the a11y actions for those.
-Browser control is a bridge: it needs the `ubb` daemon + extension, works on the user's real
-profile, and never opens a window of its own. `file://` pages need explicit file access on
-the extension; screenshotting a background tab needs `tab.select` first.
+Browser control is a bridge: it needs the CUA Browser extension loaded, works on the user's
+real profile, and never opens a window of its own. `file://` pages need explicit file access on
+the extension; screenshotting an occluded/background tab can hang — `tab.select` first (a
+minimized or covered window refuses trusted input outright with `INPUT_NOT_DELIVERED`).

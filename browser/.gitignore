@@ -1,0 +1,25 @@
+# Runtime artifacts
+*.log
+*.pid
+
+# Keys & packaged output
+*.pem
+*.crx
+
+# Test / scratch
+_*/
+screenshots/
+browser-screenshots/
+
+# E2E tests and fixtures are local-only
+e2e/
+
+# Local docs/reports; keep the project's tracked docs
+*.md
+!README.md
+!INSTALL.md
+!SKILL.md
+
+# Local tooling dotfiles/dirs
+.*
+!.gitignore

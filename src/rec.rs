@@ -277,7 +277,7 @@ pub fn cmd_stop(out: Option<String>, keep_frames: bool) -> Result<i32> {
         },
         None => (
             "html".to_string(),
-            format!("{} frames; no ffmpeg on PATH (set $CUA_UBB's sibling CUA_FFMPEG or config ffmpeg_path) -> HTML player", frames.len()),
+            format!("{} frames; no ffmpeg on PATH (set CUA_FFMPEG or config ffmpeg_path) -> HTML player", frames.len()),
         ),
     };
     if encoded != "mp4" {

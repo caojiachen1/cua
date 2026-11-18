@@ -519,7 +519,7 @@ pub fn load_config() -> SafetyConfig {
     SafetyConfig::default()
 }
 
-/// Raw config JSON, for keys SafetyConfig does not model (e.g. `ubb_path`).
+/// Raw config JSON, for keys SafetyConfig does not model (e.g. `browser_port`).
 pub fn load_config_json() -> serde_json::Value {
     let p = ensure_data_dir().join("config.json");
     std::fs::read(p)

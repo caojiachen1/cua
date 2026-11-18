@@ -7,6 +7,7 @@ mod rfb;
 mod action;
 mod agent;
 mod background;
+mod browser;
 mod capture;
 mod edge;
 mod input;
@@ -15,7 +16,6 @@ mod perception;
 mod rec;
 mod sandbox;
 mod session;
-mod ubb;
 mod uia;
 mod util;
 mod win;
@@ -800,9 +800,10 @@ enum Cmd {
         #[arg(long)]
         data_dir: Option<String>,
     },
-    /// Browser control bridged to UBB (the user's own Edge/Chrome); `browser help` lists tools
+    /// Browser control through the user's own logged-in Edge/Chrome (CUA Browser
+    /// extension); `browser help` lists the tools
     Browser {
-        /// ubb tool name + JSON params, e.g. `tab.create {"url":"example.com"}`
+        /// Tool name + JSON params, e.g. `tab.create {"url":"example.com"}`
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         rest: Vec<String>,
     },
@@ -839,9 +840,9 @@ enum Cmd {
         /// Do not keep what the browser imports into a brand-new profile
         #[arg(long = "no-import-passwords")]
         no_import_passwords: bool,
-        /// Register this profile as a UBB slot (loads the extension and pairs it)
+        /// Register this profile as a browser slot (loads the extension and pairs it)
         #[arg(long)]
-        ubb: bool,
+        pair: bool,
     },
     /// Screen recording (JPEG frames -> mp4, or an HTML player when ffmpeg is missing)
     Rec {
@@ -1237,6 +1238,13 @@ fn main() {
             // `cua child ...` / `cua --child ...` is a proxy, so it must not be
             // parsed by the main-session CLI. Everything else keeps its old shape.
             let raw: Vec<String> = std::env::args().collect();
+            // Chrome starts a native-messaging host as `<exe> <origin>`; that
+            // argv must never reach clap.
+            if let Some(origin) = raw.get(1) {
+                if origin.starts_with("chrome-extension://") {
+                    return browser::native_host(origin).unwrap_or(1);
+                }
+            }
             if let Some(code) = session::maybe_child(&raw) {
                 return code;
             }
@@ -1396,7 +1404,7 @@ fn dispatch(cmd: Cmd) -> i32 {
             Cmd::Sandbox { op } => sandbox::dispatch(op),
             Cmd::Session { op } => session::dispatch(op),
             Cmd::Agent { data_dir } => agent::run(data_dir),
-            Cmd::Browser { rest } => ubb::cmd_browser(&rest),
+            Cmd::Browser { rest } => browser::cmd_browser(&rest),
             Cmd::Edge {
                 urls,
                 fresh_profile,
@@ -1408,7 +1416,7 @@ fn dispatch(cmd: Cmd) -> i32 {
                 browser,
                 import_passwords,
                 no_import_passwords,
-                ubb,
+                pair,
             } => {
                 edge::cmd_edge(edge::EdgeOptions {
                     urls,
@@ -1420,7 +1428,7 @@ fn dispatch(cmd: Cmd) -> i32 {
                     wait_ms,
                     browser,
                     import_passwords: edge::consent_flag(import_passwords, no_import_passwords),
-                    ubb,
+                    pair,
                 })
             }
             Cmd::Rec { op } => match op {
@@ -1720,7 +1728,8 @@ fn cmd_check() -> Result<i32> {
         .unwrap_or(0);
     let cfg = util::load_config();
     let (cx, cy) = input::cursor_pos();
-    let ubb_cli = ubb::resolve().map(|c| c.label());
+    let browser_port = browser::port();
+    let browser_daemon = browser::daemon_alive();
     let out = json!({
         "tool": "cua",
         "version": env!("CARGO_PKG_VERSION"),
@@ -1730,7 +1739,7 @@ fn cmd_check() -> Result<i32> {
         "screen": {"virtual": [vx, vy, vw, vh], "primary": [pw, ph]},
         "cursor": [cx, cy],
         "sandbox": sandbox::status(),
-        "browser": {"backend": "ubb", "cli": ubb_cli},
+        "browser": {"backend": "browser", "port": browser_port, "daemon": browser_daemon},
         "safety": {
             "mode": if cfg.full_mode { "full" } else { "standard" },
             "full_mode": cfg.full_mode,

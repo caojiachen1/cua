@@ -1,4 +1,4 @@
-# install.ps1 — one-click install for cua (UBB-style: build + expose + install skill)
+# install.ps1 — one-click install for cua (build + expose + install skill)
 # Run:  powershell -ExecutionPolicy Bypass -File install.ps1 [-Cuda] [-Autotune]
 param([switch]$Cuda, [switch]$Autotune)
 $ErrorActionPreference = "Stop"
@@ -8,6 +8,8 @@ if (-not $root) { $root = Split-Path -Parent $MyInvocation.MyCommand.Path }
 Write-Host "== [1/6] cargo build --release" -ForegroundColor Cyan
 # A resident perception service locks the old binary on Windows; stop it first.
 if (Test-Path "$root\bin\cua.exe") { & "$root\bin\cua.exe" perception serve --stop 2>$null | Out-Null }
+# The browser daemon is this same binary too — it has to let go before the copy.
+if (Test-Path "$root\bin\cua.exe") { & "$root\bin\cua.exe" browser stop 2>$null | Out-Null }
 # GPU choices come from the agent's install-time question (SKILL.md "Installing
 # with GPU acceleration"); nothing is enabled silently. No flags = WGPU only.
 $features = @()
@@ -45,23 +47,7 @@ if (Test-Path $hostProj) {
     Write-Host "   warning: tools\session-host missing; `cua session` will be unavailable" -ForegroundColor Yellow
 }
 
-Write-Host "== [3/6] build ubb runtime" -ForegroundColor Cyan
-$ubbCrate = Join-Path $root "ubb\rust-cli\Cargo.toml"
-if (Test-Path $ubbCrate) {
-    Push-Location (Join-Path $root "ubb\rust-cli")
-    & cargo build --release
-    $ubbCode = $LASTEXITCODE
-    Pop-Location
-    if ($ubbCode -ne 0) {
-        Write-Host "   warning: ubb build failed; cua browser / cua edge --ubb fall back to a ubb on PATH" -ForegroundColor Yellow
-    } else {
-        Copy-Item (Join-Path $root "ubb\rust-cli\target\release\ubb.exe") (Join-Path $root "ubb\bin\ubb.exe") -Force
-    }
-} else {
-    Write-Host "   warning: ubb\rust-cli missing; cua browser needs a ubb on PATH" -ForegroundColor Yellow
-}
-
-Write-Host "== [4/6] copy binaries to bin\" -ForegroundColor Cyan
+Write-Host "== [3/6] copy binaries to bin\" -ForegroundColor Cyan
 New-Item -ItemType Directory -Force -Path "$root\bin" | Out-Null
 Copy-Item "$root\target\release\cua.exe" "$root\bin\cua.exe" -Force
 Copy-Item "$root\target\release\testpad.exe" "$root\bin\testpad.exe" -Force
@@ -75,19 +61,36 @@ if (Test-Path "$root\tools\vnc\tvnserver.exe") {
 }
     if (Test-Path $sessionHostConfig) { Copy-Item $sessionHostConfig "$root\bin\cua-session-host.exe.config" -Force }
 }
-# The vendored UBB runtime, when it was built above.
-$ubbExe = Join-Path $root "ubb\bin\ubb.exe"
-if (Test-Path $ubbExe) { Copy-Item $ubbExe "$root\bin\ubb.exe" -Force }
 # ONNX Runtime DirectML (Florence GPU path) and any runtime DLL copied by ort.
 foreach ($dll in @("DirectML.dll", "onnxruntime.dll")) {
     $src = Join-Path "$root\target\release" $dll
     if (Test-Path $src) { Copy-Item $src (Join-Path "$root\bin" $dll) -Force }
 }
 
+Write-Host "== [4/6] install browser extension" -ForegroundColor Cyan
+# The bridge daemon is linked into cua.exe; what the browser needs is the
+# unpacked extension. `cua browser install` copies it next to the data dir and
+# registers the native-messaging host so it pairs without a token. Runs on the
+# copy in bin\ so the host manifest points at the binary that stays installed.
+$installedCua = Join-Path $root "bin\cua.exe"
+if (Test-Path $installedCua) {
+    & $installedCua browser install | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "   warning: cua browser install failed; run it again after the install" -ForegroundColor Yellow
+    }
+} else {
+    Write-Host "   warning: bin\cua.exe missing; run 'cua browser install' once the install completes" -ForegroundColor Yellow
+}
+
 Write-Host "== [5/6] install skill to ~\.agents\skills\cua" -ForegroundColor Cyan
 $skillDir = Join-Path $env:USERPROFILE ".agents\skills\cua"
 New-Item -ItemType Directory -Force -Path $skillDir | Out-Null
 Copy-Item "$root\SKILL.md" "$skillDir\SKILL.md" -Force
+# the browser subsystem ships its own agent skill (tool catalog, challenge
+# recipes, pitfalls) — INSTALL.md tells agents to copy it once
+$browserSkillDir = Join-Path $env:USERPROFILE ".agents\skills\cua-browser"
+New-Item -ItemType Directory -Force -Path $browserSkillDir | Out-Null
+Copy-Item "$root\browser\SKILL.md" "$browserSkillDir\SKILL.md" -Force
 # ensure exe on user PATH
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
 if ($userPath -notlike "*$root\bin*") {
@@ -105,5 +108,6 @@ Write-Host "Installed:" -ForegroundColor Green
 Write-Host "  CLI      : $root\bin\cua.exe"
 Write-Host "  Skill    : $skillDir\SKILL.md"
 Write-Host "  Session  : $root\bin\cua-session-host.exe"
+Write-Host "  Browser  : cua browser install -> load the extension once, then 'cua browser status'"
 Write-Host "  Try      : cua apps | cua state --window Notepad | cua sandbox start --exe notepad"
 Write-Host "  Child    : cua session setup (admin once) -> sign out/in -> cua session start"

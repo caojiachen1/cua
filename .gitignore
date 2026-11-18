@@ -34,9 +34,7 @@ PROGRESS*.md
 STATUS*.md
 *进度*.md
 
-# UBB build output and runtime state
-ubb/rust-cli/target/
-ubb/node_modules/
-ubb/*.log
-ubb/*.pid
-ubb/*.pem
+# Browser extension runtime state (the unpacked copy lives in the data dir)
+browser/*.log
+browser/*.pid
+browser/*.pem

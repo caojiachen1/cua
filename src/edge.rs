@@ -11,8 +11,8 @@
 //! profile, so a machine never silently switches browser mid-profile.
 //!
 //! First version deliberately uses the existing UIA/screenshot/real-input
-//! commands (`cua child state/click/set-value/...`) instead of CDP or UBB.
-//! `cua browser` stays the UBB bridge to the user's own browser.
+//! commands (`cua child state/click/set-value/...`) instead of raw CDP or the
+//! browser extension. `cua browser` is the bridge to the user's own browser.
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -225,7 +225,7 @@ pub struct EdgeOptions {
     pub wait_ms: u64,
     pub browser: Option<BrowserPref>,
     pub import_passwords: Option<bool>,
-    pub ubb: bool,
+    pub pair: bool,
 }
 
 /// `cua child edge ...` entry point. The child agent executes `cua edge ...`
@@ -312,10 +312,10 @@ pub fn cmd_edge(opts: EdgeOptions) -> Result<i32> {
     };
     let purge_import = new_profile && consent == ImportConsent::No;
 
-    // `--ubb` registers this profile as a UBB slot: mint the one-shot pair URL
-    // here and let the browser open it as its first tab.
-    let mut pair: Option<UbbPair> = None;
-    if opts.ubb {
+    // `--pair` registers this profile as a browser slot: mint the one-shot pair
+    // URL here and let the browser open it as its first tab.
+    let mut pair: Option<BrowserPair> = None;
+    if opts.pair {
         match pair_profile(kind) {
             Ok(p) => pair = Some(p),
             Err(e) => {
@@ -465,7 +465,7 @@ pub fn cmd_edge(opts: EdgeOptions) -> Result<i32> {
         "processes_stopped": stopped,
     });
     if let Some(p) = &pair {
-        extra["ubb"] = json!({
+        extra["browser"] = json!({
             "slot": p.slot,
             "pair_url": p.pair_url,
             "extension_dir": p.extension_dir.display().to_string(),
@@ -1449,7 +1449,7 @@ fn spawn_browser(
     spawn_browser_with(exe, profile, automation, cdp_port, urls, None)
 }
 
-/// Launch with an optional UBB pairing tab: the pair page goes first (it
+/// Launch with an optional pairing tab: the pair page goes first (it
 /// registers the slot), the caller's URLs follow.
 fn spawn_browser_with(
     exe: &Path,
@@ -1457,7 +1457,7 @@ fn spawn_browser_with(
     automation: bool,
     cdp_port: Option<u16>,
     urls: &[String],
-    pair: Option<&UbbPair>,
+    pair: Option<&BrowserPair>,
 ) -> Result<u32> {
     let mut tabs: Vec<String> = Vec::new();
     if let Some(p) = pair {
@@ -1525,43 +1525,43 @@ fn spawn_browser_args(exe: &Path, args: &[String], minimized: bool) -> Result<u3
     Ok(pi.dwProcessId)
 }
 
-// ---------------------------------------------------------------- UBB pairing
+// ------------------------------------------------------------- browser pairing
 
 /// What `browser.pair` minted: cua launches the browser itself, so the pair
 /// page must be the first tab of that launch.
 #[derive(Clone, Debug)]
-struct UbbPair {
+struct BrowserPair {
     slot: String,
     pair_url: String,
     extension_dir: PathBuf,
     extension_id: String,
 }
 
-fn ubb_slot(kind: BrowserKind) -> &'static str {
+fn browser_slot(kind: BrowserKind) -> &'static str {
     match kind {
         BrowserKind::Edge => "cuaedge",
         BrowserKind::Chrome => "cuachrome",
     }
 }
 
-fn pair_profile(kind: BrowserKind) -> Result<UbbPair> {
-    // Inside the child session the ubb CLI would auto-start a daemon *there*,
-    // which answers the pair call but leaves the launch hanging; the daemon has
-    // to be up in the main session before anything pairs.
-    if in_child_session() && !crate::ubb::daemon_alive() {
+fn pair_profile(kind: BrowserKind) -> Result<BrowserPair> {
+    // Inside the child session our own client would auto-start a daemon
+    // *there*, which answers the pair call but leaves the launch hanging; the
+    // daemon has to be up in the main session before anything pairs.
+    if in_child_session() && !crate::browser::daemon_alive() {
         anyhow::bail!(
-            "no UBB daemon on 127.0.0.1:{} — start it in the main session first (`ubb status`), then retry",
-            crate::ubb::daemon_port()
+            "no browser daemon on 127.0.0.1:{} — start it in the main session first (`cua browser status`), then retry",
+            crate::browser::port()
         );
     }
-    let ext = crate::ubb::extension_dir().ok_or_else(|| {
+    let ext = crate::browser::extension_dir().ok_or_else(|| {
         anyhow::anyhow!(
-            "UBB extension not found: set CUA_UBB_EXTENSION_DIR or `ubb_extension_dir` in the cua config"
+            "browser extension not found: run `cua browser install` (or set CUA_BROWSER_EXTENSION_DIR)"
         )
     })?;
-    let slot = ubb_slot(kind);
+    let slot = browser_slot(kind);
     let ext_str = ext.display().to_string();
-    let v = match crate::ubb::call_json(
+    let v = match crate::browser::call_json(
         "browser.pair",
         &serde_json::json!({
             "name": slot,
@@ -1571,11 +1571,11 @@ fn pair_profile(kind: BrowserKind) -> Result<UbbPair> {
         Ok(v) => v,
         Err(e) => {
             let msg = format!("{e:#}");
-            // A daemon left over from an older UBB install answers but has no
+            // A daemon left over from an older install answers but has no
             // browser.pair; cua cannot fix that without killing it.
             if msg.contains("UNKNOWN_TOOL") {
                 anyhow::bail!(
-                    "{msg}\n(hint: the running UBB daemon predates this CLI — run `ubb daemon stop`, then retry; cua restarts the daemon from this repository)"
+                    "{msg}\n(hint: the running daemon is older than this cua — run `cua browser stop`, then retry)"
                 );
             }
             return Err(e);
@@ -1584,8 +1584,8 @@ fn pair_profile(kind: BrowserKind) -> Result<UbbPair> {
     let pair_url = v
         .get("pair_url")
         .and_then(|x| x.as_str())
-        .ok_or_else(|| anyhow::anyhow!("ubb browser.pair returned no pair_url"))?;
-    Ok(UbbPair {
+        .ok_or_else(|| anyhow::anyhow!("browser.pair returned no pair_url"))?;
+    Ok(BrowserPair {
         slot: v
             .get("slot")
             .and_then(|x| x.as_str())
@@ -1651,7 +1651,7 @@ fn launch_without_import(
     automation: bool,
     cdp_port: Option<u16>,
     urls: &[String],
-    pair: Option<&UbbPair>,
+    pair: Option<&BrowserPair>,
 ) -> Result<(u32, Vec<String>, usize)> {
     spawn_browser_minimized(exe, profile).context("first-run launch (minimized)")?;
 
@@ -2758,8 +2758,8 @@ mod tests {
             Path::new(r"C:\CuaEdge"),
             false,
             None,
-            &["http://127.0.0.1:8765/__ubb_pair?nonce=x".into()],
-            Some(Path::new(r"D:\Codebase\cua\ubb")),
+            &["http://127.0.0.1:8765/__cua_pair?nonce=x".into()],
+            Some(Path::new(r"D:\Codebase\cua\browser\extension")),
         );
         let ext = args
             .iter()
@@ -2770,13 +2770,13 @@ mod tests {
             .position(|a| a.starts_with("http://"))
             .expect("pair url missing");
         assert!(ext < url, "the switch must precede the first tab");
-        assert_eq!(args[ext], r"--load-extension=D:\Codebase\cua\ubb");
+        assert_eq!(args[ext], r"--load-extension=D:\Codebase\cua\browser\extension");
     }
 
     #[test]
-    fn ubb_slots_are_per_browser() {
-        assert_eq!(ubb_slot(BrowserKind::Edge), "cuaedge");
-        assert_eq!(ubb_slot(BrowserKind::Chrome), "cuachrome");
+    fn browser_slots_are_per_browser() {
+        assert_eq!(browser_slot(BrowserKind::Edge), "cuaedge");
+        assert_eq!(browser_slot(BrowserKind::Chrome), "cuachrome");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 ﻿# tests\e2e3.ps1 - phase-3: a11y patterns (toggle/select/range), right/double by index,
 # background (message-level) input on the user desktop, hover/cursor/wait/resize, exact-title
 # selectors, window-scoped shot guard, diff value changes, sandbox multi-app + a11y parity,
-# browser bridge (UBB: session/tab/find/click/evaluate/screenshot) and env hygiene.
+# browser bridge (session/tab/find/click/evaluate/screenshot) and env hygiene.
 $ErrorActionPreference = "Continue"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
@@ -296,14 +296,13 @@ Check "D12 sandbox apps invisible on user desktop" ((@($userApps.windows | Where
 $r = J (RunCua sandbox stop)
 Check "D13 sandbox stop cleans up" ($r.killed_processes -ge 2) "$($r.killed_processes)"
 
-# ---------- E. browser bridge (UBB) ----------
-# cua has no browser of its own: `cua browser ...` forwards to the ubb CLI, which drives
-# the user's real Edge through the UBB extension. Needs a fixture server, so it is gated.
-$ubbReady = $false
-$chk = J (RunCua check)
-$ubbCli = $chk.browser.cli
+# ---------- E. browser bridge ----------
+# cua has no browser of its own: `cua browser ...` talks to the bridge daemon inside
+# cua.exe, which drives the user's real Edge through the CUA Browser extension.
+# Needs a fixture server, so it is gated.
+$browserReady = $false
 $st = J (RunCua browser status)
-if ($st.status -eq "ok" -and $st.result.extension -eq $true) { $ubbReady = $true }
+if ($st.status -eq "ok" -and $st.result.extension -eq $true) { $browserReady = $true }
 $py = $null
 if (Get-Command python -ErrorAction SilentlyContinue) { $py = "python" }
 # A fixed port collided with servers leaked by earlier failed runs. Pick a free
@@ -315,7 +314,7 @@ try {
 } catch { $port = 8799 }
 $srv = $null
 $fixtureOk = $false
-if ($ubbReady -and $py) {
+if ($browserReady -and $py) {
     $srv = Start-Process -FilePath $py `
         -ArgumentList @("-m", "http.server", "$port", "--bind", "127.0.0.1", "--directory", (Join-Path $root "tests\fixtures")) `
         -PassThru -WindowStyle Hidden
@@ -324,21 +323,20 @@ if ($ubbReady -and $py) {
         catch { Start-Sleep -Milliseconds 200 }
     }
 }
-$browserRun = $ubbReady -and $py -and $fixtureOk
+$browserRun = $browserReady -and $py -and $fixtureOk
 if ($browserRun) {
-    Check "E0 ubb extension + fixture server ready" $true "ubb=$ubbReady python=$($null -ne $py) port=$port"
-} elseif ($ubbReady -and $py -and -not $fixtureOk) {
-    Check "E0 ubb extension + fixture server ready" $false "fixture server did not serve page1 on port $port"
-} elseif (-not $ubbCli -or -not $py) {
-    # A missing ubb CLI or python is environmental. A CLI that exists but whose
-    # status/bridge call fails is a regression and must stay a failure.
-    Skip "E0 ubb extension + fixture server ready" "ubb CLI=$ubbCli python=$($null -ne $py)"
+    Check "E0 browser extension + fixture server ready" $true "browser=$browserReady python=$($null -ne $py) port=$port"
+} elseif ($browserReady -and $py -and -not $fixtureOk) {
+    Check "E0 browser extension + fixture server ready" $false "fixture server did not serve page1 on port $port"
+} elseif (-not $py) {
+    # A missing python is environmental; a broken bridge is a regression.
+    Skip "E0 browser extension + fixture server ready" "python missing"
 } elseif ($st.status -eq "ok") {
     # The daemon answers but the Edge extension is not connected (browser closed).
-    # Rerun the browser section after opening Edge with the UBB extension.
-    Skip "E0 ubb extension + fixture server ready" "ubb daemon ok, extension not connected"
+    # Rerun the browser section after loading the CUA Browser extension once.
+    Skip "E0 browser extension + fixture server ready" "daemon ok, extension not connected"
 } else {
-    Check "E0 ubb extension + fixture server ready" $false "ubb CLI present but status failed: $($st.detail)"
+    Check "E0 browser extension + fixture server ready" $false "status failed: $($st.detail)"
 }
 if ($browserRun) {
     $base = "http://127.0.0.1:$port"
@@ -371,13 +369,13 @@ if ($browserRun) {
     Check "E11 tab.list marks the session tab" ($mine.Count -ge 1) "$($tl.result.tabs.Count) tabs"
     & $cua browser tab.select (JsonArg @{ tab_id = $mine[0].tab_id }) | Out-Null
     Start-Sleep -Milliseconds 800
-    $shotPath = Join-Path $cache "ubb-shot.png"
+    $shotPath = Join-Path $cache "browser-shot.png"
     Remove-Item $shotPath -Force -ErrorAction SilentlyContinue
     $sh = J (RunCua browser screenshot --out $shotPath)
     $bytes = if (Test-Path $shotPath) { (Get-Item $shotPath).Length } else { 0 }
     Check "E12 screenshot of the selected tab" ($sh.status -eq "ok" -and $bytes -gt 1000) "bytes=$bytes $($sh.detail)"
     $bad = RunErr browser no.such.tool
-    Check "E13 unknown ubb tool exits 1" ($LASTEXITCODE -eq 1 -and $bad -like "*failed*") "exit=$LASTEXITCODE"
+    Check "E13 unknown browser tool exits 1" ($LASTEXITCODE -eq 1 -and $bad -like "*failed*") "exit=$LASTEXITCODE"
     $sp = J (RunCua browser session.stop)
     Check "E14 session.stop" ($sp.result.stopped -eq $true) "$($sp.detail)"
     Start-Sleep -Milliseconds 800

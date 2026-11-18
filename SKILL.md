@@ -5,8 +5,8 @@ description: |
   (UIA trees + screenshots incl. background/occluded windows), a11y-first
   actions (element index > ValuePattern > coordinates), real SendInput,
   message-level and hidden-desktop sandbox control that never disturbs the
-  user, recording/replay with per-step verification, browser control bridged to
-  UBB (the user's own Edge/Chrome),
+  user, recording/replay with per-step verification, browser control through
+  the user's own logged-in Edge/Chrome (CUA Browser extension),
   clipboard, local grounding, and Qoder/ZCode-style safety (receipts,
   no-negotiable deny list, stale-shot guard, confirm levels). Use for any task
   needing a native desktop app's UI or the OS. Main agent only.
@@ -105,7 +105,7 @@ cua state --window <sel> --perception vision --detail fast       # works occlude
 cua perception click-element --observation-id <id> --element-id "vision:..." --background
 cua perception visualize --image shot.png --detail full --out annotated.png
 cua perception visualize --observation-id <id> --out obs.png  # exact elements the agent saw
-toolsench-perception.ps1 [-Manifest set.json]               # OCR recall + latency, repeatable
+tools\bench-perception.ps1 [-Manifest set.json]               # OCR recall + latency, repeatable
 tools\gen-ui-dataset.ps1 -OutDir <dir>                        # synthetic light/dark en/zh set
 cua state --window <sel> --perception hybrid --redact        # mask text + blur pixels
 
@@ -376,14 +376,14 @@ clone the user's current windows; it runs as the user and is not a security boun
 optional password saved by `cua session login` lives in Windows Credential Manager under the
 current Windows user; it is never printed in cua state, pipes or logs. Use `cua session logout`
 to remove it.
-Keep the user's browser tasks in the main session via `cua browser` (ubb); for browser work
+Keep the user's browser tasks in the main session via `cua browser`; for browser work
 inside the child session use `cua child edge` (a separate CuaEdge profile). Do not use
 `cua child browser` for the user's logged-in browser, because the child has a separate
 profile/instance. Use a VM instead when the task must be isolated from the user's files.
 
 ## Child-session browser (`cua child edge` — independent Edge/Chrome profile)
 
-The user's Edge profile is one-desktop-only and belongs to `cua browser` (UBB) in the main
+The user's Edge profile is one-desktop-only and belongs to `cua browser` in the main
 session. Browser work that must happen in the child session uses its own persistent profile:
 
 ```bash
@@ -419,15 +419,15 @@ prompt; on a **new** profile the no-import path opens it minimized, stops that i
 removed under `profile_import.purged` (measured: 462 logins before, 0 after). Existing profiles
 are never modified, and this is convenience, not isolation — the same Windows user can read it.
 
-### Pairing the profile with UBB (`cua edge --ubb`)
+### Pairing the profile with the extension (`cua edge --pair`)
 
-`cua edge --ubb` / `cua child edge --ubb` register this profile as a UBB slot (`cuaedge`, or
-`cuachrome` for Chrome): cua takes a one-shot `browser.pair` nonce from the daemon, launches
-the browser with the vendored extension (`ubb/`) and the pair page as the first tab. Afterwards
-the whole UBB catalog drives that profile:
+`cua edge --pair` / `cua child edge --pair` register this profile as a browser slot (`cuaedge`,
+or `cuachrome` for Chrome): cua takes a one-shot `browser.pair` nonce from the daemon, launches
+the browser with the extension (`browser/extension/`) and the pair page as the first tab.
+Afterwards the whole tool catalog drives that profile:
 
 ```bash
-cua edge --ubb https://example.com          # launch + pair in one step
+cua edge --pair https://example.com          # launch + pair in one step
 cua browser --browser cuaedge tab.list '{}'
 cua browser --browser cuaedge challenge.detect '{}'
 cua browser --browser cuaedge challenge.solve '{"mode":"slider"}'
@@ -436,7 +436,8 @@ cua browser --browser cuaedge challenge.solve '{"mode":"slider"}'
 The daemon may run in the main session (localhost is shared across Windows sessions). Pairing
 goes through a content script because web pages can no longer message unpacked extensions; the
 page only carries a single-use nonce (120 s TTL), the credentials come from the daemon. Needs
-`ubb/` in this repository and a UBB daemon; `--ubb` is not accepted by `cua session edge`.
+`cua browser install` once (it copies the extension and registers the native-messaging host);
+`--pair` is not accepted by `cua session edge`.
 
 `--cdp` is opt-in and reports `cdp.port` / `cdp.browser_ws` in the launch receipt and
 `cua edge --status`; `/json/version` and `/json/list` are localhost-only and live only while
@@ -491,14 +492,17 @@ same session opens a new window in the existing instance. `--fresh-profile` uses
 `%TEMP%` profile. Do not launch `msedge.exe`/`chrome.exe` through `cua child launch`; it is refused on
 purpose in the child session (use `cua child edge`).
 
-## Browser (bridged to UBB — the user's own Edge/Chrome)
+## Browser (the user's own Edge/Chrome)
 
-cua has no browser of its own. `cua browser <ubb-tool> [json]` forwards to the `ubb`
-CLI (extension + local daemon), which drives the browser the user is actually logged into.
+cua has no browser of its own. `cua browser <tool> [json]` talks to a small daemon inside
+`cua.exe` (loopback WebSocket), which routes to the CUA Browser extension in the browser the
+user is actually logged into. First run: `cua browser install`, then load the extension once in `edge://extensions`
+(Developer mode → Load unpacked) — `%LOCALAPPDATA%\cua\browser-ext` or the checkout
+copy `browser/extension`; either works (both origins are registered).
 
 ```bash
-cua browser status                        # daemon + extension health
-cua browser session.start                 # creates the "⏳ UBB" tab group
+cua browser status                        # daemon + extension health (auto-starts)
+cua browser session.start                 # creates the "⏳ CUA" tab group
 cua browser tab.create '{"url":"example.com"}'
 cua browser snapshot                      # @eN refs (re-take after navigation)
 cua browser find '{"query":"Sign in"}'    # keyword search -> refs
@@ -508,16 +512,21 @@ cua browser evaluate '{"expression":"6*7","world":"isolated"}'
 cua browser tab.select '{"tab_id":N}'     # raise, then capture
 cua browser screenshot --out shot.png
 cua browser session.stop                  # always end the task with this
-cua browser list                          # full ubb tool catalog (73 tools)
+cua browser list                          # full tool catalog
 ```
 
-Resolution order for the CLI: `$CUA_UBB`, then `ubb_path` in the cua config, then `PATH`.
-Calls have a hard deadline (`CUA_UBB_TIMEOUT_MS`, config `ubb_timeout_ms`, default 120 s,
-clamped 1 s–30 min) and keep at most 8 MiB of each output stream. On timeout the receipt is
-`failed` with `timed_out: true`; only the process tree started by cua is killed, not the
-user's browser or a separate UBB daemon. If a grandchild keeps a pipe open, cua stops
-waiting for the readers after 2 s instead of hanging.
-Receipts carry `backend: "ubb"`, `cli`, `call` and ubb's own JSON under `result`.
+There is no helper CLI to resolve: the daemon is the same binary, started detached on demand
+and probed with `/health`. Calls have a hard deadline (`CUA_BROWSER_TIMEOUT_MS`, config
+`browser_timeout_ms`, default 120 s, clamped 1 s–30 min); a timeout comes back as a `failed`
+receipt with `timed_out: true` and never kills the user's browser. Config lives in
+`%LOCALAPPDATA%\cua\browser.json` (`token`, `port`, `extension_dir`); overrides are
+`CUA_BROWSER_PORT`, `CUA_BROWSER_TOKEN`, `CUA_BROWSER_EXTENSION_DIR`, `CUA_DATA_DIR`.
+Receipts carry `backend: "browser"`, `call`, `tool` and the tool's own JSON under `result`.
+Extras: `cua browser mcp` runs an MCP stdio adapter (IDE clients register
+`cua.exe browser mcp`; the catalog is fetched live, 181 tools); audit entries
+drain to `%LOCALAPPDATA%\cua\audit\<date>.jsonl` every 30 s; `tunnel.start/
+status/stop` is an opt-in remote relay (default `allow:"read"` = read-only
+whitelist only).
 The bridge never touches the user's tabs: `tab.list` marks every agent tab
 `session_owned: true`, and `session.stop` closes exactly those.
 Gotchas: `file://` needs "Allow access to file URLs" on the extension (use a local HTTP

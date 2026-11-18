@@ -1,5 +1,5 @@
 ﻿# tests\e2e2.ps1 — phase-2 deep e2e: selectors, unicode/drag/keys, capture, error paths,
-# config override, sandbox deep, ubb bridge contract, window ops, exit codes.
+# config override, sandbox deep, browser bridge contract, window ops, exit codes.
 $ErrorActionPreference = "Continue"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
@@ -215,41 +215,21 @@ Check "F8 user foreground unchanged by sandbox" ($fgBefore -eq $fgAfter) "$fgBef
 $r = J (RunCua sandbox stop)
 Check "F10 sandbox stop kills app+keeper" ($r.killed_processes -ge 2) "$($r.killed_processes)"
 
-# ---------- G. ubb bridge: cli resolution + argument passthrough ----------
-# A stub CLI (node .mjs) proves the contract without touching the user's browser.
-$stub = Join-Path $cache "ubb-stub.mjs"
-Set-Content -Path $stub -Value 'console.log(JSON.stringify({ got: process.argv.slice(2) }))' -Encoding Ascii
-$prevUbb = $env:CUA_UBB
-$env:CUA_UBB = $stub
+# ---------- G. browser bridge: in-process client ----------
+# There is no helper CLI any more: the daemon is linked into cua.exe, so what is
+# left to check is the receipt shape and that a dead port fails instead of hanging.
 $r = J (RunCua browser status)
-Check "G1 ubb cli resolved from `$env:CUA_UBB" ($r.status -eq "ok" -and $r.backend -eq "ubb" -and $r.cli -like "*ubb-stub.mjs") "$($r.cli)"
-Check "G2 tool name forwarded" ($r.result.got[0] -eq "status") ($r.result.got -join "|")
-$params = (@{ url = "http://x/y" } | ConvertTo-Json -Compress)
-$wire = JsonArg @{ url = "http://x/y" }
-$r = J (RunCua browser tab.create $wire)
-Check "G3 json arg forwarded verbatim" ($r.result.got[0] -eq "tab.create" -and $r.result.got[1] -eq $params) ($r.result.got -join "|")
-$stubFail = Join-Path $cache "ubb-stub-fail.mjs"
-Set-Content -Path $stubFail -Value 'console.log(JSON.stringify({ code: "TOOL_FAILED", message: "no such tool" })); process.exit(1)' -Encoding Ascii
-$env:CUA_UBB = $stubFail
-$err = RunErr browser no.such.tool "{}"
-Check "G4 cli failure maps to receipt failed" ($LASTEXITCODE -eq 1 -and $err -like "*failed*" -and $err -like "*no such tool*") "exit=$LASTEXITCODE"
-$env:CUA_UBB = Join-Path $cache "missing-ubb.mjs"
-$prevPath = $env:PATH
-$env:PATH = "$env:SystemRoot\System32"
-$err = RunErr browser status
-$env:PATH = $prevPath
-Check "G5 missing ubb cli reports not found" ($LASTEXITCODE -eq 1 -and $err -like "*not found*") ($err.Substring(0, [Math]::Min(70, $err.Length)))
-# a hung bridge must not hang cua forever
-$stubHang = Join-Path $cache "ubb-stub-hang.mjs"
-Set-Content -Path $stubHang -Value 'setTimeout(()=>{}, 60000)' -Encoding Ascii
-$env:CUA_UBB = $stubHang
-$env:CUA_UBB_TIMEOUT_MS = "1000"
+Check "G1 browser status reports backend+port" ($r.status -eq "ok" -and $r.backend -eq "browser" -and $r.port -gt 0) "$($r.backend) port=$($r.port)"
+Check "G2 status carries daemon and extension state" ($null -ne $r.result.daemon -and $null -ne $r.result.extension) "daemon=$($r.result.daemon) ext=$($r.result.extension)"
+$env:CUA_BROWSER_PORT = "8799"
+$env:CUA_DATA_DIR = Join-Path $cache "browser-port-test"
 $sw = [Diagnostics.Stopwatch]::StartNew()
-$r = J (RunCua browser status)
+$r9 = J (RunCua browser status)
 $sw.Stop()
-Check "G6 hung ubb call times out and is killed" ($r.status -eq "failed" -and $r.timed_out -eq $true -and $sw.ElapsedMilliseconds -lt 8000) "status=$($r.status) timed_out=$($r.timed_out) ms=$($sw.ElapsedMilliseconds)"
-Remove-Item Env:CUA_UBB_TIMEOUT_MS -ErrorAction SilentlyContinue
-if ($prevUbb) { $env:CUA_UBB = $prevUbb } else { Remove-Item Env:CUA_UBB -ErrorAction SilentlyContinue }
+Check "G3 isolated port starts its own daemon quickly" ($r9.daemon -eq $true -and $sw.ElapsedMilliseconds -lt 20000) "daemon=$($r9.daemon) ms=$($sw.ElapsedMilliseconds)"
+& $cua browser stop 2>$null | Out-Null
+Remove-Item Env:CUA_BROWSER_PORT -ErrorAction SilentlyContinue
+Remove-Item Env:CUA_DATA_DIR -ErrorAction SilentlyContinue
 
 # ---------- H. window ops deep ----------
 & $cua launch --exe $testpad | Out-Null

@@ -187,11 +187,11 @@ for ($k = 0; $k -lt 12; $k++) {
 Check "sandbox isolation: fixture invisible on user desktop" $gone ("leaked: " + (($r.windows | Where-Object { $_.process -eq "testpad.exe" } | ForEach-Object { "pid=$($_.pid)" }) -join ","))
 & $cua sandbox stop | Out-Null
 
-# ---------- 17. browser bridge (UBB) contract ----------
+# ---------- 17. browser bridge contract ----------
 $help = (& $cua browser help 2>&1) -join "`n"
-Check "browser help: documents the ubb bridge" ($help -like "*ubb*" -and $help -like "*session.start*") ($help.Substring(0, [Math]::Min(60, $help.Length)))
+Check "browser help: documents the tool loop" ($help -like "*cua browser*" -and $help -like "*session.start*") ($help.Substring(0, [Math]::Min(60, $help.Length)))
 $ck = J (RunCua check)
-Check "check: browser backend is ubb" ($ck.browser.backend -eq "ubb") ($ck.browser | ConvertTo-Json -Compress)
+Check "check: browser backend is the built-in bridge" ($ck.browser.backend -eq "browser") ($ck.browser | ConvertTo-Json -Compress)
 $err = RunErr browser shot --out "$cache\e2e-browser-scope.png"
 Check "old CDP subcommand is gone" ($err -like "*failed*" -or $err -like "*not found*") ($err.Substring(0, [Math]::Min(70, $err.Length)))
 

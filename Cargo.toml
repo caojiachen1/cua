@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "cua - Windows computer-use CLI (fusion of Trae / Qoder / ZCode designs)"
 
+[workspace]
+members = ["crates/browser-bridge"]
+
 [features]
 default = ["candle"]
 # Pure-Rust Florence decoder (KV cache); the default caption backend.
@@ -47,6 +50,10 @@ candle-nn = { version = "0.9.2", optional = true }
 imageproc = "0.25"
 ab_glyph = "0.2"
 ureq = "2"
+base64 = "0.22"
+# The browser bridge daemon + client, linked in-process so `cua browser` never
+# has to resolve or spawn a helper binary.
+cua-browser-bridge = { path = "crates/browser-bridge" }
 
 [dependencies.windows]
 version = "0.58"
