@@ -24,6 +24,7 @@
 //! invisible, so a pointer preview there would be a lie.
 
 use serde_json::{json, Value};
+use std::io::Write as _;
 use std::net::UdpSocket;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -138,11 +139,32 @@ fn spawn_host() -> bool {
 
 /// Fire-and-forget: make sure the host is alive, then send the packet. The
 /// only blocking part is the one-time host spawn wait (≤2 s per session);
-/// every send is sub-millisecond and best-effort.
-pub fn emit(spec: Spec) {
-    // async is safe for the pre packet: dispatch keeps running after the
-    // spawn, so the thread gets its full lifetime
-    std::thread::spawn(move || deliver(spec));
+/// every send is sub-millisecond and best-effort. Returns a handle the caller
+/// can settle on — fast actions (clipboard, set-value) finish so quickly that
+/// a detached pre thread would otherwise be killed by process exit before its
+/// send ran.
+pub fn emit(spec: Spec) -> PreEmit {
+    // async is safe for the pre packet as long as the caller settles before
+    // returning: dispatch keeps running through the action
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        deliver(spec);
+        let _ = tx.send(());
+    });
+    PreEmit { done: rx }
+}
+
+/// Handle to the in-flight pre packet. `settle` waits briefly for it so a
+/// fast action does not tear the thread down before the UDP send ran, and so
+/// the pre is always on the wire before the post.
+pub struct PreEmit {
+    done: std::sync::mpsc::Receiver<()>,
+}
+
+impl PreEmit {
+    pub fn settle(&self, timeout: std::time::Duration) {
+        let _ = self.done.recv_timeout(timeout);
+    }
 }
 
 /// Synchronous variant for the post packet. The CLI is about to exit by the
@@ -163,12 +185,12 @@ fn deliver(spec: Spec) {
     let spec = match (&spec.window_sel, spec.x, spec.y) {
         (Some(sel), None, None) => {
             let centered = match crate::win::resolve_window(sel) {
-                Ok(hwnd) => match crate::win::window_rect(hwnd) {
-                    Ok([rx, ry, rw, rh]) => Some((rx + rw / 2, ry + rh / 2)),
-                    _ => None,
-                },
-                Err(_) => None,
-            };
+                    Ok(hwnd) => match crate::win::window_rect(hwnd) {
+                        Ok([rx, ry, rw, rh]) => Some(anchored_centre(rx, ry, rw, rh)),
+                        _ => None,
+                    },
+                    Err(_) => None,
+                };
             match centered {
                 Some((x, y)) => {
                     let mut s2 = spec.clone();
@@ -232,6 +254,33 @@ fn deliver(spec: Spec) {
     }
 }
 
+/// Clamp a rect centre into the visible virtual screen: minimized and
+/// off-screen windows report coords like -32000, and a preview anchored there
+/// would be invisible. Off-screen centres snap to the virtual-screen centre.
+fn virtual_screen() -> (i32, i32, i32, i32) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+        SM_YVIRTUALSCREEN,
+    };
+    unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    }
+}
+
+fn anchored_centre(rx: i32, ry: i32, rw: i32, rh: i32) -> (i32, i32) {
+    let (vx, vy, vw, vh) = virtual_screen();
+    let (cx, cy) = (rx + rw / 2, ry + rh / 2);
+    if cx < vx || cx > vx + vw || cy < vy || cy > vy + vh {
+        return (vx + vw / 2, vy + vh / 2);
+    }
+    (cx, cy)
+}
+
 /// Maps a dispatched command to its preview packet, or None for commands that
 /// must not show one: read-only probes, the browser (its own in-page cursor
 /// covers it), the sandbox (the hidden desktop is invisible), and the child
@@ -246,10 +295,19 @@ pub fn pre_spec(cmd: &crate::Cmd) -> Option<Spec> {
         t.chars().take(44).collect::<String>()
     };
     // real key input lands on the focused window, so its centre is the honest
-    // anchor for window-less key/type actions
+    // anchor for window-less key/type actions — clamped into the visible
+    // screen because a minimized foreground window reports coords like -32000.
+    // With NO foreground window at all (e.g. an idle RDP child session) the
+    // screen centre is the fallback: the action must still be previewed.
     let fg = || -> Option<(i32, i32)> {
         let hwnd = crate::win::foreground_hwnd();
-        crate::win::window_rect(hwnd).ok().map(|[rx, ry, rw, rh]| (rx + rw / 2, ry + rh / 2))
+        if !hwnd.is_invalid() {
+            if let Ok([rx, ry, rw, rh]) = crate::win::window_rect(hwnd) {
+                return Some(anchored_centre(rx, ry, rw, rh));
+            }
+        }
+        let (vx, vy, vw, vh) = virtual_screen();
+        Some((vx + vw / 2, vy + vh / 2))
     };
     match cmd {
         // every arm below that carries a `sandbox` flag must gate on it: a

@@ -1291,9 +1291,7 @@ fn dispatch(cmd: Cmd) -> i32 {
     // invisible, and the child-side dispatch emits its own preview inside
     // the child session.
     let pv = pointer::pre_spec(&cmd);
-    if let Some(spec) = &pv {
-        pointer::emit(spec.clone());
-    }
+    let pre_emit = pv.as_ref().map(|spec| pointer::emit(spec.clone()));
     let r: Result<i32> = (|| {
         let head_cfg = util::load_config();
         if head_cfg.full_mode {
@@ -1484,8 +1482,12 @@ fn dispatch(cmd: Cmd) -> i32 {
         }
     };
     if let Some(spec) = &pv {
-        // synchronous: dispatch is about to return and main will exit — an
-        // async send would be killed before it hit the wire
+        // settle the pre packet first (fast actions would otherwise exit
+        // before the pre thread's send ran), then the post synchronously —
+        // dispatch is about to return and main will exit
+        if let Some(h) = &pre_emit {
+            h.settle(std::time::Duration::from_millis(250));
+        }
         pointer::emit_sync(pointer::post_from(spec, code == 0));
     }
     code
