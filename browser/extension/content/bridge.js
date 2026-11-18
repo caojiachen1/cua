@@ -356,7 +356,7 @@
     try {
       if (!center) return;
       window.dispatchEvent(new CustomEvent('cua-agent-action', {
-        detail: { op, x: center.x, y: center.y, label: String(label || '') },
+        detail: { op, x: center.x, y: center.y, label: String(label || ''), phase: 'post', ok: true },
       }));
     } catch { /* cosmetic only */ }
   }

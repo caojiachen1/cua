@@ -337,6 +337,17 @@ classifies the app as `NO_PROVIDER` / `READ_ONLY` / `A11Y_RECT_ONLY` / `MSG_LEVE
 `A11Y_PARTIAL` / `A11Y_FULL` / `NEEDS_REAL_INPUT` / `CAPTURE_BLACK`. `-SelfTest` checks the
 ladder without touching any app.
 
+## Pointer preview
+
+Every mutating desktop command (`click`, `set-value`, `type`, `key`, `drag`, window moves, …)
+drives a click-through topmost overlay that shows a fake cursor where the action will land,
+what it is doing while it runs, and what it did afterwards — a11y actions point at the target
+window even though the real cursor never moves, and coordinate actions are exact. Inside a
+Child Session the preview runs in that session (the read-only viewer shows it). The overlay is
+a resident host (`cua preview serve`, auto-spawned on first use, `cua preview stop` to exit,
+idle-exits after 30 minutes); disable with `pointer_preview: false` in config.json or
+`CUA_POINTER_PREVIEW=0`.
+
 ## Known limits
 
 The real-app suites need a quiet desktop: they click at screen coordinates, so an unrelated

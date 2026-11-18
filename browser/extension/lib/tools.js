@@ -853,6 +853,7 @@ export function registerTools(dispatcher) {
     if (typeof p.x === 'number' && typeof p.y === 'number') {
       const clicks = p.double ? 2 : 1;
       const dl = {};
+      emitCursor(tabId, { cx: p.x, cy: p.y }, p.double ? '双击' : 'click', null, { phase: 'pre' });
       // fix19: which document receives a bare [x,y] event is unknowable, so the
       // top document's visibility decides (an occluded window hides them all).
       await guardInputVisibility(tabId, { action: 'click', ref: `click@(${p.x},${p.y})` });
@@ -902,6 +903,7 @@ export function registerTools(dispatcher) {
       throw err('NEEDS_CONFIRM', `"${meta.name}" looks like a destructive/paid action — retry with confirm:true after asking the user`);
     }
     await guardFrameInputReachable(tabId, p.ref, meta);
+    emitCursor(tabId, box, p.double ? '双击' : 'click', meta?.name, { phase: 'pre' });
     // fix19: the document that would receive this click is the ref's own frame
     // document (0 = top) — ask IT, and refuse before anything goes out.
     await guardInputVisibility(tabId, { action: 'click', ref: p.ref, frameId: meta?.frameId ?? 0 });
@@ -1130,6 +1132,7 @@ export function registerTools(dispatcher) {
   });
 
   R('press_key', { category: 'interaction', description: 'Press a key with optional modifiers, e.g. key:"s" modifiers:["ctrl"]. Visibility rule (fix19): a key event for a document whose visibilityState is not "visible" is refused BEFORE dispatch (INPUT_NOT_DELIVERED, nothing sent) — the hidden keyboard queue never drains into the page.' }, async (p) => {
+    emitCursor(tabId, await focusedPoint(tabId).catch(() => null), 'press_key', p.key, { phase: 'pre' });
     const tabId = targetTab(p);
     if (!p.key) throw err('BAD_PARAMS', 'key required');
     const mods = modifierBits(p.modifiers);
@@ -1199,6 +1202,7 @@ export function registerTools(dispatcher) {
   });
 
   R('drag', { category: 'interaction', description: `Drag from ref/coords \`from\` to ref/coords \`to\` in 10 interpolated steps. Returns delivered:true + delivery_ms once the document has recorded the press at the start point and the release at the end point (intermediate moves are not required — a browser coalesces them); no such record → INPUT_NOT_DELIVERED, never a silent {dragged:true}. Visibility rule (fix19): every document this drag would touch is asked for its visibilityState first, and a non-visible one is refused BEFORE dispatch (zero events sent, three real exits named) instead of burning ${VISIBLE_WAIT_BUDGET_MS}ms of proof on a queue that never drains; a visible tab pays milliseconds.` }, async (p) => {
+    emitCursor(tabId, null, 'drag', null, { phase: 'pre' });
     const tabId = targetTab(p);
     const pt = async (t) => {
       if (t.ref) {

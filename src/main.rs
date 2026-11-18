@@ -13,6 +13,7 @@ mod edge;
 mod input;
 mod ocr;
 mod perception;
+mod pointer;
 mod rec;
 mod sandbox;
 mod session;
@@ -250,6 +251,13 @@ pub(crate) enum SessionOp {
     Takeover,
     /// Return to read-only observation (shows the mask).
     Release,
+}
+
+/// `cua preview <op>`
+#[derive(clap::Subcommand, Debug)]
+enum PreviewOp {
+    Serve,
+    Stop,
 }
 
 #[derive(Subcommand)]
@@ -771,6 +779,12 @@ enum Cmd {
         #[arg(long)]
         record: Option<String>,
     },
+    /// Pointer preview overlay host / stop
+    #[command(name = "preview")]
+    Preview {
+        #[command(subcommand)]
+        op: PreviewOp,
+    },
     /// Run a sequence of actions from a JSON file (Trae batch)
     Batch {
         #[arg(long)]
@@ -1266,6 +1280,16 @@ fn main() {
 }
 
 fn dispatch(cmd: Cmd) -> i32 {
+    // pointer preview: one pre packet before the action and one post packet
+    // after — fire-and-forget, gated by pointer_preview config /
+    // CUA_POINTER_PREVIEW. Sandbox + browser + child-proxy commands are
+    // skipped: the browser draws its own in-page cursor, the sandbox is
+    // invisible, and the child-side dispatch emits its own preview inside
+    // the child session.
+    let pv = pointer::pre_spec(&cmd);
+    if let Some(spec) = &pv {
+        pointer::emit(spec.clone());
+    }
     let r: Result<i32> = (|| {
         let head_cfg = util::load_config();
         if head_cfg.full_mode {
@@ -1402,6 +1426,10 @@ fn dispatch(cmd: Cmd) -> i32 {
             Cmd::Batch { file, continue_on_error } => cmd_batch(&file, continue_on_error),
             Cmd::Replay { name, verify } => cmd_replay(&name, verify),
             Cmd::Sandbox { op } => sandbox::dispatch(op),
+            Cmd::Preview { op } => match op {
+                PreviewOp::Serve => Ok(pointer::serve()),
+                PreviewOp::Stop => Ok(pointer::stop()),
+            },
             Cmd::Session { op } => session::dispatch(op),
             Cmd::Agent { data_dir } => agent::run(data_dir),
             Cmd::Browser { rest } => browser::cmd_browser(&rest),
@@ -1440,13 +1468,17 @@ fn dispatch(cmd: Cmd) -> i32 {
             },
         }
     })();
-    match r {
+    let code = match r {
         Ok(code) => code,
         Err(e) => {
             eprintln!("error: {e:#}");
             1
         }
+    };
+    if let Some(spec) = &pv {
+        pointer::emit(pointer::post_from(spec, code == 0));
     }
+    code
 }
 
 // ---------------- helpers ----------------

@@ -2415,6 +2415,133 @@ pub async fn health(port: u16, ms: u64) -> Option<Value> {    let fut = async {
 /// How to relaunch ourselves as the daemon. `cua` supplies
 /// `Launch { exe: cua.exe, subcommand: ["browser", "serve"] }`, so the bridge
 /// never has to know the binary name or where it lives.
+
+/// Spawn a fully detached child with NO handle inheritance — the generic form
+/// of `Launch::spawn` (why FALSE matters is documented there). Used by the
+/// pointer-preview host as well: the first preview packet must not wedge the
+/// agent's pipe the way the daemon once did.
+pub fn spawn_detached_process(exe: &str, args: &str) -> bool {
+    #[cfg(windows)]
+    {
+        spawn_detached_windows(exe, args)
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new(exe)
+            .args(args.split_whitespace())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .is_ok()
+    }
+}
+
+#[cfg(windows)]
+fn spawn_detached_windows(exe: &str, args: &str) -> bool {
+    use std::os::windows::ffi::OsStrExt as _;
+    #[repr(C)]
+    struct StartupInfoW {
+        cb: u32,
+        reserved: *mut core::ffi::c_void,
+        desktop: *mut core::ffi::c_void,
+        title: *mut core::ffi::c_void,
+        x: u32,
+        y: u32,
+        x_size: u32,
+        y_size: u32,
+        x_count_chars: u32,
+        y_count_chars: u32,
+        fill_attribute: u32,
+        flags: u32,
+        show_window: u16,
+        cb_reserved2: u16,
+        reserved2: *mut u8,
+        std_input: *mut core::ffi::c_void,
+        std_output: *mut core::ffi::c_void,
+        std_error: *mut core::ffi::c_void,
+    }
+    #[repr(C)]
+    struct ProcessInfo {
+        process: *mut core::ffi::c_void,
+        thread: *mut core::ffi::c_void,
+        process_id: u32,
+        thread_id: u32,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateProcessW(
+            application_name: *const u16,
+            command_line: *mut u16,
+            process_attributes: *const core::ffi::c_void,
+            thread_attributes: *const core::ffi::c_void,
+            inherit_handles: i32,
+            creation_flags: u32,
+            environment: *const core::ffi::c_void,
+            current_directory: *const u16,
+            startup_info: *mut StartupInfoW,
+            process_information: *mut ProcessInfo,
+        ) -> i32;
+        fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
+    }
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    let mut cmd: Vec<u16> = format!("\"{}\" {}", exe, args)
+        .encode_utf16()
+        .collect();
+    cmd.push(0);
+    let mut si = StartupInfoW {
+        cb: std::mem::size_of::<StartupInfoW>() as u32,
+        reserved: std::ptr::null_mut(),
+        desktop: std::ptr::null_mut(),
+        title: std::ptr::null_mut(),
+        x: 0,
+        y: 0,
+        x_size: 0,
+        y_size: 0,
+        x_count_chars: 0,
+        y_count_chars: 0,
+        fill_attribute: 0,
+        flags: 0,
+        show_window: 0,
+        cb_reserved2: 0,
+        reserved2: std::ptr::null_mut(),
+        std_input: std::ptr::null_mut(),
+        std_output: std::ptr::null_mut(),
+        std_error: std::ptr::null_mut(),
+    };
+    let mut pi = ProcessInfo {
+        process: std::ptr::null_mut(),
+        thread: std::ptr::null_mut(),
+        process_id: 0,
+        thread_id: 0,
+    };
+    unsafe {
+        if CreateProcessW(
+            std::ptr::null(),
+            cmd.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0, // bInheritHandles = FALSE
+            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+            std::ptr::null(),
+            std::ptr::null(),
+            &mut si,
+            &mut pi,
+        ) != 0
+        {
+            let _ = CloseHandle(pi.process);
+            let _ = CloseHandle(pi.thread);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// How to relaunch ourselves as the daemon. `cua` supplies
+/// `Launch { exe: cua.exe, subcommand: ["browser", "serve"] }`, so the bridge
+/// never has to know the binary name or where it lives.
 pub struct Launch {
     pub exe: std::path::PathBuf,
     pub subcommand: Vec<String>,
@@ -2429,124 +2556,12 @@ impl Launch {
     /// writes its own log instead of inheriting std handles.
     pub fn spawn(&self, port: u16, token: &str) {
         let args = format!("browser serve --port {port} --token {token}");
-        #[cfg(windows)]
-        {
-            use std::os::windows::ffi::OsStrExt as _;
-            #[repr(C)]
-            struct StartupInfoW {
-                cb: u32,
-                reserved: *mut core::ffi::c_void,
-                desktop: *mut core::ffi::c_void,
-                title: *mut core::ffi::c_void,
-                x: u32,
-                y: u32,
-                x_size: u32,
-                y_size: u32,
-                x_count_chars: u32,
-                y_count_chars: u32,
-                fill_attribute: u32,
-                flags: u32,
-                show_window: u16,
-                cb_reserved2: u16,
-                reserved2: *mut u8,
-                std_input: *mut core::ffi::c_void,
-                std_output: *mut core::ffi::c_void,
-                std_error: *mut core::ffi::c_void,
-            }
-            #[repr(C)]
-            struct ProcessInfo {
-                process: *mut core::ffi::c_void,
-                thread: *mut core::ffi::c_void,
-                process_id: u32,
-                thread_id: u32,
-            }
-            #[link(name = "kernel32")]
-            extern "system" {
-                fn CreateProcessW(
-                    application_name: *const u16,
-                    command_line: *mut u16,
-                    process_attributes: *const core::ffi::c_void,
-                    thread_attributes: *const core::ffi::c_void,
-                    inherit_handles: i32,
-                    creation_flags: u32,
-                    environment: *const core::ffi::c_void,
-                    current_directory: *const u16,
-                    startup_info: *mut StartupInfoW,
-                    process_information: *mut ProcessInfo,
-                ) -> i32;
-                fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
-            }
-            const DETACHED_PROCESS: u32 = 0x0000_0008;
-            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-            let mut cmd: Vec<u16> = format!("\"{}\" {}", self.exe.display(), args)
-                .encode_utf16()
-                .collect();
-            cmd.push(0);
-            let mut si = StartupInfoW {
-                cb: std::mem::size_of::<StartupInfoW>() as u32,
-                reserved: std::ptr::null_mut(),
-                desktop: std::ptr::null_mut(),
-                title: std::ptr::null_mut(),
-                x: 0,
-                y: 0,
-                x_size: 0,
-                y_size: 0,
-                x_count_chars: 0,
-                y_count_chars: 0,
-                fill_attribute: 0,
-                flags: 0,
-                show_window: 0,
-                cb_reserved2: 0,
-                reserved2: std::ptr::null_mut(),
-                std_input: std::ptr::null_mut(),
-                std_output: std::ptr::null_mut(),
-                std_error: std::ptr::null_mut(),
-            };
-            let mut pi = ProcessInfo {
-                process: std::ptr::null_mut(),
-                thread: std::ptr::null_mut(),
-                process_id: 0,
-                thread_id: 0,
-            };
-            unsafe {
-                if CreateProcessW(
-                    std::ptr::null(),
-                    cmd.as_mut_ptr(),
-                    std::ptr::null(),
-                    std::ptr::null(),
-                    0, // bInheritHandles = FALSE — the whole point
-                    DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
-                    std::ptr::null(),
-                    std::ptr::null(),
-                    &mut si,
-                    &mut pi,
-                ) != 0
-                {
-                    let _ = CloseHandle(pi.process);
-                    let _ = CloseHandle(pi.thread);
-                } else {
-                    let _ = std::process::Command::new(&self.exe)
-                        .args(&self.subcommand)
-                        .args(["--port", &port.to_string(), "--token", token])
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .stdin(std::process::Stdio::null())
-                        .spawn();
-                }
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = std::process::Command::new(&self.exe)
-                .args(&self.subcommand)
-                .args(["--port", &port.to_string(), "--token", token])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .stdin(std::process::Stdio::null())
-                .spawn();
+        if !crate::spawn_detached_process(&self.exe.display().to_string(), &args) {
+            eprintln!("warning: failed to spawn the detached daemon");
         }
     }
 }
+
 
 pub async fn wait_daemon(port: u16) -> bool {
     // a 100 MB exe can take several seconds to bind; 5 s gave up too early

@@ -577,6 +577,12 @@ recorded argv keeps `--sandbox`, so replay drives the same hidden desktop.
 - Windows-logo key refused. `close` and `alt+f4` require `--confirm` (Always-Confirm).
 - Coordinate actions need a fresh shot_id. The remaining policy can be tuned via
   `%LOCALAPPDATA%\cua\config.json` (`deny_processes`, `require_shot_id_for_coords`).
+- **Pointer preview**: every mutating desktop command draws a click-through fake cursor at the
+  target ("即将 点击 → 窗口" / "正在 / 已 点击 ✓" with a ripple), so the user can see where the
+  agent's pointer is and what it is doing — including inside a Child Session (each session owns
+  its own preview host; the read-only viewer shows it). Disable with `pointer_preview: false` in
+  config.json or `CUA_POINTER_PREVIEW=0`; `cua preview serve` / `cua preview stop` manage the
+  resident overlay host manually.
 - Every action receipt carries `verification` (not_requested/passed/failed/unknown),
   `evidence` (complete/incomplete), `safety_mode` (standard/full), and (where applicable)
   `input_mode` (auto/a11y/event/background/background-a11y). An action whose recording could not be

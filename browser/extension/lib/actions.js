@@ -12,6 +12,7 @@ import { audit } from './audit.js';
 import { requestDaemon } from './ws-client.js';
 import { redact, redactUrl, truncate } from './redact.js';
 import { err } from './config.js';
+import { cursorEmit } from './cursor.js';
 
 export const DANGEROUS_LABEL =
   /(删除|移除|注销|支付|付款|购买|转账|结算|delete|remove|uninstall|pay\b|purchase|checkout|transfer\b|unsubscribe)/i;
@@ -236,20 +237,25 @@ if (typeof chrome !== 'undefined' && chrome?.storage?.onChanged?.addListener) {
  * {cx,cy}/{x,y}；name 是元素名（截 16 字，取不到就裸动词）。没有可用坐标
  * （type/press_key 读不到焦点盒）就不发 —— 光标不能落在 (0,0) 上骗人。
  */
-export async function emitCursor(tabId, box, op, name) {
+export async function emitCursor(tabId, box, op, name, opts = {}) {
   try {
     if (!(await cursorEnabled())) return false;
     const b = box && typeof box === 'object' ? box : {};
     const hasX = Number.isFinite(b.cx) || Number.isFinite(b.x);
     const hasY = Number.isFinite(b.cy) || Number.isFinite(b.y);
-    if (!hasX || !hasY) return false;
-    const x = Math.round(Number.isFinite(b.cx) ? b.cx : b.x);
-    const y = Math.round(Number.isFinite(b.cy) ? b.cy : b.y);
     const verb = CURSOR_VERBS[op] || String(op || '');
     // 元素名硬截 16 字（气泡一句话，不带 truncate 的省略尾巴）
     const label = name ? `${verb} ${String(name).trim().slice(0, 16)}` : verb;
-    // 无回调 fire-and-forget；拒绝吞掉（目标页无 content script 等）
-    Promise.resolve(chrome.tabs.sendMessage(tabId, { type: 'CUA_CURSOR', x, y, label, op: op || null }, { frameId: 0 })).catch(() => {});
+    // 委托给 cursor.js：懒注入（页面在扩展加载前打开时先注入 overlay 再发）+
+    // act 节流都在那边；这里只负责语义（op/label/phase）。
+    cursorEmit(tabId, {
+      phase: opts.phase || 'post',
+      ok: opts.ok !== false,
+      op: op || null,
+      label,
+      x: hasX ? Math.round(Number.isFinite(b.cx) ? b.cx : b.x) : null,
+      y: hasY ? Math.round(Number.isFinite(b.cy) ? b.cy : b.y) : null,
+    });
     return true;
   } catch {
     return false;
@@ -408,6 +414,16 @@ export async function mouse(tabId, type, x, y, opts = {}) {
   // reaches the wire. No open pass = nothing to confirm (read-only callers and
   // un-armed tabs never pay), same semantics as lib/tools.js's gate.check().
   await assertInputGate(tabId);
+  // cursor preview (act): every CDP dispatch moves the in-page preview dot —
+  // mouseMoved drags are coalesced inside cursorEmit; mousePressed switches the
+  // bubble to 正在点击, mouseReleased closes it with 已点击 + ripple
+  cursorEmit(tabId, {
+    phase: type === 'mouseReleased' ? 'post' : 'act',
+    ok: true,
+    op: type === 'mouseMoved' ? 'hover' : 'click',
+    x: Math.round(x),
+    y: Math.round(y),
+  });
   await cdp.send(tabId, `Input.dispatchMouseEvent`, {
     type,
     x,
@@ -431,6 +447,7 @@ export async function key(tabId, type, keyName, { modifiers = 0, code, text } = 
   // keys rule is re-checked before every Input.dispatchKeyEvent and a refused
   // confirmation throws before this send exists on the wire.
   await assertInputGate(tabId);
+  cursorEmit(tabId, { phase: 'act', ok: true, op: 'press_key', key: keyName, x: null, y: null });
   const k = keyName.toLowerCase();
   const needsText = !/^(control|shift|alt|meta|enter|tab|escape|backspace|delete|arrowup|arrowdown|arrowleft|arrowright|home|end|pageup|pagedown)/.test(k);
   await cdp.send(tabId, 'Input.dispatchKeyEvent', {
