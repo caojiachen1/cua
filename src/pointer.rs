@@ -322,8 +322,8 @@ mod host {
         GdipCreateFromHDC, GdipCreatePen1, GdipCreateSolidFill, GdipDeleteBrush, GdipDeleteFont,
         GdipDeleteFontFamily, GdipDeleteGraphics, GdipDeletePen, GdipDrawEllipse,
         GdipDrawRectangle, GdipDrawString, GdipFillEllipse, GdipFillRectangle, GdipGetImageGraphicsContext,
-        GdipSetSmoothingMode, GdiplusShutdown, GdiplusStartup, GdiplusStartupInput, GpBrush,
-        GpSolidFill, Status, FontStyleRegular, GdiplusStartupOutput,
+        GdipDisposeImage, GdipFlush, FlushIntentionFlush, GdipSetSmoothingMode, GdipGraphicsClear, GdiplusShutdown, GdiplusStartup, GdiplusStartupInput, GpBrush,
+        GpSolidFill, Status, FontStyleRegular, GdiplusStartupOutput, GpImage, GpBitmap,
         GpFont, GpFontFamily, GpGraphics, GpPen, RectF, SmoothingModeAntiAlias, UnitPixel,
     };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -333,7 +333,7 @@ mod host {
         GetSystemMetrics, PeekMessageW, PostQuitMessage, RegisterClassExW, ShowWindow,
         TranslateMessage, WINDOW_EX_STYLE, WNDCLASSEXW, MSG,
         WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-        WS_EX_TRANSPARENT, WS_POPUP, PM_REMOVE, SW_HIDE, WM_QUIT,
+        WS_EX_TRANSPARENT, WS_POPUP, PM_REMOVE, SW_HIDE, SW_SHOWNOACTIVATE, WM_QUIT,
         SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
         UpdateLayeredWindow, ULW_ALPHA,
     };
@@ -381,6 +381,19 @@ mod host {
     }
 
     fn apply(state: &mut HostState, v: &Value) {
+        if std::env::var("CUA_PREVIEW_DEBUG")
+            .map(|x| x != "0" && !x.eq_ignore_ascii_case("false"))
+            .unwrap_or(false)
+        {
+            eprintln!(
+                "[preview] {} {} @ {:?},{:?} ({})",
+                v.get("phase").and_then(|p| p.as_str()).unwrap_or("?"),
+                v.get("verb").and_then(|s| s.as_str()).unwrap_or("?"),
+                v.get("x").and_then(|x| x.as_i64()),
+                v.get("y").and_then(|y| y.as_i64()),
+                v.get("detail").and_then(|s| s.as_str()).unwrap_or(""),
+            );
+        }
         let phase = v
             .get("phase")
             .and_then(|p| p.as_str())
@@ -424,6 +437,7 @@ mod host {
         dib: HBITMAP,
         old_bmp: HGDIOBJ,
         bits: *mut u8,
+        bmp: *mut GpBitmap,
         graphics: *mut GpGraphics,
         font_main: *mut GpFont,
         font_dim: *mut GpFont,
@@ -493,8 +507,19 @@ mod host {
         let mem_dc = CreateCompatibleDC(screen_dc);
         ReleaseDC(windows::Win32::Foundation::HWND::default(), screen_dc);
         let old_bmp = SelectObject(mem_dc, HGDIOBJ(dib.0));
+        // GDI+ via the HDC writes RGB but leaves the alpha channel at 0 — ULW's
+        // AC_SRC_ALPHA blend then treats every pixel as fully transparent and
+        // the overlay is invisible on screen even though ULW succeeds. Building
+        // the Graphics from a bitmap wrapping the same scan0 writes premultiplied
+        // ARGB straight into the DIB, which is what ULW needs.
+        const PIXEL_32BPP_ARGB: i32 = 0x0026200A; // PixelFormat32bppARGB
+        let mut bmp: *mut GpBitmap = std::ptr::null_mut();
+        if GdipCreateBitmapFromScan0(WINDOW_W, WINDOW_H, WINDOW_W * 4,
+                                     PIXEL_32BPP_ARGB, Some(bits as *const u8), &mut bmp) != Status(0) {
+            return None;
+        }
         let mut graphics: *mut GpGraphics = std::ptr::null_mut();
-        if GdipCreateFromHDC(mem_dc, &mut graphics) != Status(0) {
+        if GdipGetImageGraphicsContext(bmp as *mut GpImage, &mut graphics) != Status(0) {
             return None;
         }
         GdipSetSmoothingMode(graphics, SmoothingModeAntiAlias);
@@ -535,6 +560,7 @@ mod host {
             dib,
             old_bmp,
             bits: bits as *mut u8,
+            bmp,
             graphics,
             font_main,
             font_dim,
@@ -613,6 +639,9 @@ mod host {
             }
         }
         let _ = ring_c;
+        // GDI+ renders lazily — without the flush, ULW reads the freshly-cleared
+        // (all-zero) pixels and the overlay stays invisible forever
+        GdipFlush(ui.graphics, FlushIntentionFlush);
     }
 
     unsafe fn paint(hwnd: HWND, ui: &Ui, state: &mut HostState) {
@@ -717,9 +746,9 @@ mod host {
                 eprintln!("preview: window/GDI+ init failed");
                 return 1;
             };
-            // the layered window starts fully transparent; ULW in paint() makes
-            // it visible (and positions it), so no ShowWindow call is needed
-            let _ = ShowWindow(ui.hwnd, SW_HIDE);
+            // ULW composites the content but does NOT show a hidden window —
+            // without this the overlay is never visible on screen at all
+            let _ = ShowWindow(ui.hwnd, SW_SHOWNOACTIVATE);
 
             let mut state = HostState {
                 phase: "post",
@@ -773,6 +802,7 @@ mod host {
             GdipDeleteBrush(ui.text_brush);
             GdipDeleteBrush(ui.dim_brush);
             GdipDeleteGraphics(ui.graphics);
+            GdipDisposeImage(ui.bmp as *mut GpImage);
             GdiplusShutdown(gdi_token);
             let _ = SelectObject(ui.mem_dc, ui.old_bmp);
             let _ = DeleteObject(ui.dib);
