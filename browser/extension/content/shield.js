@@ -205,13 +205,23 @@
     apply();
   }
   const CSS = `
-    /* A single, evenly-thick ring with the same corner radius on all four
-       sides. The old inset box-shadow drew the pulse on the element box, which
-       at the corners reads thicker than along the edges; a real border with
-       border-radius keeps the stroke uniform all the way round. */
+    /* A single, evenly-thick ring. The old approach stacked two percentage
+       linear-gradients, so the 8% stop was 154px wide on a 1920 screen but only
+       86px tall on a 1080 one — the sides always read thicker than the top and
+       bottom, and the two gradients crossed at the corners with no blend.
+       A mask with fixed px stops makes every side exactly BAND px, and the
+       conic sweep below is the only thing that carries colour. */
+    /* brightness rather than opacity: dimming the alpha greys a thin coloured
+       band out, while brightness keeps the hue and just makes it glow softer */
     @keyframes cua-ring-pulse {
-      0%,100% { opacity: .72; }
-      50%     { opacity: 1; }
+      0%,100% { filter: brightness(.78) drop-shadow(0 0 4px rgba(139,92,246,.55))
+                         drop-shadow(0 0 9px rgba(56,189,248,.32)); }
+      50%     { filter: brightness(1.18) drop-shadow(0 0 7px rgba(139,92,246,.95))
+                         drop-shadow(0 0 16px rgba(56,189,248,.60)); }
+    }
+    /* the colour itself slowly rotates around the ring */
+    @keyframes cua-ring-spin {
+      to { --cua-angle: 360deg; }
     }
     * { all: initial; box-sizing: border-box; }
     /* "all: initial" above resets the <style> element's UA display:none to
@@ -223,40 +233,75 @@
        PDF render, whatever the visibility handshake is doing at that moment */
     @media print { .host, .pill, .veil, .frame, .confirm, .helpcard { display: none !important; } }
     .host { position: fixed; inset: 0; z-index: 2147483647; pointer-events: none; font-family: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }
-    /* The ring: one uniform 2px border, identical on every side and around the
-       corners, inset slightly so the radius is visible. It only animates while
-       the tab is actually under agent control (armed) — an idle or paused tab
-       holds a steady ring, and a tab we do not control has no host at all. */
+
+    /* The band is one element with a conic rainbow that is masked down to a
+       fixed-width edge ring. Because the mask uses px stops, the left/right and
+       top/bottom thicknesses are identical on any viewport, and the ring is a
+       single continuous shape, so the corners blend instead of crossing. */
     .frame {
       position: absolute; inset: 0; pointer-events: none;
-      border: 2px solid rgba(255,255,255,.9);
-      /* the radius matches the stroke weight: a 2px border with a small radius
-         keeps the corners reading as thick as the edges, instead of a big
-         round-off that visually thins them */
-      border-radius: 6px;
-      box-shadow:
-        0 0 0 1px rgba(255,255,255,.20),
-        inset 0 0 26px rgba(255,255,255,.07);
+      border-radius: 16px;
+      /* @property keeps --cua-angle animatable; browsers without it fall back
+         to a static (still pretty) ring */
+      --cua-band: 4px;
+      padding: var(--cua-band);
+      /* Saturated stops, no blanket opacity: a 3px band blended at .78 opacity
+         read as flat grey on a dark page — the colour has to carry its own
+         alpha so the hue survives the antialiasing on a thin stroke. */
+      background:
+        conic-gradient(from var(--cua-angle, 0deg),
+          rgba(56,189,248,.95),
+          rgba(139,92,246,.95),
+          rgba(236,72,153,.95),
+          rgba(251,191,36,.95),
+          rgba(56,189,248,.95));
+      /* subtract the inner box: only the padding band survives */
+      -webkit-mask:
+        linear-gradient(#000 0 0) content-box,
+        linear-gradient(#000 0 0);
+      -webkit-mask-composite: xor;
+      mask:
+        linear-gradient(#000 0 0) content-box,
+        linear-gradient(#000 0 0);
+      mask-composite: exclude;
+      /* bloom outside the band so the ring reads as glowing light. This is
+         also the paused-state look (the armed animation overrides it). */
+      filter: brightness(.92) drop-shadow(0 0 5px rgba(139,92,246,.65))
+              drop-shadow(0 0 11px rgba(56,189,248,.38));
     }
-    /* pulse ONLY on a controlled tab */
-    .host[data-cua-mode="armed"] .frame { animation: cua-ring-pulse 1.8s ease-in-out infinite; }
-    /* monochrome veil: dark tint with a white gradient glowing in from all
-       four edges — the aside-style edge treatment. Each side carries a faint
-       spectral wash (cyan top-left → magenta bottom-right) so the white glow
-       has a little colour without turning the veil into a rainbow. */
+    /* pulse + spin ONLY on a controlled tab. The pulse modulates brightness
+       via filter so the hue never greys out at the low end. */
+    .host[data-cua-mode="armed"] .frame {
+      animation:
+        cua-ring-pulse 2.4s ease-in-out infinite,
+        cua-ring-spin 8s linear infinite;
+    }
+    /* pulse + spin ONLY on a controlled tab */
+    .host[data-cua-mode="armed"] .frame {
+      animation:
+        cua-ring-pulse 2.4s ease-in-out infinite,
+        cua-ring-spin 8s linear infinite;
+    }
+    @property --cua-angle {
+      syntax: '<angle>';
+      initial-value: 0deg;
+      inherits: false;
+    }
+
+    /* The soft glow inside the ring. A single inset box-shadow with a fixed
+       spread keeps the falloff identical on all four sides, and the tint is a
+       plain radial wash rather than two crossing gradients. */
     .veil {
       position: absolute; inset: 0; pointer-events: auto; cursor: not-allowed;
-      border-radius: 6px;
+      border-radius: 10px;
       background:
-        linear-gradient(to right,
-          rgba(255,255,255,.26), rgba(120,215,255,.16) 3%,
-          rgba(255,255,255,0) 8%, rgba(255,255,255,0) 92%,
-          rgba(255,150,230,.16) 97%, rgba(255,255,255,.26)),
-        linear-gradient(to bottom,
-          rgba(255,255,255,.26), rgba(150,190,255,.16) 3%,
-          rgba(255,255,255,0) 8%, rgba(255,255,255,0) 92%,
-          rgba(255,205,150,.16) 97%, rgba(255,255,255,.26)),
-        rgba(10,10,10,.34);
+        radial-gradient(120% 100% at 50% 50%,
+          rgba(10,10,10,.30) 40%,
+          rgba(20,18,30,.34) 70%,
+          rgba(60,120,180,.18) 100%);
+      box-shadow:
+        inset 0 0 0 1px rgba(255,255,255,.22),
+        inset 0 0 42px rgba(160,200,255,.10);
     }
     .pill {
       position: absolute; top: 8px; left: 50%; transform: translateX(-50%);
