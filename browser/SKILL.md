@@ -37,6 +37,8 @@ cua browser <tool.name> '<json-params>'   # run one tool
 cua browser browsers                      # connected browser slots
 cua browser screenshot '{}' --out shot.png   # save binary output, then Read it
 cua browser --browser <slot> snapshot     # target one slot
+cua browser reload                        # reload the extension after a code change
+cua browser --browser <slot> reload       # ...in a specific slot (e.g. cuaedge)
 ```
 
 Common flags: `--browser <slot>`, `--out <file>` (screenshot / PDF), `--timeout <ms>`.
@@ -80,6 +82,9 @@ session.start → tab.create {url} → snapshot → act on @eN refs → verify
 2. `cua browser tab.create '{"url":"example.com"}'` — url without scheme is fine. Tabs
    open SILENTLY in the background (the user keeps their current tab); pass
    `"active":true` only when the page must be visible (CSS hover menus, video).
+   In a **child session** also pass `"visible":true`: Windows parks an unfocused
+   window from a session with no user at the console in the minimized state, so
+   without it the page is never painted and screenshots come back blank.
 3. `cua browser snapshot` — prints the accessibility tree with `@eN refs`, including child
    frames as indented `# frame[N]` sections. The default read is an incremental
    diff: after the first capture of a document you get only the changed lines
