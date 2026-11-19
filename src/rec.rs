@@ -140,8 +140,13 @@ pub fn cmd_start(window: Option<String>, fps: u32, out: Option<String>, max_seco
         // A crashed/exited worker must not block every future recording.
         let _ = std::fs::remove_file(state_path());
     }
-    let fps = fps.clamp(1, 30);
-    let quality = quality.unwrap_or(80).clamp(1, 100);
+    // CLI flags win; otherwise the settings app's rec_fps / rec_quality defaults
+    // apply, then the built-in 2 fps / 80 quality.
+    let cfg = crate::util::load_config_json();
+    let cfg_fps = cfg.get("rec_fps").and_then(|v| v.as_u64()).map(|f| f as u32);
+    let cfg_quality = cfg.get("rec_quality").and_then(|v| v.as_u64()).map(|q| q as u8);
+    let fps = cfg_fps.unwrap_or(fps).clamp(1, 30);
+    let quality = quality.or(cfg_quality).unwrap_or(80).clamp(1, 100);
     let name = out.clone().unwrap_or_else(|| format!("rec-{}", util::now_iso().replace([':', '-'], "")));
     let dir = util::ensure_data_dir()
         .join("recordings")

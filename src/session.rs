@@ -422,8 +422,15 @@ fn cmd_start(
 ) -> Result<i32> {
     // 默认无感后台：观察窗隐藏（session_start_show_viewer 配置可改默认值）。
     // --view 强制显示；--hide 强制隐藏（兼容旧参数）。
-    let cfg_show = crate::util::load_config_json()
+    let cfg = crate::util::load_config_json();
+    let cfg_show = cfg
         .get("session_start_show_viewer")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    // 设置应用的「后台电脑控制」：默认无头（创建后关闭子会话路由，远程软件
+    // 回到主会话，子会话继续在后台跑），等价于 CLI 的 --headless。
+    let cfg_headless = cfg
+        .get("session_headless")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let show_viewer = if view {
@@ -433,8 +440,8 @@ fn cmd_start(
     } else {
         cfg_show
     };
-    // 无头模式：CLI 显式指定，或托盘设置「自动关闭路由」开启。
-    let headless = headless || headless_auto_disable_setting();
+    // 无头模式：CLI 显式指定，或设置里的「后台电脑控制」，或托盘「自动关闭路由」。
+    let headless = headless || cfg_headless || headless_auto_disable_setting();
 
     // A previous stop turns the system-wide child-sessions flag off (it steals
     // remote-desktop logons otherwise). Starting again must re-enable it, so
