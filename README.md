@@ -208,9 +208,6 @@ directory cua was installed into is the extension's home, so editing `browser/ex
 effect on the next `cua browser reload`. (An existing `%LOCALAPPDATA%` copy is refreshed in
 place so profiles paired before this change keep working.)
 
-Developers: [`docs/browser-extension-dev.md`](docs/browser-extension-dev.md) covers the reload
-mechanism, the shield's shadow-DOM state attributes and edge geometry, and how to test inside a
-child session.
 
 ### Driving the profile through the extension (`cua edge --pair`)
 
