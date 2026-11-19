@@ -205,9 +205,13 @@
     apply();
   }
   const CSS = `
-    @keyframes cua-pulse {
-      0%,100% { box-shadow: inset 0 0 0 2px rgba(255,255,255,.72), inset 0 0 28px rgba(255,255,255,.08); }
-      50%     { box-shadow: inset 0 0 0 2px rgba(255,255,255,.95),  inset 0 0 52px rgba(255,255,255,.16); }
+    /* A single, evenly-thick ring with the same corner radius on all four
+       sides. The old inset box-shadow drew the pulse on the element box, which
+       at the corners reads thicker than along the edges; a real border with
+       border-radius keeps the stroke uniform all the way round. */
+    @keyframes cua-ring-pulse {
+      0%,100% { opacity: .72; }
+      50%     { opacity: 1; }
     }
     * { all: initial; box-sizing: border-box; }
     /* "all: initial" above resets the <style> element's UA display:none to
@@ -219,14 +223,39 @@
        PDF render, whatever the visibility handshake is doing at that moment */
     @media print { .host, .pill, .veil, .frame, .confirm, .helpcard { display: none !important; } }
     .host { position: fixed; inset: 0; z-index: 2147483647; pointer-events: none; font-family: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }
-    .frame { position: absolute; inset: 0; pointer-events: none; animation: cua-pulse 1.6s ease-in-out infinite; }
+    /* The ring: one uniform 2px border, identical on every side and around the
+       corners, inset slightly so the radius is visible. It only animates while
+       the tab is actually under agent control (armed) — an idle or paused tab
+       holds a steady ring, and a tab we do not control has no host at all. */
+    .frame {
+      position: absolute; inset: 0; pointer-events: none;
+      border: 2px solid rgba(255,255,255,.9);
+      /* the radius matches the stroke weight: a 2px border with a small radius
+         keeps the corners reading as thick as the edges, instead of a big
+         round-off that visually thins them */
+      border-radius: 6px;
+      box-shadow:
+        0 0 0 1px rgba(255,255,255,.20),
+        inset 0 0 26px rgba(255,255,255,.07);
+    }
+    /* pulse ONLY on a controlled tab */
+    .host[data-cua-mode="armed"] .frame { animation: cua-ring-pulse 1.8s ease-in-out infinite; }
     /* monochrome veil: dark tint with a white gradient glowing in from all
-       four edges — the aside-style edge treatment */
+       four edges — the aside-style edge treatment. Each side carries a faint
+       spectral wash (cyan top-left → magenta bottom-right) so the white glow
+       has a little colour without turning the veil into a rainbow. */
     .veil {
       position: absolute; inset: 0; pointer-events: auto; cursor: not-allowed;
+      border-radius: 6px;
       background:
-        linear-gradient(to right, rgba(255,255,255,.20), rgba(255,255,255,0) 5%, rgba(255,255,255,0) 95%, rgba(255,255,255,.20)),
-        linear-gradient(to bottom, rgba(255,255,255,.20), rgba(255,255,255,0) 5%, rgba(255,255,255,0) 95%, rgba(255,255,255,.20)),
+        linear-gradient(to right,
+          rgba(255,255,255,.26), rgba(120,215,255,.16) 3%,
+          rgba(255,255,255,0) 8%, rgba(255,255,255,0) 92%,
+          rgba(255,150,230,.16) 97%, rgba(255,255,255,.26)),
+        linear-gradient(to bottom,
+          rgba(255,255,255,.26), rgba(150,190,255,.16) 3%,
+          rgba(255,255,255,0) 8%, rgba(255,255,255,0) 92%,
+          rgba(255,205,150,.16) 97%, rgba(255,255,255,.26)),
         rgba(10,10,10,.34);
     }
     .pill {
