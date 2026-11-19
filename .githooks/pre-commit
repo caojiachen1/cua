@@ -1,0 +1,27 @@
+#!/bin/sh
+# Reminds the committer to refresh dist/ when Rust sources changed.
+#
+# Enable once per clone:
+#     git config core.hooksPath .githooks
+#
+# This never blocks a commit (a WIP commit is legitimate) — it only prints a
+# loud reminder, because install.ps1 ships the archive, not the sources.
+
+staged_src=$(git diff --cached --name-only -- 'src/**/*.rs' 'src/*.rs' 'Cargo.toml' 'Cargo.lock' 'build.rs' | head -1)
+staged_dist=$(git diff --cached --name-only -- 'dist/*.zip' | head -1)
+
+if [ -n "$staged_src" ] && [ -z "$staged_dist" ]; then
+    printf '\n\033[33m────────────────────────────────────────────────────────────\033[0m\n'
+    printf '\033[33m  dist/ was NOT updated, but sources changed:\033[0m\n'
+    printf '    %s\n' "$staged_src"
+    printf '\n'
+    printf '  install.ps1 ships dist/cua-<version>-win64.zip, so a stale archive\n'
+    printf '  means users install old code. Before pushing the final commit:\n'
+    printf '\n'
+    printf '    powershell -ExecutionPolicy Bypass -File package.ps1\n'
+    printf '    git add dist/ && git commit --amend --no-edit\n'
+    printf '\n'
+    printf '  (Commit anyway with: git commit --no-verify)\n'
+    printf '\033[33m────────────────────────────────────────────────────────────\033[0m\n\n'
+fi
+exit 0

@@ -1,4 +1,7 @@
 .*
+# The shared git hooks are part of the repo: enable once with
+#   git config core.hooksPath .githooks
+!.githooks/
 # Build output
 /target/
 target-final/
