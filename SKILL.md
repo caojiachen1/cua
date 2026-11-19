@@ -14,16 +14,23 @@ description: |
 
 # cua — Windows Computer Use CLI (Trae + Qoder + ZCode fusion)
 
-Rust CLI (source: this repository). `install.ps1` builds `bin\cua.exe` and puts it on
-PATH as `cua`. Every action prints a JSON receipt
-(`cua-action-receipt-v1`); exit code 0=ok, 2=refused-by-safety, 1=failed.
-All observation commands print JSON.
+Rust CLI (source: this repository). `install.ps1` unpacks the committed
+prebuilt binaries in `dist\` into `bin\` and puts that directory on PATH as
+`cua` — no Rust toolchain is needed. It only falls back to
+`cargo build --release` when the archive is missing or you pass `-ForceBuild`.
+Every action prints a JSON receipt (`cua-action-receipt-v1`); exit code 0=ok,
+2=refused-by-safety, 1=failed. All observation commands print JSON.
+
+**Do not build from source just to install.** Run `install.ps1` as-is; the
+`dist\cua-<version>-win64.zip` it consumes is rebuilt and committed with every
+code change (see `package.ps1`). A source build takes many minutes and needs the
+Rust toolchain plus a Windows SDK for gpui's shader compiler.
 
 ## Installing with GPU acceleration (ask the user first)
 
-`install.ps1` enables nothing by default: the YOLO detector runs on WGPU (~400 ms
-per 640 pass). If an NVIDIA GPU and CUDA toolkit are present, ask once before
-running it:
+The prebuilt archive is a plain WGPU build (no CUDA, no autotune), so the
+default install path enables nothing: the YOLO detector runs on WGPU (~400 ms
+per 640 pass). If an NVIDIA GPU and CUDA toolkit are present, ask once:
 
 > 检测器加速有三个选项：
 > 1. CUDA：这台机器有 NVIDIA GPU，是否启用？
@@ -32,14 +39,18 @@ running it:
 >    370 ms，和 WGPU 差不多。是否同时启用？
 > 3. TensorRT：目前只有基准结果（约 5.4 ms/遍），还没接入 CLI，暂时不能启用。
 
-Then run the matching command:
+CUDA/autotune 只能通过源码构建启用（预编译包不含这些特性），所以选 1 或 2
+时必须加 `-ForceBuild`：
 
 ```powershell
-install.ps1 -Cuda -Autotune   # CUDA + autotune: ~40 ms/pass, ~40 s first service start
-install.ps1 -Cuda             # CUDA only: ~1.5 s start, ~370 ms/pass (about WGPU speed)
-install.ps1 -Autotune         # WGPU + autotune: ~185 ms/pass, ~20 s first call
-install.ps1                   # WGPU only (default, ~400 ms/pass)
+install.ps1 -Cuda -Autotune -ForceBuild   # CUDA + autotune: ~40 ms/pass, ~40 s first service start
+install.ps1 -Cuda -ForceBuild             # CUDA only: ~1.5 s start, ~370 ms/pass (about WGPU speed)
+install.ps1 -Autotune -ForceBuild         # WGPU + autotune: ~185 ms/pass, ~20 s first call
+install.ps1                               # prebuilt, WGPU only (default, ~400 ms/pass)
 ```
+
+Note: `-Cuda`/`-Autotune` without `-ForceBuild` still installs the prebuilt
+archive (they have no effect on it) — always pair them with `-ForceBuild`.
 
 If the user asks for TensorRT, say it is benchmark-only today (it needs a
 separate ORT/TensorRT worker and a 124 MB engine), and do not claim it is

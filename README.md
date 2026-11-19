@@ -17,8 +17,19 @@ CUA Browser extension loaded once (`cua browser install`, then `cua browser stat
 ```powershell
 git clone https://github.com/caojiachen1/cua.git
 cd cua
-powershell -ExecutionPolicy Bypass -File install.ps1    # build -> bin\ -> skill -> smoke test
+powershell -ExecutionPolicy Bypass -File install.ps1    # unpack prebuilt -> bin\ -> skill -> smoke test
 ```
+
+`install.ps1` unpacks the committed `dist\cua-<version>-win64.zip` — **no Rust
+toolchain needed**. Only pass `-ForceBuild` if you want a source build (required
+for `-Cuda`/`-Autotune`, which the prebuilt archive does not include):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install.ps1 -ForceBuild -Cuda
+```
+
+Maintainers rebuild the archive with `package.ps1` and commit it alongside the
+code change that produced it.
 
 Uninstall: `powershell -ExecutionPolicy Bypass -File uninstall.ps1`.
 

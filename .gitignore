@@ -7,6 +7,11 @@ obj/
 tools/*/bin/
 tools/*/obj/
 
+# Prebuilt install archive IS committed (install.ps1 consumes it): dist/*.zip
+# stays tracked on purpose. Only stray unpack/staging dirs are ignored.
+/dist/*.tmp
+/dist/*-stage/
+
 # Local runtime and debug artifacts
 *.log
 *.mp4
