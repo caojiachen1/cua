@@ -353,9 +353,18 @@ pub fn cmd_stop(out: Option<String>, keep_frames: bool) -> Result<i32> {
     let _ = std::fs::remove_file(&done);
     let _ = std::fs::remove_file(state_path());
     if frames.is_empty() {
+        // The usual cause is a window in another Windows session: PrintWindow
+        // and GetWindowDC are blocked across the session boundary, so the
+        // capture loop gets nothing back. Say that instead of the vague
+        // "may refuse capture" — the fix is to record from inside that session.
+        let hint = if st.window.is_some() {
+            "no frames were captured — a window in another Windows session cannot be captured from here (PrintWindow is blocked across the boundary); run it as `cua child rec start ...` from inside that session"
+        } else {
+            "no frames were captured — the screen grabber returned nothing"
+        };
         let r = util::Receipt::new("rec.stop").fail(
             serde_json::json!({ "dir": st.dir.display().to_string() }),
-            "no frames were captured (the target window may refuse capture)");
+            hint);
         r.print();
         return Ok(1);
     }
