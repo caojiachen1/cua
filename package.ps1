@@ -54,6 +54,15 @@ if (-not $SkipBuild) {
 }
 
 Write-Host "== [3/4] stage files" -ForegroundColor Cyan
+# A broken extension script ships silently (the shield just never appears), so
+# refuse to pack one. The CSS lives in a JS template literal — a stray backtick
+# in a comment closes it early and breaks the whole content script.
+if (Get-Command node -ErrorAction SilentlyContinue) {
+    & node (Join-Path $root "scripts\check-extension.mjs")
+    if ($LASTEXITCODE -ne 0) { throw "extension scripts do not parse; fix them before packing" }
+} else {
+    Write-Host "   warning: node not found; skipped extension syntax check" -ForegroundColor Yellow
+}
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 

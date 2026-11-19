@@ -238,15 +238,15 @@
       backdrop-filter: blur(8px);
       pointer-events: none; user-select: none;
       /* keep the label on one line: a wrapped pill reads as broken chrome.
-         `width: max-content` stops the absolutely-positioned pill from being
+         width:max-content stops the absolutely-positioned pill from being
          sized by its containing block, which is what forced the wrap. */
       white-space: nowrap;
       width: max-content;
     }
-    /* `* { all: initial }` above resets every descendant to the initial black
-       text colour, so the label span painted black-on-black inside the pill.
-       Re-assert white for the pill and everything in it (the two buttons set
-       their own colour below and keep it — they are more specific). */
+    /* the universal "all: initial" reset above sends every descendant back to
+       the initial black text colour, so the label span painted black-on-black
+       inside the pill. Re-assert white for the pill and everything in it (the
+       two buttons set their own colour below and keep it). */
     .pill, .pill span { color: #fff; }
     .dot { width: 6px; height: 6px; border-radius: 50%; background: #fff; animation: cua-blink 1.2s infinite; }
     @keyframes cua-blink { 50% { opacity: .25; } }
