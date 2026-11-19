@@ -185,7 +185,7 @@ class SessionManager {
   /** Create a tab inside the session group. In own-window mode the first
    *  createTab opens the dedicated window WITH the real url (no placeholder
    *  tab), and the window is re-created on demand if it disappeared. */
-  async createTab(url = 'about:blank', { active = false } = {}) {
+  async createTab(url = 'about:blank', { active = false, visible = false } = {}) {
     await this.ready();
     const s = await this._require();
     if (url !== 'about:blank') url = normalizeUrl(url);
@@ -202,8 +202,17 @@ class SessionManager {
       }
       if (win == null) {
         // windows.create takes focused (not tabs.create's active) — the first
-        // tab is inherently its window's active tab
-        const w = await chrome.windows.create({ url, focused: false });
+        // tab is inherently its window's active tab.
+        // `visible: true` is the testing / child-session escape hatch: without
+        // it Windows parks an unfocused window from a session that has no real
+        // user at the console in the minimized state (rect -32000), so the page
+        // and its shield are never painted. Normal agent work keeps the quiet
+        // default.
+        const w = await chrome.windows.create({
+          url,
+          focused: visible === true,
+          ...(visible === true ? { state: 'normal' } : {}),
+        });
         s.ownWindowId = w.id;
         const tab = (w.tabs && w.tabs[0]) || (await chrome.tabs.query({ windowId: w.id }))[0];
         s.created.add(tab.id);
@@ -217,7 +226,12 @@ class SessionManager {
       return this._createInWindow(url, { active }, win);
     }
     const win = await lastFocusedWindow();
-    return this._createInWindow(url, { active }, win);
+    const out = await this._createInWindow(url, { active }, win);
+    if (visible === true && win != null) {
+      // same escape hatch for the in-group path
+      await chrome.windows.update(win, { state: 'normal', focused: true }).catch(() => {});
+    }
+    return out;
   }
 
   async _createInWindow(url, { active = false }, win) {

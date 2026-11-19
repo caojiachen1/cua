@@ -281,6 +281,21 @@ function registerMore(dispatcher) {
     return { recovered: adopted.length, tab_ids: adopted, groups: groups.map((g) => g.id) };
   });
 
+  R('extension.reload', {
+    category: 'session',
+    sensitive: true,
+    description: 'Reload THIS unpacked extension so a code change on disk takes effect (the equivalent of the ↻ button on edge://extensions). The reply is sent first, then chrome.runtime.reload() tears the worker down — expect the bridge to drop for ~1s and reconnect with a new instance_id. Session/tab-group state lives in chrome.storage, so run session.recover afterwards if the session was lost.',
+  }, async () => {
+    audit.log({ action: 'extension.reload', build: chrome.runtime.getManifest().version });
+    // Reply BEFORE the reload: runtime.reload() kills this worker immediately,
+    // so a reload inside the awaited path would drop the response and the
+    // caller would see a timeout instead of a clean "reloading".
+    setTimeout(() => {
+      try { chrome.runtime.reload(); } catch { /* the worker is already gone */ }
+    }, 120);
+    return { reloading: true, note: 'the bridge reconnects in about a second with a new instance_id' };
+  });
+
   R('tab.repair', {
     category: 'tabs',
     timeoutMs: 60000,

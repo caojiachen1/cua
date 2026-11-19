@@ -325,6 +325,39 @@ pub fn cmd_browser(rest: &[String]) -> Result<i32> {
         return Ok(0);
     }
 
+    // `reload` is sugar for the extension.reload tool: fire it, then poll
+    // /health until the extension reconnects with a fresh instance_id. This is
+    // the cross-session way to pick up a code change on disk — the a11y
+    // edge://extensions route only works where a visible browser window and a
+    // human-scale UIA tree exist.
+    if cmd == "reload" {
+        let slot_arg = slot.as_deref();
+        let _ = client::call(port, &token, "tool.extension.reload", &serde_json::Value::Null, slot_arg, ms);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut back = false;
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            if let Some(h) = client::health(port, 800) {
+                let ok = h.get("extension").and_then(|v| v.as_bool()).unwrap_or(false);
+                if ok {
+                    back = true;
+                    let r = Receipt::new("browser").ok(
+                        serde_json::json!({ "call": "reload", "slot": slot_arg }),
+                        "extension reloaded and reconnected",
+                    );
+                    println!("{}", serde_json::to_string_pretty(&r)?);
+                    return Ok(0);
+                }
+            }
+        }
+        let r = Receipt::new("browser").fail(
+            serde_json::json!({ "call": "reload", "slot": slot_arg }),
+            if back { "reload sent" } else { "extension did not reconnect within 20s" },
+        );
+        println!("{}", serde_json::to_string_pretty(&r)?);
+        return Ok(1);
+    }
+
     // `list` is sugar for the catalog tool; everything else is the tool name.
     let method = match cmd.as_str() {
         "list" => "tool.list".to_string(),

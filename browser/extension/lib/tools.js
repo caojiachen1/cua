@@ -614,7 +614,7 @@ export function registerTools(dispatcher) {
     return { tabs: out };
   });
 
-  R('tab.create', { category: 'tabs', timeoutMs: 90_000, description: 'Create a tab inside the CUA group (auto-starts session if needed). Opens SILENTLY in the background — the user stays on their current tab — and waits for the page to finish loading (loaded flag; cap with timeout_ms). headers:{...} injects extra HTTP request headers for the new tab (persist until headers:null). Pass active:true only for pages that must be visible (CSS hover menus, video playback). Cold-start note: the real URL is driven through the same chrome.tabs.update leg that navigate uses (fix20) — a freshly-started Edge sometimes drops the initial navigation of tabs.create, and this path self-heals it with one explicit re-kick instead of returning a tab that never loaded.' }, async (p = {}) => {
+  R('tab.create', { category: 'tabs', timeoutMs: 90_000, description: 'Create a tab inside the CUA group (auto-starts session if needed). Opens SILENTLY in the background — the user stays on their current tab — and waits for the page to finish loading (loaded flag; cap with timeout_ms). headers:{...} injects extra HTTP request headers for the new tab (persist until headers:null). Pass active:true only for pages that must be visible (CSS hover menus, video playback). Pass visible:true to also un-minimise and focus the window — required in a child session, where Windows parks an unfocused window off-screen so the page and its shield never paint. Cold-start note: the real URL is driven through the same chrome.tabs.update leg that navigate uses (fix20) — a freshly-started Edge sometimes drops the initial navigation of tabs.create, and this path self-heals it with one explicit re-kick instead of returning a tab that never loaded.' }, async (p = {}) => {
     if (sessions.isPaused()) throw err('SESSION_PAUSED', 'the user took over this session — no new agent tabs until they resume control');
     if (!sessions.active()) await sessions.start();
     const url = p.url && p.url !== 'about:blank' ? normalizeUrl(p.url) : 'about:blank';
@@ -627,7 +627,7 @@ export function registerTools(dispatcher) {
     // this shape anyway), and tabs.create's own initial navigation is the
     // flaky leg on a cold-started Edge (the tab sits un-navigated with a
     // hidden URL and the CDP attach then refuses it as restricted).
-    const r = await sessions.createTab('about:blank', { active: p.active === true });
+    const r = await sessions.createTab('about:blank', { active: p.active === true, visible: p.visible === true });
     await armTab(r.tab_id);
     let headers_applied = null;
     if (p.headers !== undefined) {
