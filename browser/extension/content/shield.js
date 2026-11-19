@@ -28,6 +28,7 @@
   let helpActive = false; // human-assistance banner up → page belongs to the user
   let label = 'CUA agent control';
   let host = null;
+  let hostEl = null;   // the .host element INSIDE the shadow root
   let veil = null;
   let pill = null;
   let pillLabel = null;
@@ -211,13 +212,13 @@
        but only 86px tall on a 1080 one — the sides read much thicker than the
        top and bottom. Every stop below is in px, so the falloff is identical
        on all four sides at any viewport size. */
+    /* The pulse drives opacity AND brightness: opacity alone barely moves a
+       shadow that already sits at .9, and brightness alone cannot reach the
+       faint half of the cycle. Together they swing the edge from a dim rim to
+       a hot glow, which is what reads as "breathing" on a dark page. */
     @keyframes cua-edge-breathe {
-      0%,100% { opacity: .55; }
-      50%     { opacity: 1; }
-    }
-    /* the colour itself drifts around the frame */
-    @keyframes cua-edge-hue {
-      to { --cua-angle: 360deg; }
+      0%,100% { opacity: .38; filter: brightness(.85); }
+      50%     { opacity: 1;   filter: brightness(1.25); }
     }
     * { all: initial; box-sizing: border-box; }
     /* "all: initial" above resets the <style> element's UA display:none to
@@ -251,7 +252,9 @@
         inset 0 0 30px 0 rgba(255,255,255,.55),
         /* 3. colour wash, 90px of blur from the edge inward */
         inset 0 0 90px 0 var(--cua-tint, rgba(139,92,246,.95));
-      opacity: .9;
+      /* the armed animation owns these two; paused keeps a steady mid value */
+      opacity: .78;
+      filter: brightness(1);
     }
     /* the colour cycles through the ring while it breathes */
     @keyframes cua-tint-cycle {
@@ -376,7 +379,7 @@
     style.textContent = CSS;
     root.appendChild(style);
 
-    const hostEl = document.createElement('div');
+    hostEl = document.createElement('div');
     hostEl.className = 'host';
     root.appendChild(hostEl);
 
@@ -435,6 +438,15 @@
       host.setAttribute('data-cua-mode', mode);
       host.setAttribute('data-cua-block', blockMode);
       host.setAttribute('data-cua-visible', visible ? '1' : '0');
+      // The CSS lives in the shadow root, where `.frame`'s parent is the
+      // .host element — NOT the shadow host. Mirror the state attributes onto
+      // that inner element, or `.host[data-cua-mode="armed"] .frame` never
+      // matches and the pulse silently does nothing.
+      if (hostEl) {
+        hostEl.setAttribute('data-cua-mode', mode);
+        hostEl.setAttribute('data-cua-block', blockMode);
+        hostEl.setAttribute('data-cua-visible', visible ? '1' : '0');
+      }
     }
     // THE reconciliation — GC of expired/unclaimed stamps and a fresh veil write
     // for EVERY host of this extension, this world's own host included. It runs
