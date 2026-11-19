@@ -101,8 +101,53 @@ struct Settings {
     browser_port: u16,
     /// Per browser tool-call timeout in ms (default 40000).
     browser_timeout_ms: u64,
+    /// Use the visual layout detector (YOLO/OCR "OmniParser-style" grounding)
+    /// in addition to the UIA tree. Maps to `perception_layout`.
+    perception_layout: bool,
+    /// Preferred inference device for the visual detector.
+    /// Written to config as `det_backend`.
+    det_backend: DetBackend,
     deny_processes: Vec<String>,
     deny_key_modifiers: Vec<String>,
+}
+
+/// Inference device for the visual detector. `Auto` lets the CLI choose
+/// (CUDA if compiled in and available, then WGPU, then CPU).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DetBackend {
+    Auto,
+    Cuda,
+    Wgpu,
+    Cpu,
+}
+
+impl DetBackend {
+    fn as_str(self) -> &'static str {
+        match self {
+            DetBackend::Auto => "auto",
+            DetBackend::Cuda => "cuda",
+            DetBackend::Wgpu => "wgpu",
+            DetBackend::Cpu => "cpu",
+        }
+    }
+    fn from_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "cuda" => DetBackend::Cuda,
+            "wgpu" => DetBackend::Wgpu,
+            "cpu" | "flex" => DetBackend::Cpu,
+            _ => DetBackend::Auto,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            DetBackend::Auto => "自动",
+            DetBackend::Cuda => "CUDA",
+            DetBackend::Wgpu => "WGPU",
+            DetBackend::Cpu => "CPU",
+        }
+    }
+    const ALL: [DetBackend; 4] =
+        [DetBackend::Auto, DetBackend::Cuda, DetBackend::Wgpu, DetBackend::Cpu];
 }
 
 impl Settings {
@@ -155,6 +200,12 @@ impl Settings {
                 .and_then(|x| x.as_u64())
                 .map(|t| t.clamp(1000, 300_000))
                 .unwrap_or(40_000),
+            perception_layout: bool_of(&v, "perception_layout", false),
+            det_backend: v
+                .get("det_backend")
+                .and_then(|x| x.as_str())
+                .map(DetBackend::from_str)
+                .unwrap_or(DetBackend::Auto),
             deny_processes,
             deny_key_modifiers,
         }
@@ -189,6 +240,8 @@ fn save_settings(s: &Settings) -> Result<(), String> {
     obj.insert("browser_import_passwords".into(), json!(s.browser_import_passwords));
     obj.insert("browser_port".into(), json!(s.browser_port));
     obj.insert("browser_timeout_ms".into(), json!(s.browser_timeout_ms));
+    obj.insert("perception_layout".into(), json!(s.perception_layout));
+    obj.insert("det_backend".into(), json!(s.det_backend.as_str()));
     obj.insert("deny_processes".into(), json!(s.deny_processes));
     obj.insert("deny_key_modifiers".into(), json!(s.deny_key_modifiers));
     let pretty = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
@@ -466,6 +519,74 @@ fn probe_config() -> (ProbeState, String) {
     }
 }
 
+/// Is an NVIDIA CUDA toolkit / driver present? Checks the three things that
+/// actually matter for `cargo build --features cuda`: the toolkit directory,
+/// nvcc on PATH, and a usable driver via nvidia-smi.
+fn probe_cuda() -> (ProbeState, String) {
+    let toolkit = std::env::var("CUDA_PATH")
+        .ok()
+        .filter(|p| std::path::Path::new(p).is_dir());
+    let nvcc = which("nvcc.exe");
+    let smi = which("nvidia-smi.exe");
+    let driver = smi.as_ref().and_then(|p| {
+        std::process::Command::new(p)
+            .args(["--query-gpu=name,driver_version", "--format=csv,noheader"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    });
+    match (toolkit.as_deref(), nvcc.as_deref(), driver.as_deref()) {
+        (Some(tk), Some(_), Some(drv)) => (
+            ProbeState::Ok,
+            format!("CUDA toolkit + 驱动就绪 · {drv} · {tk}"),
+        ),
+        (None, Some(_), Some(drv)) => (
+            ProbeState::Warn,
+            format!("有驱动（{drv}）但未检测到 CUDA toolkit · 点「下载 CUDA」安装后需源码构建"),
+        ),
+        (None, None, Some(drv)) => (
+            ProbeState::Warn,
+            format!("仅有驱动（{drv}）· 未安装 CUDA toolkit · 当前用 WGPU 推理"),
+        ),
+        (Some(_), None, Some(drv)) => (
+            ProbeState::Warn,
+            format!("CUDA_PATH 存在但 PATH 里没有 nvcc · {drv} · 可能需重开终端"),
+        ),
+        (_, _, None) => (
+            ProbeState::Unknown,
+            "未检测到 NVIDIA 驱动 · 使用 WGPU/CPU 推理".into(),
+        ),
+    }
+}
+
+fn which(exe: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|d| d.join(exe))
+        .find(|p| p.is_file())
+}
+
+/// Open a URL in the default browser. Used by the CUDA download button.
+fn open_url(url: &str) -> bool {
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let op = HSTRING::from("open");
+    let file = HSTRING::from(url);
+    let rc = unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR(op.as_ptr()),
+            PCWSTR(file.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    rc.0 as usize > 32
+}
+
 fn run_probes() -> Vec<Probe> {
     let mut out = Vec::new();
     let (s, d) = probe_config();
@@ -482,6 +603,8 @@ fn run_probes() -> Vec<Probe> {
     out.push(Probe { label: "指针预览宿主", state: s, detail: d });
     let (s, d) = probe_rec_encoder();
     out.push(Probe { label: "录制编码器", state: s, detail: d });
+    let (s, d) = probe_cuda();
+    out.push(Probe { label: "CUDA 环境", state: s, detail: d });
     out
 }
 
@@ -493,6 +616,7 @@ enum Toggle {
     FullMode,
     RequireShot,
     ImportPasswords,
+    PerceptionLayout,
 }
 
 #[derive(Clone, Copy)]
@@ -528,6 +652,7 @@ impl SettingsView {
             Toggle::FullMode => self.cfg.full_mode = !self.cfg.full_mode,
             Toggle::RequireShot => self.cfg.require_shot_id_for_coords = !self.cfg.require_shot_id_for_coords,
             Toggle::ImportPasswords => self.cfg.browser_import_passwords = !self.cfg.browser_import_passwords,
+            Toggle::PerceptionLayout => self.cfg.perception_layout = !self.cfg.perception_layout,
         }
         self.status = None;
         cx.notify();
@@ -761,6 +886,96 @@ impl Render for SettingsView {
 
         body = body.child(section("常规", full_rows, cx));
         body = body.child(section("浏览器", browser_rows, cx));
+
+        // 感知：视觉布局检测（OmniParser 式）+ 推理设备 + CUDA 环境
+        let mut perception_rows = div().flex().flex_col().gap(px(2.)).w_full();
+        perception_rows = perception_rows.child(row(
+            "视觉布局检测",
+            "OCR/目标检测辅助定位（OmniParser 式）；关闭则只用 UIA 元素树",
+            self.cfg.perception_layout,
+            Toggle::PerceptionLayout,
+            cx,
+        ));
+        // device picker: four pills, the selected one inverted
+        let mut dev_pills = div().flex().items_center().gap(px(6.));
+        for b in DetBackend::ALL {
+            let on = self.cfg.det_backend == b;
+            dev_pills = dev_pills.child(
+                div()
+                    .id(SharedString::from(format!("dev-{}", b.as_str())))
+                    .px(px(11.))
+                    .py(px(4.))
+                    .rounded(px(999.))
+                    .text_size(px(11.5))
+                    .cursor_pointer()
+                    .when(on, |s| {
+                        s.bg(rgb(0xffffff))
+                            .text_color(rgb(0x000000))
+                            .font_weight(FontWeight::MEDIUM)
+                    })
+                    .when(!on, |s| {
+                        s.bg(rgb(0x2b2b2b))
+                            .text_color(rgb(0x8a8a8a))
+                            .border_1()
+                            .border_color(rgb(0x3d3d3d))
+                    })
+                    .on_click(cx.listener(move |this, _ev, _window, cx| {
+                        this.cfg.det_backend = b;
+                        this.status = None;
+                        cx.notify();
+                    }))
+                    .child(b.label()),
+            );
+        }
+        perception_rows = perception_rows.child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .w_full()
+                .py(px(10.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .text_color(rgb(0xffffff))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child("推理设备"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(0x8a8a8a))
+                                .child("自动 = 有 CUDA 用 CUDA，否则 WGPU，最后 CPU"),
+                        ),
+                )
+                .child(dev_pills),
+        );
+        // CUDA download shortcut: opens the toolkit page in the default browser
+        perception_rows = perception_rows.child(
+            div()
+                .id("cuda-download")
+                .flex()
+                .items_center()
+                .justify_center()
+                .w_full()
+                .py(px(6.))
+                .rounded(px(8.))
+                .border_1()
+                .border_color(rgb(0x3d3d3d))
+                .text_size(px(11.5))
+                .text_color(rgb(0xc9c9c9))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(0x2b2b2b)))
+                .on_click(cx.listener(|_this, _ev, _window, _cx| {
+                    open_url("https://developer.nvidia.com/cuda-downloads");
+                }))
+                .child("没有 CUDA？打开下载页面 ↗"),
+        );
+        body = body.child(section("感知（视觉检测）", perception_rows, cx));
 
 
         body = body.child(chips(
@@ -1121,6 +1336,8 @@ mod tests {
             browser_import_passwords: false,
             browser_port: 9001,
             browser_timeout_ms: 25_000,
+            perception_layout: true,
+            det_backend: DetBackend::Cuda,
             deny_processes: vec!["cmd".into(), "extra-custom".into()],
             deny_key_modifiers: vec!["win".into()],
         };
@@ -1142,6 +1359,8 @@ mod tests {
             raw.get("browser_import_passwords").and_then(|x| x.as_bool()),
             Some(false)
         );
+        assert_eq!(raw.get("perception_layout").and_then(|x| x.as_bool()), Some(true));
+        assert_eq!(raw.get("det_backend").and_then(|x| x.as_str()), Some("cuda"));
         let reloaded = Settings::load();
         assert!(!reloaded.pointer_preview);
         assert!(reloaded.session_start_show_viewer);

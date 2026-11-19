@@ -72,6 +72,10 @@ pub struct Spec {
     /// a11y actions have no coordinates — the emitter resolves this selector to
     /// the target window's rect centre, so the preview still lands on target
     pub window_sel: Option<String>,
+    /// the element index for an a11y action. When present the emitter resolves
+    /// the element's own rect centre from the cached observation, so a UIA
+    /// click previews where it actually lands (the pointer never moves there).
+    pub index: Option<usize>,
     /// delivery type shown in the bubble: 键鼠 (real SendInput), UIA
     /// (accessibility patterns, the real pointer never moves), 消息 (posted
     /// window messages), 窗口 (window management), 系统 (ShellExecute/process
@@ -179,19 +183,21 @@ fn deliver(spec: Spec) {
     if !enabled() {
         return;
     }
-    // a11y actions carry no coordinates: resolve the target window's rect
-    // centre here (never blocking the action path for long — the host is
-    // already warm by post time)
+    // a11y actions carry no coordinates: resolve the *element's* rect centre
+    // from the cached observation so the dot lands where UIA will actually
+    // click, not on the window centre. Falls back to the window centre when
+    // there is no index, no cache, or the element is off-screen/zero-sized.
     let spec = match (&spec.window_sel, spec.x, spec.y) {
         (Some(sel), None, None) => {
-            let centered = match crate::win::resolve_window(sel) {
-                    Ok(hwnd) => match crate::win::window_rect(hwnd) {
-                        Ok([rx, ry, rw, rh]) => Some(anchored_centre(rx, ry, rw, rh)),
-                        _ => None,
-                    },
-                    Err(_) => None,
-                };
-            match centered {
+            let resolved = match crate::win::resolve_window(sel) {
+                Ok(hwnd) => element_centre(hwnd.0 as isize, spec.index).or_else(|| {
+                    crate::win::window_rect(hwnd)
+                        .ok()
+                        .map(|[rx, ry, rw, rh]| anchored_centre(rx, ry, rw, rh))
+                }),
+                Err(_) => None,
+            };
+            match resolved {
                 Some((x, y)) => {
                     let mut s2 = spec.clone();
                     s2.x = Some(x);
@@ -281,6 +287,74 @@ fn anchored_centre(rx: i32, ry: i32, rw: i32, rh: i32) -> (i32, i32) {
     (cx, cy)
 }
 
+/// Centre of the element with `index` in the cached observation for `hwnd`.
+///
+/// This is what makes a UIA preview honest: `cua click --index 12` never moves
+/// the pointer, so a dot on the window centre would be a lie. The cache is the
+/// same `elements-<hwnd>.json` the action path resolves indices against.
+///
+/// Returns None when there is no index, no cache, no matching element, or the
+/// element reports a degenerate rect (some virtualized list items do) — the
+/// caller then falls back to the window centre.
+fn element_centre(hwnd: isize, index: Option<usize>) -> Option<(i32, i32)> {
+    let index = index? as i64;
+    let cache = crate::util::load_elements(hwnd)?;
+    centre_from_cache(&cache, index)
+}
+
+/// Pure part of `element_centre`: find `index` in a cached element array and
+/// return its rect centre. Split out so it can be tested without touching the
+/// on-disk cache.
+fn centre_from_cache(cache: &Value, index: i64) -> Option<(i32, i32)> {
+    let arr = cache.as_array()?;
+    let node = arr
+        .iter()
+        .find(|n| n.get("i").and_then(|v| v.as_i64()) == Some(index))?;
+    let r = node.get("rect")?.as_array()?;
+    if r.len() < 4 {
+        return None;
+    }
+    let (x, y) = (r[0].as_i64()? as i32, r[1].as_i64()? as i32);
+    let (w, h) = (r[2].as_i64()? as i32, r[3].as_i64()? as i32);
+    // a zero/negative extent means UIA could not measure the element
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    Some(anchored_centre(x, y, w, h))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn element_centre_uses_the_element_rect_not_the_window() {
+        // A menu bar at the window's top-left corner: the preview must follow
+        // the element (256,256), never the window centre (1188,729). This is
+        // the regression that made every UIA preview sit in the screen centre.
+        let cache = json!([
+            {"i": 0, "rect": [228, 228, 1921, 1002]},
+            {"i": 10, "rect": [239, 239, 34, 34]},
+        ]);
+        assert_eq!(centre_from_cache(&cache, 10), Some((256, 256)));
+        assert_eq!(centre_from_cache(&cache, 0), Some((1188, 729)));
+    }
+
+    #[test]
+    fn element_centre_rejects_missing_and_degenerate_rects() {
+        let cache = json!([
+            {"i": 1, "rect": [10, 10, 0, 0]},
+            {"i": 2, "rect": [10, 10, 40]},
+            {"i": 3},
+        ]);
+        assert_eq!(centre_from_cache(&cache, 1), None, "zero-size element");
+        assert_eq!(centre_from_cache(&cache, 2), None, "short rect array");
+        assert_eq!(centre_from_cache(&cache, 3), None, "no rect at all");
+        assert_eq!(centre_from_cache(&cache, 99), None, "index not in cache");
+    }
+}
+
 /// Maps a dispatched command to its preview packet, or None for commands that
 /// must not show one: read-only probes, the browser (its own in-page cursor
 /// covers it), the sandbox (the hidden desktop is invisible), and the child
@@ -334,6 +408,7 @@ pub fn pre_spec(cmd: &crate::Cmd) -> Option<Spec> {
                 click: true,
                 ok: None,
                 window_sel: window.clone(),
+                index: *index,
                 post_xy: None,
             })
         }
@@ -347,6 +422,7 @@ pub fn pre_spec(cmd: &crate::Cmd) -> Option<Spec> {
             click: false,
             ok: None,
             window_sel: window.clone(),
+                index: None,
             post_xy: None,
         }),
         Cmd::Scroll { dx: _, dy: _, x, y, window, sandbox, background, .. } if !*sandbox => Some(Spec {
@@ -359,6 +435,7 @@ pub fn pre_spec(cmd: &crate::Cmd) -> Option<Spec> {
             click: false,
             ok: None,
             window_sel: window.clone(),
+                index: None,
             post_xy: None,
         }),
         Cmd::Drag { x1, y1, x2, y2, sandbox, background, .. } if !*sandbox => Some(Spec {
@@ -374,6 +451,7 @@ pub fn pre_spec(cmd: &crate::Cmd) -> Option<Spec> {
             click: false,
             ok: None,
             window_sel: None,
+                index: None,
             post_xy: Some((*x2, *y2)),
         }),
         Cmd::Key { keys, window, sandbox, background, .. } if !*sandbox => {
@@ -388,6 +466,7 @@ pub fn pre_spec(cmd: &crate::Cmd) -> Option<Spec> {
                 click: false,
                 ok: None,
                 window_sel: window.clone(),
+                index: None,
                 post_xy: None,
             })
         }
@@ -403,6 +482,7 @@ pub fn pre_spec(cmd: &crate::Cmd) -> Option<Spec> {
                 click: false,
                 ok: None,
                 window_sel: window.clone(),
+                index: None,
                 post_xy: None,
             })
         }
@@ -416,25 +496,26 @@ pub fn pre_spec(cmd: &crate::Cmd) -> Option<Spec> {
             click: false,
             ok: None,
             window_sel: Some(window.clone()),
+                index: None,
             post_xy: None,
         }),
-        Cmd::Toggle { window, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "切换", tag: "UIA", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
-        Cmd::Select { window, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "选择", tag: "UIA", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
-        Cmd::SelectAdd { window, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "多选", tag: "UIA", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
-        Cmd::SelectRemove { window, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "取消选择", tag: "UIA", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
-        Cmd::Expand { window, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "展开", tag: "UIA", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
-        Cmd::Collapse { window, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "折叠", tag: "UIA", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
-        Cmd::SetRange { window, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "设值", tag: "UIA", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
-        Cmd::ScrollItem { window, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "滚动到", tag: "UIA", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
-        Cmd::Realize { window, .. } => Some(Spec { phase: "pre", verb: "展开", tag: "UIA", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
-        Cmd::Grid { window, row, col, invoke, .. } if *invoke && row.is_some() && col.is_some() => Some(Spec { phase: "pre", verb: "选中", tag: "UIA", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
-        Cmd::Transform { window, move_to, size, zoom, .. } if move_to.is_some() || size.is_some() || zoom.is_some() => Some(Spec { phase: "pre", verb: "变换", tag: "UIA", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
+        Cmd::Toggle { window, index, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "切换", tag: "UIA", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), index: Some(*index), post_xy: None }),
+        Cmd::Select { window, index, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "选择", tag: "UIA", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), index: Some(*index), post_xy: None }),
+        Cmd::SelectAdd { window, index, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "多选", tag: "UIA", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), index: Some(*index), post_xy: None }),
+        Cmd::SelectRemove { window, index, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "取消选择", tag: "UIA", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), index: Some(*index), post_xy: None }),
+        Cmd::Expand { window, index, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "展开", tag: "UIA", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), index: Some(*index), post_xy: None }),
+        Cmd::Collapse { window, index, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "折叠", tag: "UIA", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), index: Some(*index), post_xy: None }),
+        Cmd::SetRange { window, index, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "设值", tag: "UIA", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), index: Some(*index), post_xy: None }),
+        Cmd::ScrollItem { window, index, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "滚动到", tag: "UIA", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), index: Some(*index), post_xy: None }),
+        Cmd::Realize { window, index, .. } => Some(Spec { phase: "pre", verb: "展开", tag: "UIA", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), index: Some(*index), post_xy: None }),
+        Cmd::Grid { window, row, col, invoke, .. } if *invoke && row.is_some() && col.is_some() => Some(Spec { phase: "pre", verb: "选中", tag: "UIA", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), index: None, post_xy: None }),
+        Cmd::Transform { window, move_to, size, zoom, .. } if move_to.is_some() || size.is_some() || zoom.is_some() => Some(Spec { phase: "pre", verb: "变换", tag: "UIA", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), index: None, post_xy: None }),
         // window management: real desktop changes, but never the pointer
-        Cmd::Close { window, .. } => Some(Spec { phase: "pre", verb: "关闭", tag: "窗口", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
-        Cmd::Activate { window, .. } => Some(Spec { phase: "pre", verb: "激活", tag: "窗口", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
-        Cmd::Minimize { window, .. } => Some(Spec { phase: "pre", verb: "最小化", tag: "窗口", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
-        Cmd::Maximize { window, .. } => Some(Spec { phase: "pre", verb: "最大化", tag: "窗口", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
-        Cmd::Restore { window, .. } => Some(Spec { phase: "pre", verb: "还原", tag: "窗口", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), post_xy: None }),
+        Cmd::Close { window, .. } => Some(Spec { phase: "pre", verb: "关闭", tag: "窗口", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), index: None, post_xy: None }),
+        Cmd::Activate { window, .. } => Some(Spec { phase: "pre", verb: "激活", tag: "窗口", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), index: None, post_xy: None }),
+        Cmd::Minimize { window, .. } => Some(Spec { phase: "pre", verb: "最小化", tag: "窗口", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), index: None, post_xy: None }),
+        Cmd::Maximize { window, .. } => Some(Spec { phase: "pre", verb: "最大化", tag: "窗口", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), index: None, post_xy: None }),
+        Cmd::Restore { window, .. } => Some(Spec { phase: "pre", verb: "还原", tag: "窗口", detail: d(&Some(window.clone()), None, None), x: None, y: None, click: false, ok: None, window_sel: Some(window.clone()), index: None, post_xy: None }),
         Cmd::Resize { window, width, height, x, y, .. } => Some(Spec {
             phase: "pre",
             verb: "调整大小",
@@ -448,14 +529,15 @@ pub fn pre_spec(cmd: &crate::Cmd) -> Option<Spec> {
             click: false,
             ok: None,
             window_sel: Some(window.clone()),
+                index: None,
             post_xy: None,
         }),
         // process launches: no pointer involved
-        Cmd::Open { name, .. } => Some(Spec { phase: "pre", verb: "打开", tag: "系统", detail: name.chars().take(24).collect(), x: None, y: None, click: false, ok: None, window_sel: None, post_xy: None }),
-        Cmd::Launch { exe, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "启动", tag: "系统", detail: exe.chars().take(24).collect(), x: None, y: None, click: false, ok: None, window_sel: None, post_xy: None }),
+        Cmd::Open { name, .. } => Some(Spec { phase: "pre", verb: "打开", tag: "系统", detail: name.chars().take(24).collect(), x: None, y: None, click: false, ok: None, window_sel: None, index: None, post_xy: None }),
+        Cmd::Launch { exe, sandbox, .. } if !*sandbox => Some(Spec { phase: "pre", verb: "启动", tag: "系统", detail: exe.chars().take(24).collect(), x: None, y: None, click: false, ok: None, window_sel: None, index: None, post_xy: None }),
         Cmd::Clipboard { op: crate::ClipOp::Set { .. } } => {
             let (x, y) = fg().map(|(a, b)| (Some(a), Some(b))).unwrap_or((None, None));
-            Some(Spec { phase: "pre", verb: "剪贴", tag: "剪贴板", detail: "写入剪贴板".into(), x, y, click: false, ok: None, window_sel: None, post_xy: None })
+            Some(Spec { phase: "pre", verb: "剪贴", tag: "剪贴板", detail: "写入剪贴板".into(), x, y, click: false, ok: None, window_sel: None, index: None, post_xy: None })
         }
         _ => None,
     }
@@ -479,6 +561,7 @@ pub fn post_from(pre: &Spec, ok: bool) -> Spec {
         click: pre.click,
         ok: Some(ok),
         window_sel: pre.window_sel.clone(),
+                index: None,
         post_xy: None,
     }
 }

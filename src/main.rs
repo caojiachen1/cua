@@ -1244,6 +1244,18 @@ enum SandboxOp {
 
 fn main() {
     win::dpi_aware();
+    // The settings app's 推理设备 choice (config `det_backend`) becomes the
+    // process-wide detector preference. An explicit CUA_DET_BACKEND in the
+    // environment still wins — this only fills it in when unset.
+    if std::env::var_os("CUA_DET_BACKEND").is_none() {
+        if let Some(v) = util::load_config_json().get("det_backend").and_then(|x| x.as_str()) {
+            let v = v.trim().to_ascii_lowercase();
+            if matches!(v.as_str(), "cuda" | "wgpu" | "cpu" | "flex") {
+                std::env::set_var("CUA_DET_BACKEND", &v);
+            }
+            // "auto" stays unset so vision::pick_device applies its own order
+        }
+    }
     // UTF-8 console output so JSON with CJK titles survives pipes (PowerShell decodes UTF-8)
     unsafe {
         let _ = windows::Win32::System::Console::SetConsoleOutputCP(65001);
@@ -1305,6 +1317,21 @@ fn dispatch(cmd: Cmd) -> i32 {
             Cmd::Mode { mode, confirm } => cmd_mode(mode, confirm),
             Cmd::Apps { all } => cmd_apps(all),
             Cmd::State { window, depth, no_shot, out, diff, redact, patterns, raw, perception, detail, ocr_profile, deadline_ms, stream } => {
+                // The settings app's 视觉布局检测 switch supplies the default:
+                // when it is on, a plain `cua state` also runs the visual
+                // pipeline (UIA tree + OCR/detector grounding). An explicit
+                // --perception always wins; the switch defaults to OFF so a
+                // stock install keeps the fast pure-UIA path and never touches
+                // the 1.5 GB model set unless the user asked for it.
+                let cfg_perception = util::load_config_json()
+                    .get("perception_layout")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let perception = perception.or(if cfg_perception {
+                    Some(perception::types::Mode::Auto)
+                } else {
+                    None
+                });
                 if perception.is_some() || detail.is_some() || ocr_profile.is_some() || stream || deadline_ms.is_some() {
                     if diff || patterns || raw {
                         bail!("--diff/--patterns/--raw are not supported together with --perception yet; use the v1 state path");

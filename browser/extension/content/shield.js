@@ -237,19 +237,31 @@
       padding: 4px 5px 4px 12px; font-size: 11.5px; line-height: 1;
       backdrop-filter: blur(8px);
       pointer-events: none; user-select: none;
+      /* keep the label on one line: a wrapped pill reads as broken chrome.
+         `width: max-content` stops the absolutely-positioned pill from being
+         sized by its containing block, which is what forced the wrap. */
+      white-space: nowrap;
+      width: max-content;
     }
+    /* `* { all: initial }` above resets every descendant to the initial black
+       text colour, so the label span painted black-on-black inside the pill.
+       Re-assert white for the pill and everything in it (the two buttons set
+       their own colour below and keep it — they are more specific). */
+    .pill, .pill span { color: #fff; }
     .dot { width: 6px; height: 6px; border-radius: 50%; background: #fff; animation: cua-blink 1.2s infinite; }
     @keyframes cua-blink { 50% { opacity: .25; } }
     button.stop {
       all: unset; pointer-events: auto; cursor: pointer;
       background: #fff; color: #000; border-radius: 999px;
       padding: 4px 11px; font-size: 11px; font-weight: 600;
+      white-space: nowrap;
     }
     button.stop:hover { background: #d4d4d4; }
     button.resume {
       all: unset; pointer-events: auto; cursor: pointer;
       background: #000; color: #fff; border: 1px solid rgba(255,255,255,.5); border-radius: 999px;
       padding: 4px 11px; font-size: 11px; font-weight: 600;
+      white-space: nowrap;
     }
     button.resume:hover { background: #1a1a1a; }
     .confirm {
@@ -260,7 +272,7 @@
       background: #0a0a0a; color: #fff; border: 1px solid rgba(255,255,255,.22); border-radius: 12px; padding: 18px 22px;
       max-width: 420px; box-shadow: 0 24px 60px rgba(0,0,0,.5); font-size: 13.5px;
     }
-    .card h3 { margin: 0 0 6px; font-size: 15px; }
+    .card h3 { margin: 0 0 6px; font-size: 15px; color: #fff; }
     .card p { margin: 0 0 14px; color: #a3a3a3; }
     .card .btns { display: flex; gap: 8px; justify-content: flex-end; align-items: center; }
     .card button { all: unset; cursor: pointer; border-radius: 8px; padding: 7px 16px; font-size: 12.5px; font-weight: 600; }
@@ -275,7 +287,7 @@
       padding: 12px 16px; max-width: 460px; pointer-events: auto;
       box-shadow: 0 18px 48px rgba(0,0,0,.5); font-size: 13px;
     }
-    .helpcard .t { font-weight: 600; margin-bottom: 3px; font-size: 13px; }
+    .helpcard .t { font-weight: 600; margin-bottom: 3px; font-size: 13px; color: #fff; }
     .helpcard .s { color: #a3a3a3; font-size: 11.5px; margin-bottom: 9px; }
     .helpcard .btns { display: flex; gap: 7px; justify-content: flex-end; align-items: center; }
     .helpcard button { all: unset; cursor: pointer; border-radius: 8px; padding: 5px 12px; font-size: 11.5px; font-weight: 600; }
