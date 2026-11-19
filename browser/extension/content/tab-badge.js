@@ -16,8 +16,8 @@
   if (!isTop) return;
 
   const MARKS = {
-    deliverable: { color: '#22c55e', glyph: 'check' },
-    handoff: { color: '#f59e0b', glyph: 'pause' },
+    deliverable: { color: '#ffffff', glyph: 'check' },
+    handoff: { color: '#8a8a8a', glyph: 'pause' },
   };
 
   let current = undefined; // undefined = never marked in this document
@@ -67,7 +67,7 @@
     ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2.5; ctx.stroke();
     ctx.beginPath(); ctx.arc(23, 23, 6.5, 0, Math.PI * 2);
     ctx.fillStyle = spec.color; ctx.fill();
-    ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2.2; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.strokeStyle = '#000000'; ctx.lineWidth = 2.2; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
     if (spec.glyph === 'check') {
       ctx.beginPath(); ctx.moveTo(19.8, 23.2); ctx.lineTo(22.2, 25.6); ctx.lineTo(26.6, 20.2); ctx.stroke();
     } else {
@@ -85,7 +85,7 @@
     if (img) {
       try { ctx.drawImage(img, 0, 0, 32, 32); } catch { /* keep blank under the badge */ }
     } else {
-      ctx.fillStyle = '#0f172a';
+      ctx.fillStyle = '#202020';
       ctx.fillRect(0, 0, 32, 32);
     }
     withBadge(ctx, MARKS[mark]);

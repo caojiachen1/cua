@@ -9,6 +9,9 @@
 // agent. Unknown keys are preserved on save (the merge mirrors
 // util::set_full_mode), and a malformed config is never overwritten.
 
+// GUI subsystem: launching the settings window must not flash a console.
+#![windows_subsystem = "windows"]
+
 use gpui::{
     div, prelude::*, px, rgb, size, App, Application, Bounds, Context, FontWeight, SharedString,
     Window, WindowBounds, WindowOptions,
@@ -233,7 +236,7 @@ impl Render for SettingsView {
                 .py(px(10.))
                 .on_click(cx.listener(move |this, _ev, _window, cx| this.toggle(t, cx)))
                 .cursor_pointer()
-                .hover(|s| s.bg(rgb(0x141414)))
+                .hover(|s| s.bg(rgb(0x2b2b2b)))
                 .child(
                     div()
                         .flex()
@@ -280,10 +283,10 @@ impl Render for SettingsView {
                                 .font_weight(FontWeight::MEDIUM)
                         })
                         .when(!on, |s| {
-                            s.bg(rgb(0x141414))
+                            s.bg(rgb(0x2b2b2b))
                                 .text_color(rgb(0x8a8a8a))
                                 .border_1()
-                                .border_color(rgb(0x2e2e2e))
+                                .border_color(rgb(0x3d3d3d))
                         })
                         .child((*item).to_string()),
                 );
@@ -329,7 +332,7 @@ impl Render for SettingsView {
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgb(0x0a0a0a))
+            .bg(rgb(0x202020))
             .text_color(rgb(0xffffff))
             .p(px(22.))
             .gap(px(14.))
@@ -417,10 +420,10 @@ fn section(title: &'static str, body: impl IntoElement, cx: &mut Context<Setting
         .gap(px(8.))
         .w_full()
         .border_1()
-        .border_color(rgb(0x1f1f1f))
+        .border_color(rgb(0x2e2e2e))
         .rounded(px(12.))
         .p(px(16.))
-        .bg(rgb(0x101010))
+        .bg(rgb(0x282828))
         .child(
             div()
                 .text_size(px(11.))
@@ -442,7 +445,7 @@ fn toggle_switch(on: bool) -> impl IntoElement {
         .rounded(px(999.))
         .p(px(2.))
         .when(on, |s| s.bg(rgb(0xffffff)).justify_end())
-        .when(!on, |s| s.bg(rgb(0x2e2e2e)).justify_start())
+        .when(!on, |s| s.bg(rgb(0x3d3d3d)).justify_start())
         .child(
             div()
                 .w(px(14.))

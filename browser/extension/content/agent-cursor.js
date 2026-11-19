@@ -36,14 +36,14 @@
   will-change:transform;font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
 #cua-agent-cursor.cua-on{opacity:1}
 .cua-cursor-dot{position:absolute;left:-7px;top:-7px;width:14px;height:14px;border-radius:50%;
-  background:#3b82f6;border:2px solid #fff;box-shadow:0 1px 6px rgba(0,0,0,.35)}
+  background:#fff;border:2px solid #000;box-shadow:0 1px 6px rgba(0,0,0,.45)}
 #cua-agent-cursor.cua-on .cua-cursor-dot{animation:cua-cursor-pulse 1.2s ease-in-out infinite}
-#cua-agent-cursor.cua-pre .cua-cursor-dot{background:#f59e0b;border-color:#fff}
-#cua-agent-cursor.cua-act .cua-cursor-dot{background:#3b82f6;border-color:#fff}
-#cua-agent-cursor.cua-post .cua-cursor-dot{background:#22c55e;border-color:#fff}
-#cua-agent-cursor.cua-fail .cua-cursor-dot{background:#ef4444;border-color:#fff}
+#cua-agent-cursor.cua-pre .cua-cursor-dot{background:rgba(255,255,255,.55);border-color:#000}
+#cua-agent-cursor.cua-act .cua-cursor-dot{background:#fff;border-color:#000}
+#cua-agent-cursor.cua-post .cua-cursor-dot{background:#fff;border-color:#000}
+#cua-agent-cursor.cua-fail .cua-cursor-dot{background:#000;border-color:#fff}
 .cua-cursor-ring{position:absolute;left:-9px;top:-9px;width:18px;height:18px;border-radius:50%;
-  border:2px solid #22c55e;opacity:0}
+  border:2px solid #fff;opacity:0}
 .cua-cursor-ring.cua-run{animation:cua-cursor-ripple .6s ease-out forwards}
 @keyframes cua-cursor-ripple{0%{transform:scale(.4);opacity:.9}
   100%{transform:scale(2.6);opacity:0}}
