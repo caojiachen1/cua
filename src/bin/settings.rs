@@ -94,6 +94,13 @@ struct Settings {
     rec_quality: u8,
     /// Recorder frames per second.
     rec_fps: u32,
+    /// A brand-new browser profile may import the main profile's passwords and
+    /// history (cua edge --import-passwords / --no-import-passwords default).
+    browser_import_passwords: bool,
+    /// Browser bridge daemon port (default 8765).
+    browser_port: u16,
+    /// Per browser tool-call timeout in ms (default 40000).
+    browser_timeout_ms: u64,
     deny_processes: Vec<String>,
     deny_key_modifiers: Vec<String>,
 }
@@ -137,6 +144,17 @@ impl Settings {
                 .and_then(|x| x.as_u64())
                 .map(|f| f.clamp(1, 30) as u32)
                 .unwrap_or(2),
+            browser_import_passwords: bool_of(&v, "browser_import_passwords", true),
+            browser_port: v
+                .get("browser_port")
+                .and_then(|x| x.as_u64())
+                .map(|p| p.clamp(1, 65535) as u16)
+                .unwrap_or(8765),
+            browser_timeout_ms: v
+                .get("browser_timeout_ms")
+                .and_then(|x| x.as_u64())
+                .map(|t| t.clamp(1000, 300_000))
+                .unwrap_or(40_000),
             deny_processes,
             deny_key_modifiers,
         }
@@ -168,6 +186,9 @@ fn save_settings(s: &Settings) -> Result<(), String> {
     obj.insert("require_shot_id_for_coords".into(), json!(s.require_shot_id_for_coords));
     obj.insert("rec_quality".into(), json!(s.rec_quality));
     obj.insert("rec_fps".into(), json!(s.rec_fps));
+    obj.insert("browser_import_passwords".into(), json!(s.browser_import_passwords));
+    obj.insert("browser_port".into(), json!(s.browser_port));
+    obj.insert("browser_timeout_ms".into(), json!(s.browser_timeout_ms));
     obj.insert("deny_processes".into(), json!(s.deny_processes));
     obj.insert("deny_key_modifiers".into(), json!(s.deny_key_modifiers));
     let pretty = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
@@ -181,6 +202,9 @@ struct SettingsView {
     /// Read-only environment probes, refreshed on open and on demand. They
     /// never write anything — they only answer "is this feature usable here?".
     health: Vec<Probe>,
+    /// gpui only routes wheel events to an overflow_y_scroll element when a
+    /// ScrollHandle is tracked on it.
+    scroll: gpui::ScrollHandle,
 }
 
 /// One line in the 状态检测 section: what was checked and how it came out.
@@ -468,12 +492,21 @@ enum Toggle {
     Headless,
     FullMode,
     RequireShot,
+    ImportPasswords,
 }
 
 #[derive(Clone, Copy)]
 enum Chip {
     DenyProcess(usize),
     DenyModifier(usize),
+}
+
+/// Numeric settings edited with -/+ steppers (gpui 0.2 has no text input in
+/// this build, and a stepper is clearer for bounded integers anyway).
+#[derive(Clone, Copy)]
+enum Num {
+    BrowserPort,
+    BrowserTimeout,
 }
 
 impl SettingsView {
@@ -483,6 +516,7 @@ impl SettingsView {
             status: None,
             error: None,
             health: run_probes(),
+            scroll: gpui::ScrollHandle::new(),
         }
     }
 
@@ -493,6 +527,7 @@ impl SettingsView {
             Toggle::Headless => self.cfg.session_headless = !self.cfg.session_headless,
             Toggle::FullMode => self.cfg.full_mode = !self.cfg.full_mode,
             Toggle::RequireShot => self.cfg.require_shot_id_for_coords = !self.cfg.require_shot_id_for_coords,
+            Toggle::ImportPasswords => self.cfg.browser_import_passwords = !self.cfg.browser_import_passwords,
         }
         self.status = None;
         cx.notify();
@@ -516,6 +551,23 @@ impl SettingsView {
                 list.remove(pos);
             }
             None => list.push(item),
+        }
+        self.status = None;
+        cx.notify();
+    }
+
+    /// Step a bounded numeric setting. `delta` is applied in the setting's own
+    /// unit (port = 1, timeout = 5000 ms) and clamped to its range.
+    fn step_num(&mut self, n: Num, delta: i64, cx: &mut Context<Self>) {
+        match n {
+            Num::BrowserPort => {
+                let v = self.cfg.browser_port as i64 + delta;
+                self.cfg.browser_port = v.clamp(1, 65535) as u16;
+            }
+            Num::BrowserTimeout => {
+                let v = self.cfg.browser_timeout_ms as i64 + delta;
+                self.cfg.browser_timeout_ms = v.clamp(1000, 300_000) as u64;
+            }
         }
         self.status = None;
         cx.notify();
@@ -651,6 +703,32 @@ impl Render for SettingsView {
             cx,
         ));
 
+        // 浏览器：独立 profile 的数据迁移 + 桥接连接参数
+        let mut browser_rows = div().flex().flex_col().gap(px(2.)).w_full();
+        browser_rows = browser_rows.child(row(
+            "新档案导入密码与历史",
+            "cua edge 首次创建独立档案时，从主浏览器导入密码/历史；关闭则清空导入",
+            self.cfg.browser_import_passwords,
+            Toggle::ImportPasswords,
+            cx,
+        ));
+        browser_rows = browser_rows.child(number_row(
+            "桥接端口",
+            "守护进程监听端口；改完需 cua browser stop 后重新拉起",
+            self.cfg.browser_port as u64,
+            1,
+            Num::BrowserPort,
+            cx,
+        ));
+        browser_rows = browser_rows.child(number_row(
+            "工具调用超时 (ms)",
+            "单次浏览器工具调用的默认截止时间",
+            self.cfg.browser_timeout_ms,
+            5000,
+            Num::BrowserTimeout,
+            cx,
+        ));
+
         // 固定头部（标题 + 配置路径）
         let header = div()
             .flex()
@@ -678,9 +756,13 @@ impl Render for SettingsView {
             .w_full()
             .flex_1()
             .gap(px(14.))
-            .overflow_y_scroll();
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll);
 
         body = body.child(section("常规", full_rows, cx));
+        body = body.child(section("浏览器", browser_rows, cx));
+
+
         body = body.child(chips(
             "拒绝进程（这些进程上的输入会被拒绝）",
             KNOWN_DENY_PROCESSES,
@@ -854,6 +936,83 @@ fn toggle_switch(on: bool) -> impl IntoElement {
         )
 }
 
+/// A labelled numeric row with − / value / + steppers. `step` is how much one
+/// click changes the value; the display is formatted by the caller's unit.
+fn number_row(
+    label: &'static str,
+    hint: &'static str,
+    value: u64,
+    step: i64,
+    n: Num,
+    cx: &mut Context<SettingsView>,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .w_full()
+        .py(px(10.))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .text_color(rgb(0xffffff))
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(label.to_string()),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(0x8a8a8a))
+                        .child(hint.to_string()),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .child(step_button("−", format!("num-{label}-dec"), n, -step, cx))
+                .child(
+                    div()
+                        .min_w(px(52.))
+                        .text_size(px(12.5))
+                        .text_color(rgb(0xffffff))
+                        .child(value.to_string()),
+                )
+                .child(step_button("+", format!("num-{label}-inc"), n, step, cx)),
+        )
+}
+
+fn step_button(
+    glyph: &'static str,
+    id: String,
+    n: Num,
+    delta: i64,
+    cx: &mut Context<SettingsView>,
+) -> impl IntoElement {
+    div()
+        .id(SharedString::from(id))
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(24.))
+        .h(px(24.))
+        .rounded(px(7.))
+        .border_1()
+        .border_color(rgb(0x3d3d3d))
+        .bg(rgb(0x2b2b2b))
+        .text_size(px(13.))
+        .text_color(rgb(0xffffff))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(0x3a3a3a)))
+        .on_click(cx.listener(move |this, _ev, _window, cx| this.step_num(n, delta, cx)))
+        .child(glyph)
+}
+
 /// Effective scale of the primary monitor (1.0 at 96 DPI, 1.5 at 150%). The
 /// process is DPI-unaware before gpui sets awareness, so GetDpiForSystem can
 /// report 96 on a scaled display — GetDpiForMonitor with the monitor's actual
@@ -959,12 +1118,15 @@ mod tests {
             require_shot_id_for_coords: false,
             rec_quality: 65,
             rec_fps: 5,
+            browser_import_passwords: false,
+            browser_port: 9001,
+            browser_timeout_ms: 25_000,
             deny_processes: vec!["cmd".into(), "extra-custom".into()],
             deny_key_modifiers: vec!["win".into()],
         };
         save_settings(&s).unwrap();
         let raw = load_config();
-        assert_eq!(raw.get("browser_port").and_then(|x| x.as_u64()), Some(8765));
+        // an unknown key the settings app never models must survive untouched
         assert_eq!(
             raw.get("levels").and_then(|x| x.get("close")).and_then(|x| x.as_str()),
             Some("confirm")
@@ -973,6 +1135,13 @@ mod tests {
         assert_eq!(raw.get("session_headless").and_then(|x| x.as_bool()), Some(true));
         assert_eq!(raw.get("rec_quality").and_then(|x| x.as_u64()), Some(65));
         assert_eq!(raw.get("rec_fps").and_then(|x| x.as_u64()), Some(5));
+        // browser_port must survive as the user set it, not be overwritten by
+        // the round-trip (the fixture starts with 8765).
+        assert_eq!(raw.get("browser_port").and_then(|x| x.as_u64()), Some(9001));
+        assert_eq!(
+            raw.get("browser_import_passwords").and_then(|x| x.as_bool()),
+            Some(false)
+        );
         let reloaded = Settings::load();
         assert!(!reloaded.pointer_preview);
         assert!(reloaded.session_start_show_viewer);

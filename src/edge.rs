@@ -202,6 +202,16 @@ impl ImportConsent {
             None => Self::from_meta(meta),
         }
     }
+
+    /// The decision when nothing was recorded: the settings app's
+    /// `browser_import_passwords` switch, defaulting to import (the historical
+    /// behaviour) so an absent config never silently stops the import.
+    fn default_from_config(wants: Option<bool>) -> Self {
+        match wants {
+            Some(false) => ImportConsent::No,
+            _ => ImportConsent::Yes,
+        }
+    }
 }
 
 /// Map the two mutually exclusive CLI flags onto the tri-state consent value.
@@ -307,7 +317,14 @@ pub fn cmd_edge(opts: EdgeOptions) -> Result<i32> {
     let new_profile = !profile.exists();
     let recorded = read_metadata();
     let consent = match ImportConsent::resolve(opts.import_passwords, recorded.as_ref()) {
-        ImportConsent::Unrecorded => ImportConsent::Yes,
+        // No flag and nothing recorded: honour the settings app's
+        // `browser_import_passwords` choice instead of always importing.
+        ImportConsent::Unrecorded => {
+            let wants = crate::util::load_config_json()
+                .get("browser_import_passwords")
+                .and_then(|v| v.as_bool());
+            ImportConsent::default_from_config(wants)
+        }
         decided => decided,
     };
     let purge_import = new_profile && consent == ImportConsent::No;
@@ -2695,6 +2712,21 @@ mod tests {
             "an explicit flag overrides the record"
         );
         assert_eq!(ImportConsent::No.as_str(), "no");
+    }
+
+    #[test]
+    fn unrecorded_consent_follows_the_settings_switch() {
+        // absent config / absent key keeps the historical import-on default
+        assert_eq!(ImportConsent::default_from_config(None), ImportConsent::Yes);
+        assert_eq!(
+            ImportConsent::default_from_config(Some(true)),
+            ImportConsent::Yes
+        );
+        // the settings app's "off" is what suppresses the import
+        assert_eq!(
+            ImportConsent::default_from_config(Some(false)),
+            ImportConsent::No
+        );
     }
 
     #[test]
