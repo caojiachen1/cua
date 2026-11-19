@@ -230,56 +230,46 @@
     @media print { .host, .pill, .veil, .frame, .confirm, .helpcard { display: none !important; } }
     .host { position: fixed; inset: 0; z-index: 2147483647; pointer-events: none; font-family: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }
 
-    /* The frame is the edge gradient itself: a conic colour sweep masked down
-       to a band that is bright at the rim and fades inward. Every mask stop is
-       in px so the left/right and top/bottom falloffs are identical at any
-       viewport — the old percentage stops made the sides twice as thick as the
-       top and bottom on a wide screen. */
+    /* The edge glow: a bright white rim that fades inward into colour.
+       Implemented as an INSET box-shadow stack, not a gradient mask — a
+       mask-based approach made the falloff depend on the viewport aspect (the
+       percentage stops) or collapse at the corners (px stops + mask-composite).
+       Inset shadows are measured from the box edge in px on every side, so the
+       four edges and the corners all fade identically at any size.
+       Three shadows: a crisp white rim, a wide white haze, then the colour. */
     .frame {
       position: absolute; inset: 0; pointer-events: none;
       border-radius: 18px;
-      /* how far the colour reaches into the page */
-      --cua-edge: 74px;
-      background:
-        conic-gradient(from var(--cua-angle, 0deg),
-          rgba(125,211,252,1),
-          rgba(167,139,250,1),
-          rgba(244,114,182,1),
-          rgba(251,191,36,1),
-          rgba(125,211,252,1));
-      /* Four px-stopped linear masks intersected: each keeps only its own edge
-         band, and the intersection of the four is the ring plus its inward
-         falloff. Corners get the union naturally because both the horizontal
-         and vertical bands are present there. */
-      -webkit-mask:
-        linear-gradient(to right,  #000 0, #000 26px, transparent var(--cua-edge)),
-        linear-gradient(to left,   #000 0, #000 26px, transparent var(--cua-edge)),
-        linear-gradient(to bottom, #000 0, #000 26px, transparent var(--cua-edge)),
-        linear-gradient(to top,    #000 0, #000 26px, transparent var(--cua-edge));
-      -webkit-mask-composite: source-over, source-over, source-over;
-      mask:
-        linear-gradient(to right,  #000 0, #000 26px, transparent var(--cua-edge)),
-        linear-gradient(to left,   #000 0, #000 26px, transparent var(--cua-edge)),
-        linear-gradient(to bottom, #000 0, #000 26px, transparent var(--cua-edge)),
-        linear-gradient(to top,    #000 0, #000 26px, transparent var(--cua-edge));
-      mask-composite: add, add, add;
-      opacity: .55;
-      /* the rim: a crisp 2px white line on top of the colour wash */
+      background: transparent;
+      /* A positive spread pushes an inset shadow OUTSIDE the box, which is
+         why the first attempt showed a 2px line and nothing else. spread 0
+         keeps the whole blur inside, so the wash really does reach inward. */
       box-shadow:
-        inset 0 0 0 2px rgba(255,255,255,.95),
-        inset 0 0 16px rgba(255,255,255,.30);
-      filter: drop-shadow(0 0 7px rgba(167,139,250,.6))
-              drop-shadow(0 0 15px rgba(125,211,252,.35));
+        /* 1. the white rim, 2px, hard */
+        inset 0 0 0 2px rgba(255,255,255,.98),
+        /* 2. white haze, 30px of blur from the edge inward */
+        inset 0 0 30px 0 rgba(255,255,255,.55),
+        /* 3. colour wash, 90px of blur from the edge inward */
+        inset 0 0 90px 0 var(--cua-tint, rgba(139,92,246,.95));
+      opacity: .9;
+    }
+    /* the colour cycles through the ring while it breathes */
+    @keyframes cua-tint-cycle {
+      0%   { --cua-tint: rgba(125,211,252,.92); }
+      25%  { --cua-tint: rgba(167,139,250,.92); }
+      50%  { --cua-tint: rgba(244,114,182,.92); }
+      75%  { --cua-tint: rgba(251,191,36,.92); }
+      100% { --cua-tint: rgba(125,211,252,.92); }
     }
     /* breathe + drift ONLY on a controlled tab */
     .host[data-cua-mode="armed"] .frame {
       animation:
-        cua-edge-breathe 2.6s ease-in-out infinite,
-        cua-edge-hue 10s linear infinite;
+        cua-edge-breathe 2.8s ease-in-out infinite,
+        cua-tint-cycle 9s linear infinite;
     }
-    @property --cua-angle {
-      syntax: '<angle>';
-      initial-value: 0deg;
+    @property --cua-tint {
+      syntax: '<color>';
+      initial-value: rgba(139,92,246,.9);
       inherits: false;
     }
 

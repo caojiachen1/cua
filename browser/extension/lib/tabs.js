@@ -199,6 +199,13 @@ class SessionManager {
       if (win != null) {
         const alive = await chrome.windows.get(win).then(() => true).catch(() => false);
         if (!alive) { win = null; s.ownWindowId = null; }
+        else if (visible === true) {
+          // A window we created earlier is reused, so windows.create's focused
+          // flag never runs for it. Without this the session's window stays
+          // minimized forever (Windows parks an unfocused window from a session
+          // with no user at the console), and the page is never painted.
+          await chrome.windows.update(win, { state: 'normal', focused: true }).catch(() => {});
+        }
       }
       if (win == null) {
         // windows.create takes focused (not tabs.create's active) — the first

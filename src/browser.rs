@@ -111,10 +111,11 @@ pub fn extension_dir() -> Option<PathBuf> {
             return Some(pb);
         }
     }
-    let installed = bcfg::default_extension_dir();
-    if installed.join("manifest.json").is_file() {
-        return Some(installed);
-    }
+    // The checkout's own browser/extension comes FIRST. A copy under the data
+    // dir used to win, which meant editing the sources changed nothing the
+    // browser was actually loading — the classic "I reloaded and the UI did not
+    // change" trap. Whoever installed cua keeps owning the extension; the data
+    // dir copy stays only as a fallback for a bin-only deployment.
     let rels: [&[&str]; 2] = [&["browser", "extension"], &[]];
     for dir in search_roots() {
         for rel in rels {
@@ -491,13 +492,17 @@ fn install() -> Result<i32> {
             "extension sources not found — run this from the cua checkout (browser/extension)"
         )
     })?;
-    let dest = bcfg::default_extension_dir();
-    if src != dest {
-        if dest.exists() {
-            std::fs::remove_dir_all(&dest)
-                .with_context(|| format!("clear {}", dest.display()))?;
+    // The sources ARE the installed extension — the data-dir copy is no longer
+    // authoritative, so editing the checkout takes effect on the next reload.
+    // The copy is still refreshed when it already exists, because a profile
+    // that was paired before this change keeps pointing at that path and Edge
+    // refuses a junction/unpacked extension whose manifest it cannot read.
+    let dest = src.clone();
+    let legacy = bcfg::default_extension_dir();
+    if legacy.join("manifest.json").is_file() {
+        if let Err(e) = copy_dir(&src, &legacy) {
+            eprintln!("# warning: could not refresh the legacy copy at {}: {e}", legacy.display());
         }
-        copy_dir(&src, &dest)?;
     }
     let (token, _) = bcfg::token_and_port().map_err(|e| anyhow::anyhow!(e))?;
     let mut cfg = bcfg::read().as_object().cloned().unwrap_or_default();
@@ -506,14 +511,12 @@ fn install() -> Result<i32> {
         serde_json::json!(dest.display().to_string()),
     );
     bcfg::write(&cfg);
-    // An unpacked extension's id is a hash of its directory, so every copy the
-    // user may load needs its origin in the host manifest: the installed copy
-    // (steady state) and the checkout copy (development iteration).
+    // An unpacked extension's id is a hash of its directory. Register every
+    // directory a user might have loaded the extension from, so an older copy
+    // they loaded before this change still pairs.
     let mut dirs: Vec<PathBuf> = vec![dest.clone()];
-    if let Some(src) = source_extension_dir() {
-        if src != dest {
-            dirs.push(src);
-        }
+    if legacy != dest && legacy.join("manifest.json").is_file() {
+        dirs.push(legacy);
     }
     let manifest = cua_browser_bridge::register_native_host(&dirs)
         .map_err(|e| anyhow::anyhow!("native host registration failed: {e}"))?;
