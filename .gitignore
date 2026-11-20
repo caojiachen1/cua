@@ -31,6 +31,7 @@ tools/*/obj/
 
 # Locally generated reports, screenshots and samples (matched by kind, not by name)
 /*SUMMARY*.md
+docs/
 docs/*.png
 docs/*-samples/
 docs/*-report.md
