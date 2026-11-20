@@ -4,6 +4,7 @@
 // the whole CLI.
 pub mod action;
 pub mod capture;
+pub mod capture_wgc;
 pub mod input;
 pub mod perception;
 pub mod uia;

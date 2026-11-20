@@ -236,8 +236,28 @@ fn scoped(name: &str, ext: &str) -> String {
 }
 
 pub fn save_last_state(state_id: &str, hwnd: isize, tree_sig: &str) {
+    save_last_state_ex(state_id, hwnd, tree_sig, None, None);
+}
+
+/// Extended form: also records the observed window geometry and frame size so a
+/// later action can tell whether the observation is still spatially valid.
+/// `geom` is the window rect in screen coordinates ``[x, y, w, h]``; `frame` is
+/// the captured pixel size ``[w, h]``.
+pub fn save_last_state_ex(
+    state_id: &str,
+    hwnd: isize,
+    tree_sig: &str,
+    geom: Option<[i32; 4]>,
+    frame: Option<[u32; 2]>,
+) {
     let p = ensure_data_dir().join("cache").join(scoped("last-state", "json"));
-    let v = serde_json::json!({"state_id": state_id, "hwnd": hwnd, "sig": tree_sig, "session": session(), "ts": now_iso()});
+    let mut v = serde_json::json!({"state_id": state_id, "hwnd": hwnd, "sig": tree_sig, "session": session(), "ts": now_iso()});
+    if let Some(g) = geom {
+        v["geom"] = serde_json::json!(g);
+    }
+    if let Some(f) = frame {
+        v["frame"] = serde_json::json!(f);
+    }
     let _ = std::fs::write(p, serde_json::to_vec(&v).unwrap_or_default());
 }
 

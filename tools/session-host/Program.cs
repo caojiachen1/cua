@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Threading;
 using System.Windows.Forms;
 
 namespace CuaSessionHost
@@ -17,6 +18,7 @@ namespace CuaSessionHost
         public bool RestoreStartup;
         public bool DisableChildSessions;
         public bool KeepChildSession;
+        public bool Cursor = true;
         public int Width;
         public int Height;
         public bool ExplicitSize;
@@ -50,6 +52,7 @@ namespace CuaSessionHost
                     case "--restore-startup": o.RestoreStartup = true; break;
                     case "--disable-child-sessions": o.DisableChildSessions = true; break;
                     case "--keep-child-session": o.KeepChildSession = true; break;
+                    case "--no-cursor": o.Cursor = false; break;
                     case "--width": o.Width = ParseInt(Next(args, ref i), o.Width); o.ExplicitSize = true; break;
                     case "--height": o.Height = ParseInt(Next(args, ref i), o.Height); o.ExplicitSize = true; break;
                     case "--cua-exe": o.CuaExe = Next(args, ref i); break;
@@ -146,9 +149,36 @@ namespace CuaSessionHost
                 }
                 if (opt.Setup) return Setup.Run(opt);
 
-                using (var form = new HostForm(opt))
+                // One child session exists system-wide, so two observers would fight
+                // over it (second RDP attach can terminate the first). `--preview` is
+                // the escape hatch for tests that never create a session.
+                Mutex single = null;
+                if (!opt.Preview)
                 {
-                    Application.Run(form);
+                    single = new Mutex(true, @"Local\cua-session-host-singleton", out bool created);
+                    if (!created)
+                    {
+                        try
+                        {
+                            File.WriteAllText(
+                                Path.Combine(opt.DataDir, "session-error.json"),
+                                "{\"error\":\"another cua observer is already running; only one is allowed\"}");
+                        }
+                        catch { }
+                        return 2;
+                    }
+                }
+
+                try
+                {
+                    using (var form = new HostForm(opt))
+                    {
+                        Application.Run(form);
+                    }
+                }
+                finally
+                {
+                    try { if (single != null) { single.ReleaseMutex(); single.Dispose(); } } catch { }
                 }
                 return 0;
             }

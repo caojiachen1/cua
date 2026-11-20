@@ -210,6 +210,14 @@ fn deliver(spec: Spec) {
         _ => spec.clone(),
     };
     let payload = spec.to_packet().to_string();
+    // Mirror "pre" packets to the viewer that owns the RDP surface. The local
+    // overlay below only covers the desktop it runs on: inside a child session
+    // that desktop reaches the user through RDP, where the remote cursor is
+    // drawn by mstscax only while the user's own mouse is over the client
+    // area. The host-side arrow is the one that stays visible.
+    if spec.phase == "pre" {
+        mirror_to_viewer(&spec);
+    }
     let ensure = |attempt: u8| -> Option<u16> {
         if let Some((port, pid)) = read_port() {
             if pid_alive(pid) {
@@ -257,6 +265,52 @@ fn deliver(spec: Spec) {
     if spec.phase == "pre" {
         std::thread::sleep(Duration::from_millis(250));
         let _ = sock.send_to(payload.as_bytes(), &dst);
+    }
+}
+
+/// Best-effort: tell the session host where the agent is about to act, so it
+/// can animate its own cursor over the RDP surface. Only runs inside a child
+/// session (the pipe name carries the child session id); every failure is
+/// ignored — a missing viewer must never turn a visual nicety into a failed
+/// action.
+fn mirror_to_viewer(spec: &Spec) {
+    let in_child = std::env::var("CUA_CHILD_SESSION")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if !in_child {
+        return;
+    }
+    let (Some(x), Some(y)) = (spec.x, spec.y) else {
+        return;
+    };
+    let Ok(sid) = std::env::var("CUA_CHILD_ID") else {
+        return;
+    };
+    if sid.trim().is_empty() {
+        return;
+    }
+    let payload = json!({
+        "x": x,
+        "y": y,
+        "click": spec.click,
+        "verb": spec.verb,
+    })
+    .to_string();
+    let name = format!("\\\\.\\pipe\\cua-cursor-{}", sid.trim());
+    // the server closes and re-creates its single instance between events; a
+    // write that lands in that window would be dropped, so retry briefly
+    let mut pipe = None;
+    for _ in 0..4 {
+        if let Ok(p) = std::fs::OpenOptions::new().write(true).open(&name) {
+            pipe = Some(p);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(4));
+    }
+    if let Some(mut pipe) = pipe {
+        use std::io::Write as _;
+        let _ = pipe.write_all(payload.as_bytes());
+        let _ = pipe.write_all(b"\n");
     }
 }
 

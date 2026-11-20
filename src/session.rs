@@ -226,8 +226,8 @@ fn host_call(state: &SessionState, op: &str, extra: Value) -> Result<Value> {
 pub fn dispatch(op: SessionOp) -> Result<i32> {
     match op {
         SessionOp::Setup { enable_rdp } => cmd_setup(enable_rdp),
-        SessionOp::Start { view, hide, interactive, keep_startup, headless, width, height } => {
-            cmd_start(view, hide, interactive, keep_startup, headless, width, height)
+        SessionOp::Start { view, hide, interactive, keep_startup, headless, no_cursor, width, height } => {
+            cmd_start(view, hide, interactive, keep_startup, headless, no_cursor, width, height)
         }
         SessionOp::Login => cmd_credentials(true),
         SessionOp::Logout => cmd_credentials(false),
@@ -417,6 +417,7 @@ fn cmd_start(
     interactive: bool,
     keep_startup: bool,
     headless: bool,
+    no_cursor: bool,
     width: Option<u32>,
     height: Option<u32>,
 ) -> Result<i32> {
@@ -490,6 +491,9 @@ fn cmd_start(
     }
     if keep_startup {
         cmd.arg("--keep-startup");
+    }
+    if no_cursor {
+        cmd.arg("--no-cursor");
     }
     if interactive {
         cmd.arg("--interactive");

@@ -343,6 +343,7 @@ cua session start --keep-startup       # let the child run the user's startup ap
 cua session login                      # optional one-time Windows password for PIN/Hello logon
 cua session logout                     # remove the saved child-session password
 cua session start --hide               # background only; no viewer
+cua session start --no-cursor          # no fake cursor layer in the viewer
 cua session status
 cua session view                       # read-only viewer; user may click Take over
 cua session view --interactive         # input enabled (only with explicit user approval)
@@ -591,8 +592,10 @@ recorded argv keeps `--sandbox`, so replay drives the same hidden desktop.
   `%LOCALAPPDATA%\cua\config.json` (`deny_processes`, `require_shot_id_for_coords`).
 - **Pointer preview**: every mutating desktop command draws a click-through fake cursor at the
   target ("即将 点击 → 窗口" / "正在 / 已 点击 ✓" with a ripple), so the user can see where the
-  agent's pointer is and what it is doing — including inside a Child Session (each session owns
-  its own preview host; the read-only viewer shows it). Disable with `pointer_preview: false` in
+  agent's pointer is and what it is doing. Inside a Child Session the in-session preview only
+  survives RDP as its bubble, so the read-only viewer draws its own arrow layer on the RDP
+  picture (180 ms glide, 360 ms ripple, 8 s idle hide, click-through). Disable that layer with
+  `cua session start --no-cursor`. Disable the in-session preview with `pointer_preview: false` in
   config.json or `CUA_POINTER_PREVIEW=0`; `cua preview serve` / `cua preview stop` manage the
   resident overlay host manually.
 - Every action receipt carries `verification` (not_requested/passed/failed/unknown),

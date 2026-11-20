@@ -61,6 +61,7 @@ cua session setup                                      # child session: one-time
 cua session start                                      # child session + startup isolation, 无感后台（观察窗默认隐藏）
 cua session view                                       # show the hidden read-only viewer on demand
 cua session start --keep-startup                       # allow child-session startup apps
+cua session start --no-cursor                          # no fake cursor in the viewer
 cua session login                                      # optional: save Windows password for PIN/Hello logon
 cua session start --hide                               # background; no viewer
 cua session view                                       # reopen the viewer from the CLI (tray icon also works)
@@ -364,8 +365,12 @@ pinned to the true target even at screen edges, where the bubble flips sides). T
 colour-coded by phase — amber 即将, blue 正在, green 已 (+ ripple), red ✗ — matching the
 browser's in-page cursor. It holds ~8 s after the last action for the user to read the
 outcome, then fades out: nothing stays parked on screen. Sandbox commands show no preview
-(the hidden desktop is invisible). Inside a Child Session the preview runs in that session
-(the read-only viewer shows it). The overlay is a resident host (`cua preview serve`,
+(the hidden desktop is invisible). Inside a Child Session the preview runs in that session,
+but RDP only reliably carries its bubble; the read-only viewer therefore draws its own fake
+cursor on top of the RDP picture — same 180 ms glide, ripple on click, 8 s idle hide, and the
+layer is click-through, so it never eats input meant for the session. Turn that viewer layer
+off with `cua session start --no-cursor` (or restart with it) when recording a clean screen.
+The overlay is a resident host (`cua preview serve`,
 auto-spawned on first use, `cua preview stop` to exit, idle-exits after 30 minutes); disable
 with `pointer_preview: false` in config.json or `CUA_POINTER_PREVIEW=0`. Every mutating
 command's bubble labels the delivery type — `[键鼠]` real pointer/keyboard input, `[UIA]`

@@ -34,6 +34,8 @@ pub struct Shot {
     /// A legitimately black frame stays "captured" only if PrintWindow reported
     /// success; an all-black frame from a failed print is "suspected_black".
     pub status: &'static str,
+    /// which capture path produced the pixels: "wgc" | "printwindow" | "gdi"
+    pub source: &'static str,
 }
 
 pub fn shot_window(hwnd: HWND, client_only: bool) -> Result<Shot> {
@@ -41,7 +43,34 @@ pub fn shot_window(hwnd: HWND, client_only: bool) -> Result<Shot> {
     if w <= 0 || h <= 0 || w > 20000 || h > 20000 {
         bail!("bad window size {w}x{h}");
     }
-    let shot = unsafe { print_window(hwnd, w, h, client_only) }?;
+
+    // Minimized windows have no surface to capture on either path: WGC refuses
+    // and PrintWindow yields a blank/stale frame. Say so instead of returning
+    // pixels that look valid but carry nothing.
+    if unsafe { windows::Win32::UI::WindowsAndMessaging::IsIconic(hwnd).as_bool() } {
+        bail!("WINDOW_MINIMIZED: window is minimized; restore it before capturing");
+    }
+
+    // Path 1: Windows Graphics Capture. Composites the real window surface, so
+    // occluded windows and GPU-rendered apps (Chromium/Electron, games) still
+    // produce pixels. Fails fast on minimized windows / missing D3D.
+    match crate::capture_wgc::capture_window(hwnd, 700) {
+        Ok(f) => {
+            return Ok(Shot {
+                width: f.width,
+                height: f.height,
+                rgba: f.rgba,
+                rendered: true,
+                status: "captured",
+                source: "wgc",
+            });
+        }
+        Err(e) => eprintln!("[capture] wgc unavailable ({e}); falling back to PrintWindow"),
+    }
+
+    // Path 2: PrintWindow(PW_RENDERFULLCONTENT) — legacy fallback.
+    let mut shot = unsafe { print_window(hwnd, w, h, client_only) }?;
+    shot.source = "printwindow";
     Ok(shot)
 }
 
@@ -175,6 +204,7 @@ unsafe fn blit_to_rgba(
         rgba: buf,
         rendered: true,
         status: "captured",
+        source: "gdi",
     }
 }
 

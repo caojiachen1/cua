@@ -1867,8 +1867,18 @@ pub fn toggle_element(hwnd: HWND, rid: &[i32]) -> Result<(String, String)> {
     let p = el
         .get_pattern::<UITogglePattern>()
         .map_err(|_| anyhow!("element does not support UIA TogglePattern"))?;
+    let before = toggle_state(&el);
     p.toggle().map_err(|e| anyhow!("toggle failed: {e}"))?;
-    Ok(("toggled via UIA TogglePattern".into(), toggle_state(&el).unwrap_or_else(|| "?".into())))
+    let after = toggle_state(&el).unwrap_or_else(|| "?".into());
+    // Post-action verification: a toggle that reports success but leaves the
+    // state unchanged means the control refused (disabled/read-only), and the
+    // caller must not be told "ok".
+    if let (Some(b), Some(a)) = (before.as_deref(), toggle_state(&el).as_deref()) {
+        if b == a {
+            bail!("ACTION_FAILED: toggle reported success but state is still '{a}' (control may be disabled or read-only)");
+        }
+    }
+    Ok(("toggled via UIA TogglePattern".into(), after))
 }
 
 pub fn select_element(hwnd: HWND, rid: &[i32]) -> Result<(String, bool)> {
@@ -1878,6 +1888,9 @@ pub fn select_element(hwnd: HWND, rid: &[i32]) -> Result<(String, bool)> {
         .map_err(|_| anyhow!("element does not support UIA SelectionItemPattern"))?;
     p.select().map_err(|e| anyhow!("select failed: {e}"))?;
     let selected = p.is_selected().unwrap_or(true);
+    if !selected {
+        bail!("ACTION_FAILED: select reported success but the item is still not selected");
+    }
     Ok(("selected via UIA SelectionItemPattern".into(), selected))
 }
 
@@ -1887,7 +1900,11 @@ pub fn expand_element(hwnd: HWND, rid: &[i32]) -> Result<(String, String)> {
         .get_pattern::<UIExpandCollapsePattern>()
         .map_err(|_| anyhow!("element does not support UIA ExpandCollapsePattern"))?;
     p.expand().map_err(|e| anyhow!("expand failed: {e}"))?;
-    Ok(("expanded via UIA ExpandCollapsePattern".into(), expand_state(&el).unwrap_or_else(|| "?".into())))
+    let st = expand_state(&el).unwrap_or_else(|| "?".into());
+    if st != "expanded" {
+        bail!("ACTION_FAILED: expand reported success but state is '{st}'");
+    }
+    Ok(("expanded via UIA ExpandCollapsePattern".into(), st))
 }
 
 pub fn collapse_element(hwnd: HWND, rid: &[i32]) -> Result<(String, String)> {

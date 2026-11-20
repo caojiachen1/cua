@@ -112,6 +112,11 @@ namespace CuaSessionHost
         private ToolTip _tips;
 
         private HostPipe _pipe;
+        private CursorOverlay _cursor;
+        private CursorPipe _cursorPipe;
+        private string _cursorPipeName;
+        private int _cursorRetryAt;
+        private int _cursorEvents;
         private uint? _childId;
         private string _agentPipe;
         private bool _connected;
@@ -125,6 +130,12 @@ namespace CuaSessionHost
         private DateTime _reconnectAt = DateTime.MinValue;
         private bool _vncAutoDone;
         private uint? _lastChildId;
+        /// <summary>子会话 id 是否由本进程创建/接管；false 表示是别的程序建的。</summary>
+        private uint? _ownedChildId;
+        /// <summary>当前子会话属于其他程序：可以观察，但退出时绝不能注销它。</summary>
+        private bool _foreignChild;
+        /// <summary>本进程刚刚发起过创建，下一次拿到的 id 就算自己的。</summary>
+        private bool _expectOwnChild;
         private int _reconnectAttempts;
         private bool _plainTried;
         private RfbClientControl _rfbCtl;
@@ -496,6 +507,120 @@ namespace CuaSessionHost
                 _rdp.Bounds = area;
                 if (_rfbCtl != null) _rfbCtl.Bounds = area;
             }
+            if (_cursor != null) _cursor.SyncLayout();
+        }
+
+        /// <summary>DPI scale for the overlay art; the RDP picture is physical
+        /// pixels, so a 150% window needs a 150% sprite to stay readable.</summary>
+        internal float UiScale
+        {
+            get { return _uiScale; }
+        }
+
+        /// <summary>
+        /// Child-desktop pixel -> screen pixel of the viewer's RDP surface.
+        /// The control keeps the remote aspect ratio, so one scale covers both
+        /// axes; the offset is the letterbox introduced by LayoutContent.
+        /// Returns false before the desktop size is known (caller must not
+        /// guess: a wrong position is worse than no cursor).
+        /// </summary>
+        internal bool TryMapChildPoint(int childX, int childY, out Point client)
+        {
+            client = Point.Empty;
+            if (_content == null || _rdp == null) return false;
+            if (_opt.Width <= 0 || _opt.Height <= 0) return false;
+            Rectangle r = _rdp.Bounds;
+            if (r.Width <= 0 || r.Height <= 0) return false;
+            if (childX < 0 || childY < 0 || childX > _opt.Width || childY > _opt.Height) return false;
+            int x = r.Left + (int)Math.Round(childX * (r.Width / (double)_opt.Width));
+            int y = r.Top + (int)Math.Round(childY * (r.Height / (double)_opt.Height));
+            client = new Point(x, y);
+            return true;
+        }
+
+        /// <summary>The panel the cursor sprites are parented to (layered child
+        /// windows are clipped by it and travel with the viewer, unlike a
+        /// desktop-wide topmost popup).</summary>
+        internal IntPtr CursorLayerParent
+        {
+            get { return _content.IsHandleCreated ? _content.Handle : IntPtr.Zero; }
+        }
+
+        /// <summary>
+        /// Start the viewer-owned cursor once the child session id is known.
+        /// Optional by design (`--no-cursor`): disabled means no overlay window
+        /// and no pipe, i.e. exactly the pre-D-04 behaviour.
+        /// </summary>
+        private void EnsureCursorPipe()
+        {
+            if (!_opt.Cursor || _cursorPipe != null || !_childId.HasValue) return;
+            _cursorPipeName = "cua-cursor-" + _childId.Value;
+            _cursorPipe = new CursorPipe(_cursorPipeName, delegate(int x, int y, bool click)
+            {
+                _cursorEvents++;
+                if (IsDisposed || !IsHandleCreated) return;
+                try
+                {
+                    BeginInvoke(new Action(delegate
+                    {
+                        if (_cursor != null) _cursor.MoveTo(x, y, click);
+                    }));
+                }
+                catch (InvalidOperationException) { }
+            });
+            _cursorPipe.Start();
+        }
+
+        private void EnsureCursor()
+        {
+            if (!_opt.Cursor || _cursor != null || !_childId.HasValue) return;
+            // the pipe outlives the overlay: a DPI/handle rebuild must not
+            // drop events or rebind the same pipe name while the old listener
+            // is still winding down
+            EnsureCursorPipe();
+            try
+            {
+                _cursor = new CursorOverlay(this);
+                _cursor.SetVisible(Visible && WindowState != FormWindowState.Minimized);
+            }
+            catch (Exception ex)
+            {
+                // the viewer may still be hidden (no window handle yet) when
+                // the child id arrives; Poll retries, so keep the message for
+                // the next attempt instead of failing the seat
+                _cursor = null;
+                _lastError = "cursor overlay: " + ex.GetBaseException().Message;
+                try
+                {
+                    File.AppendAllText(Path.Combine(_opt.DataDir, "cursor-error.log"),
+                        DateTime.Now.ToString("o") + " " + ex.GetBaseException() + Environment.NewLine);
+                }
+                catch { }
+            }
+        }
+
+        private void RebuildCursor()
+        {
+            if (_cursor != null)
+            {
+                _cursor.Dispose();
+                _cursor = null;
+            }
+            EnsureCursor();
+        }
+
+        private void StopCursor()
+        {
+            if (_cursorPipe != null)
+            {
+                _cursorPipe.Stop();
+                _cursorPipe = null;
+            }
+            if (_cursor != null)
+            {
+                _cursor.Dispose();
+                _cursor = null;
+            }
         }
 
         private void PaintBar(Graphics g)
@@ -800,6 +925,7 @@ namespace CuaSessionHost
                 UpdateMeta();
                 _statusPill.SetState("正在创建子会话", Theme.Accent);
                 LayoutBar();
+                _expectOwnChild = true;
                 _rdp.Connect(size, _scalePercent, _credential);
                 _poll.Start();
             }
@@ -972,7 +1098,26 @@ namespace CuaSessionHost
             {
                 // 路由开关关闭后 WTSGetChildSessionId 不再返回子会话 id，
                 // 因此重连时优先使用断开前记住的 id。
-                _childId = _lastChildId ?? ChildSessionApi.TryGetId();
+                uint? found = _lastChildId ?? ChildSessionApi.TryGetId();
+                if (found.HasValue)
+                {
+                    // Ownership: created by us just now, remembered from a previous
+                    // link, or already adopted. Anything else was created by another
+                    // program and must not be logged off on exit.
+                    bool own = _expectOwnChild || _lastChildId.HasValue || _ownedChildId == found;
+                    if (own)
+                    {
+                        _ownedChildId = found;
+                        _foreignChild = false;
+                        _expectOwnChild = false;
+                    }
+                    else
+                    {
+                        _foreignChild = true;
+                        SetError("子会话 " + found.Value + " 由其他程序创建：可以观察，但退出时不会注销它");
+                    }
+                }
+                _childId = found;
                 if (!_childId.HasValue)
                 {
                     _statusPill.SetState("已连接 · 等待子会话", Theme.Accent);
@@ -981,7 +1126,29 @@ namespace CuaSessionHost
                     return;
                 }
                 _agentPipe = "cua-child-agent-" + _childId.Value;
+                EnsureCursor();
                 UpdateMeta();
+            }
+
+            if (_childId.HasValue && _opt.Cursor)
+            {
+                // the viewer may have no window on the first poll (host started
+                // hidden), and a DPI change recreates the form handle, taking
+                // the layered children down with it. Rebuild rather than lose
+                // the pointer for the rest of the session.
+                EnsureCursorPipe();
+                if (_cursor == null)
+                {
+                    if (unchecked(Environment.TickCount - _cursorRetryAt) >= 0)
+                    {
+                        _cursorRetryAt = Environment.TickCount + 2000;
+                        EnsureCursor();
+                    }
+                }
+                else if (!_cursor.IsAlive)
+                {
+                    RebuildCursor();
+                }
             }
 
             if (!_viewerInitialized)
@@ -1075,6 +1242,8 @@ namespace CuaSessionHost
             if (!_startupReleased && _startupReleaseAt != DateTime.MinValue &&
                 DateTime.UtcNow >= _startupReleaseAt)
                 ReleaseStartupQuarantine();
+            if (_cursor != null)
+                _cursor.SetVisible(Visible && WindowState != FormWindowState.Minimized);
             LayoutBar();
         }
 
@@ -1270,6 +1439,12 @@ namespace CuaSessionHost
                 Opacity = 1;
                 WindowState = FormWindowState.Normal;
                 if (_pipBounds.IsEmpty) _pipBounds = DefaultPipBounds(Screen.PrimaryScreen.WorkingArea);
+                // a minimized/hidden window can report the -32000 parked rect
+                // (or a caption-sized 237x39 box); never let that become the
+                // remembered PiP geometry, or every later show lands off-screen
+                if (_pipBounds.Width < 400 || _pipBounds.Height < 260 ||
+                    _pipBounds.X < -10000 || _pipBounds.Y < -10000)
+                    _pipBounds = DefaultPipBounds(Screen.PrimaryScreen.WorkingArea);
                 Bounds = _isMaximized ? Screen.PrimaryScreen.WorkingArea : _pipBounds;
                 Show();
                 ApplyTopMost();
@@ -1278,6 +1453,7 @@ namespace CuaSessionHost
                 Activate();
                 SetViewOnly(viewOnly);
                 _viewerShown = true;
+                if (_cursor != null) _cursor.SetVisible(WindowState != FormWindowState.Minimized);
                 if (_viewOnly) _pipWatch.Start();
                 WriteState();
             }
@@ -1298,6 +1474,7 @@ namespace CuaSessionHost
             ShowInTaskbar = false;
             _viewerShown = false;
             _pipWatch.Stop();
+            if (_cursor != null) _cursor.SetVisible(false);
             ApplyTopMost();
             WriteState();
             if (!_trayTipShown && _tray != null)
@@ -1619,7 +1796,7 @@ namespace CuaSessionHost
                 _sizeZone = PipZone.None;
                 Cursor.Current = Cursors.Default;
             }
-            if (!_isMaximized)
+            if (!_isMaximized && WindowState == FormWindowState.Normal && Visible)
             {
                 _pipBounds = Bounds;
                 SaveViewerBounds();
@@ -2207,7 +2384,13 @@ namespace CuaSessionHost
             try { _rdp.Disconnect(); } catch { }
             try
             {
-                if (_childId.HasValue) ChildSessionApi.Logoff(_childId.Value);
+                if (_childId.HasValue)
+                {
+                    if (_foreignChild || _ownedChildId != _childId)
+                        SetError("已跳过注销：子会话 " + _childId.Value + " 不是本进程创建的");
+                    else
+                        ChildSessionApi.Logoff(_childId.Value);
+                }
             }
             catch (Exception ex)
             {
@@ -2320,6 +2503,12 @@ namespace CuaSessionHost
                 { "width", _opt.Width },
                 { "height", _opt.Height },
                 { "scale", _scalePercent },
+                { "cursor", _opt.Cursor },
+                { "cursor_pipe", _cursorPipeName ?? "" },
+                { "cursor_overlay", _cursor != null && _cursor.IsAlive },
+                { "cursor_visible", _cursor != null && _cursor.IsShown },
+                { "cursor_idle_ms", _cursor != null ? _cursor.IdleAgeMs : 0 },
+                { "cursor_events", _cursorEvents },
                 { "credential_saved", _credential != null },
                 { "credential_user", _credential != null ? _credential.UserName : "" },
                 { "startup_quarantined", _startup != null && !_startupReleased },
@@ -2338,6 +2527,7 @@ namespace CuaSessionHost
                 state["host_pipe"] = _opt.HostPipe;
                 state["cua_exe"] = _opt.CuaExe;
                 state["data_dir"] = _opt.DataDir;
+                state["child_owned"] = !_foreignChild && _ownedChildId.HasValue;
                 File.WriteAllText(Path.Combine(_opt.DataDir, "session.json"), Json.Serialize(state));
                 if (string.IsNullOrEmpty(_lastError))
                 {
@@ -2394,7 +2584,10 @@ namespace CuaSessionHost
             try { _rdp.Disconnect(); } catch { }
             try
             {
-                if (_childId.HasValue) ChildSessionApi.Logoff(_childId.Value);
+                // Same ownership rule as LogoffSession: never tear down a session
+                // another program created.
+                if (_childId.HasValue && !_foreignChild && _ownedChildId == _childId)
+                    ChildSessionApi.Logoff(_childId.Value);
             }
             catch { }
             try
@@ -2404,6 +2597,7 @@ namespace CuaSessionHost
             }
             catch { }
             try { _pipe.Stop(); } catch { }
+            StopCursor();
             ReleaseStartupQuarantine();
             DisposeTray();
             Close();

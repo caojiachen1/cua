@@ -9,6 +9,7 @@ mod agent;
 mod background;
 mod browser;
 mod capture;
+mod capture_wgc;
 mod edge;
 mod input;
 mod ocr;
@@ -194,6 +195,9 @@ pub(crate) enum SessionOp {
         /// 子会话任务继续跑但无画面（OS 限制）。默认关闭（老样子）。
         #[arg(long)]
         headless: bool,
+        /// 不画 agent 光标（观察窗里看不到指针滑行和点击涟漪）
+        #[arg(long)]
+        no_cursor: bool,
         #[arg(long)]
         width: Option<u32>,
         #[arg(long)]
@@ -376,6 +380,10 @@ enum Cmd {
         x: Option<i32>,
         #[arg(long, allow_hyphen_values = true)]
         y: Option<i32>,
+        #[arg(long, help = "x as 0-1000 relative to the target window (requires --window)")]
+        x_pct: Option<i32>,
+        #[arg(long, help = "y as 0-1000 relative to the target window (requires --window)")]
+        y_pct: Option<i32>,
         #[arg(long, help = "state_id from the last state/shot (Qoder screenshotId guard)")]
         shot_id: Option<String>,
         #[arg(long)]
@@ -405,6 +413,10 @@ enum Cmd {
         index: Option<usize>,
         #[arg(long, help = "deliver via window messages instead of real input (no focus change)")]
         background: bool,
+        #[arg(long, help = "select all and overwrite instead of appending at the caret (foreground only)")]
+        replace: bool,
+        #[arg(long, help = "press Enter after typing (foreground only)")]
+        submit: bool,
         #[arg(long)]
         record: Option<String>,
         #[arg(long)]
@@ -1365,11 +1377,11 @@ fn dispatch(cmd: Cmd) -> i32 {
             Cmd::Hover { window, index, x, y, shot_id, background, record } => {
                 cmd_hover(window, index, x, y, shot_id, background, record)
             }
-            Cmd::Click { window, index, x, y, shot_id, right, double, strategy, background, delivery, consume_shot, record, sandbox } => {
-                cmd_click(window, index, x, y, shot_id, right, double, &strategy, background, delivery, consume_shot, record, sandbox)
+            Cmd::Click { window, index, x, y, x_pct, y_pct, shot_id, right, double, strategy, background, delivery, consume_shot, record, sandbox } => {
+                cmd_click(window, index, x, y, x_pct, y_pct, shot_id, right, double, &strategy, background, delivery, consume_shot, record, sandbox)
             }
-            Cmd::Type { text, window, index, background, record, sandbox } => {
-                cmd_type(&text, window, index, background, record, sandbox)
+            Cmd::Type { text, window, index, background, replace, submit, record, sandbox } => {
+                cmd_type(&text, window, index, background, replace, submit, record, sandbox)
             }
             Cmd::Key { keys, window, confirm, background, record, sandbox } => {
                 cmd_key(&keys, window, confirm, background, record, sandbox)
@@ -1579,6 +1591,32 @@ pub fn check_shot_id(shot_id: Option<&str>, target_hwnd: windows::Win32::Foundat
             ));
         }
     }
+    check_shot_geom(target_hwnd)?;
+    Ok(())
+}
+
+/// Third staleness dimension: the window may still be the same and the shot_id
+/// still fresh, but if the window moved/resized between observation and action
+/// every coordinate from that observation is off. Compare the recorded rect.
+pub fn check_shot_geom(target_hwnd: windows::Win32::Foundation::HWND) -> Result<(), String> {
+    let last = util::load_last_state().unwrap_or(Value::Null);
+    let Some(g) = last.get("geom").and_then(|v| v.as_array()) else {
+        return Ok(());
+    };
+    if g.len() != 4 {
+        return Ok(());
+    }
+    let expect: Vec<i32> = g.iter().filter_map(|v| v.as_i64()).map(|v| v as i32).collect();
+    let Some(info) = win::snapshot_window(win::root_window(target_hwnd)) else {
+        return Ok(());
+    };
+    let cur = info.rect;
+    if cur != [expect[0], expect[1], expect[2], expect[3]] {
+        return Err(format!(
+            "coordinate action refused: window geometry changed since the observation (observed [x={}, y={}, w={}, h={}], now [x={}, y={}, w={}, h={}]) — re-observe with 'cua shot'",
+            expect[0], expect[1], expect[2], expect[3], cur[0], cur[1], cur[2], cur[3]
+        ));
+    }
     Ok(())
 }
 
@@ -1591,6 +1629,35 @@ fn target_json(t: &Target) -> Value {
         "process": t.info.process,
         "rect": t.info.rect,
     })
+}
+
+/// Map a refusal/failure message to a concrete next step.
+/// Only matches wording this crate emits itself, so it cannot misfire on
+/// third-party error text.
+fn default_suggestion(detail: &str) -> Option<String> {
+    let s = |t: &str| Some(t.to_string());
+    if detail.contains("window geometry changed") {
+        return s("re-observe with 'cua shot' before retrying the coordinate action");
+    }
+    if detail.contains("stale or missing shot_id") {
+        return s("run 'cua state' or 'cua shot' first, then retry with the new --shot-id");
+    }
+    if detail.contains("refusing physical input at") || detail.contains("not the target") {
+        return s("bring the target window to the front, or use --background / an a11y action");
+    }
+    if detail.contains("focus moved away") {
+        return s("re-focus the target (or use --background) and retry");
+    }
+    if detail.contains("does not support UIA") {
+        return s("use a different action for this element, or strategy=auto to allow the pixel/message fallback");
+    }
+    if detail.contains("ambiguous:") {
+        return s("re-observe after the UI settles, then target an element index from the fresh observation");
+    }
+    if detail.contains("WINDOW_MINIMIZED") {
+        return s("restore the window first; neither WGC nor PrintWindow captures a minimized window");
+    }
+    None
 }
 
 /// Run an action with receipt + optional recording. Returns exit code.
@@ -1687,6 +1754,11 @@ where
         .and_then(|r| r.suggestion.clone())
         .or_else(|| report.as_ref().and_then(|r| r.suggestion.clone()));
     outcome.apply(&mut receipt);
+    // A refused/failed action should tell the caller what to do next. The prefixes
+    // are cua's own stable wording, so this is mapping rather than guessing.
+    if receipt.status != "ok" && receipt.suggestion.is_none() {
+        receipt.suggestion = default_suggestion(receipt.detail.as_deref().unwrap_or(""));
+    }
     if receipt.status == "ok" && req.consume_shot {
         util::consume_last_state();
     }
@@ -2022,7 +2094,7 @@ fn cmd_state(
     let cache_value = json!(uia::nodes_json(&tree.nodes));
     util::save_elements(t.info.hwnd, &cache_value);
     let elems = uia::nodes_json_lean(&out_nodes);
-    util::save_last_state(&state_id, t.info.hwnd, &tree.sig);
+    util::save_last_state_ex(&state_id, t.info.hwnd, &tree.sig, Some(t.info.rect), None);
 
     // screenshot
     let shot_path = if no_shot {
@@ -2037,7 +2109,7 @@ fn cmd_state(
         match shot {
             Ok(s) => {
                 capture::save_png(&s, &path)?;
-                Some(json!({"path": path.to_string_lossy(), "width": s.width, "height": s.height, "rendered": s.rendered, "status": s.status}))
+                Some(json!({"path": path.to_string_lossy(), "width": s.width, "height": s.height, "rendered": s.rendered, "status": s.status, "source": s.source}))
             }
             Err(e) => Some(json!({"error": format!("{e:#}")})),
         }
@@ -2073,17 +2145,17 @@ fn cmd_state(
 }
 
 fn cmd_shot(window: Option<String>, screen: bool, out: &str) -> Result<i32> {
-    let (shot, hwnd) = if screen {
-        (capture::shot_screen(true)?, 0isize)
+    let (shot, hwnd, geom) = if screen {
+        (capture::shot_screen(true)?, 0isize, None)
     } else {
         let sel = window.ok_or_else(|| anyhow!("--window or --screen required"))?;
         let t = resolve_target(&sel)?;
-        (capture::shot_window(t.hwnd, false)?, t.info.hwnd)
+        (capture::shot_window(t.hwnd, false)?, t.info.hwnd, Some(t.info.rect))
     };
     let path = std::path::PathBuf::from(out);
     capture::save_png(&shot, &path)?;
     let state_id = util::new_state_id();
-    util::save_last_state(&state_id, hwnd, "");
+    util::save_last_state_ex(&state_id, hwnd, "", geom, Some([shot.width, shot.height]));
     let v = json!({
         "state_id": state_id,
         "path": path.to_string_lossy(),
@@ -2091,6 +2163,7 @@ fn cmd_shot(window: Option<String>, screen: bool, out: &str) -> Result<i32> {
         "height": shot.height,
         "rendered": shot.rendered,
         "status": shot.status,
+        "source": shot.source,
     });
     println!("{}", serde_json::to_string_pretty(&v)?);
     Ok(0)
@@ -2721,6 +2794,8 @@ fn cmd_click(
     index: Option<usize>,
     x: Option<i32>,
     y: Option<i32>,
+    x_pct: Option<i32>,
+    y_pct: Option<i32>,
     shot_id: Option<String>,
     right: bool,
     double: bool,
@@ -2731,6 +2806,28 @@ fn cmd_click(
     record: Option<String>,
     sandbox: bool,
 ) -> Result<i32> {
+    // Percent coordinates are relative to the target window, so they require
+    // --window: without it there is nothing to be relative to.
+    let (x, y) = match (x_pct, y_pct) {
+        (None, None) => (x, y),
+        (xp, yp) => {
+            let (xp, yp) = match (xp, yp) {
+                (Some(a), Some(b)) => (a, b),
+                _ => bail!("--x-pct and --y-pct must be given together"),
+            };
+            if !(0..=1000).contains(&xp) || !(0..=1000).contains(&yp) {
+                bail!("--x-pct/--y-pct must be within 0..=1000");
+            }
+            let sel = window
+                .as_ref()
+                .ok_or_else(|| anyhow!("--x-pct/--y-pct require --window (percent coordinates are window-relative)"))?;
+            let t = resolve_target(sel)?;
+            let [rx, ry, rw, rh] = t.info.rect;
+            let px = rx + (xp as i64 * rw as i64 / 1000) as i32;
+            let py = ry + (yp as i64 * rh as i64 / 1000) as i32;
+            (Some(px), Some(py))
+        }
+    };
     let requested = delivery.as_deref().map(Delivery::parse).transpose()?;
     if sandbox {
         if requested.is_some() {
@@ -3052,6 +3149,8 @@ fn cmd_type(
     window: Option<String>,
     index: Option<usize>,
     background: bool,
+    replace: bool,
+    submit: bool,
     record: Option<String>,
     sandbox: bool,
 ) -> Result<i32> {
@@ -3063,6 +3162,11 @@ fn cmd_type(
     let text = text.to_string();
     if index.is_some() && !background {
         bail!("--index only applies to --background (foreground typing goes to the focused control)");
+    }
+    // These two need real key state (select-all, Enter), which the message-level
+    // route cannot produce faithfully.
+    if background && (replace || submit) {
+        bail!("--replace/--submit need real input; drop --background or drop those flags");
     }
     let mode = InputMode::from_background(background);
     guarded_action_req(
@@ -3112,8 +3216,25 @@ fn cmd_type(
             if !win::is_foreground(t.hwnd) {
                 bail!("focus moved away from the target before typing; nothing was typed — re-focus it or use --background");
             }
+            if replace {
+                // Select-all then overwrite: the natural meaning of "replace".
+                let select_all = input::parse_combo("ctrl+a")?;
+                input::press_combo(&select_all)?;
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
             input::type_text(&text)?;
-            Ok((format!("typed {} chars", text.chars().count()), None))
+            if submit {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                let enter = input::parse_combo("enter")?;
+                input::press_combo(&enter)?;
+            }
+            let how = match (replace, submit) {
+                (true, true) => " (replaced, submitted)",
+                (true, false) => " (replaced)",
+                (false, true) => " (submitted)",
+                (false, false) => "",
+            };
+            Ok((format!("typed {} chars{how}", text.chars().count()), None))
         },
     )
 }

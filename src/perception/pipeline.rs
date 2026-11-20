@@ -1272,7 +1272,7 @@ mod tests {
     use super::*;
 
     fn shot(w: u32, h: u32, rgba: Vec<u8>) -> capture::Shot {
-        capture::Shot { width: w, height: h, rgba, rendered: true, status: "captured" }
+        capture::Shot { width: w, height: h, rgba, rendered: true, status: "captured", source: "gdi" }
     }
 
     #[test]
